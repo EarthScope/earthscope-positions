@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg-info*
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+venv*/
+env/
+
+# Data and outputs — store locally, never commit
+data/
+output/
+logs/
+*.arrow
+*.parquet
+
+# IDE / OS
+.vscode/
+.DS_Store
+*.swp
+*.swo
+
+# Secrets / tokens
+.env
+.env.*
+*.token
+
+# Claude
+.claude/

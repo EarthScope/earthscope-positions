@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=64.0", "wheel", "setuptools_scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "earthscope-positions"
+description = "Pull GNSS position data from the EarthScope API and store it locally"
+readme = "README.md"
+requires-python = ">=3.13"
+authors = [{name = "Charlie Sievers", email = "charlie.sievers@earthscope.org"}]
+license = {text = "MIT"}
+dynamic = ["version"]
+
+dependencies = [
+    # EarthScope
+    "earthscope-sdk>=1.5.0",
+    "earthscope-cli>=1.2.0",
+
+    # Kafka
+    "confluent-kafka>=2.0.0",
+
+    # HTTP / serialization
+    "requests>=2.31.0",
+    "orjson>=3.9.0",
+
+    # Arrow / columnar storage
+    "pyarrow>=12.0.0",
+
+    # Utilities
+    "pydantic>=2.0.0",
+]
+
+[project.scripts]
+es-positions = "earthscope_positions.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools_scm]
+version_scheme = "post-release"
+write_to = "src/earthscope_positions/_version.py"
