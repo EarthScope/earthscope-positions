@@ -14,6 +14,9 @@ Usage:
   es-pos process completeness
   es-pos process completeness --overwrite --data-dir /custom/data/arrow
 
+  es-pos process ppsd
+  es-pos process ppsd -i ShakeAlert --start 2026-01-01 --end 2026-01-31
+
   es-pos test fetch -i ShakeAlert.clean --start 2026-01-01 --total-duration 25200
   es-pos test plot data/positions_diagnose/diagnose_20260701T000000Z.jsonl
 """
@@ -21,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import os
 import pathlib
 import sys
 
@@ -82,11 +86,88 @@ Use 'es-pos <subcommand> --help' for per-command options.
 
 Subcommands:
   completeness   Generate 15-min completeness and latency summary files.
+  ppsd           Pre-compute per-station-day PPSD cache files.
 
 Use 'es-pos process <subcommand> --help' for per-command options.
 """,
     )
     process_sub = process_p.add_subparsers(dest="process_cmd", metavar="SUBCOMMAND")
+
+    # ── process ppsd ─────────────────────────────────────────────────────────
+    ppsd_proc_p = process_sub.add_parser(
+        "ppsd",
+        help="Pre-compute per-station-day PPSD cache files for faster web UI generation.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="""Pre-compute PPSD cache files for all downloaded position files.
+
+For every  <stem>.arrow  file under DATA_DIR, writes a sibling sidecar:
+  <stem>_ppsd.arrow
+
+Each sidecar stores a sparse histogram (component, period-bin, power-bin, count)
+derived from a Hanning-windowed FFT.  The web UI PPSD Generation page uses these
+caches so that grouping / re-grouping is nearly instant; without them the FFT is
+run on demand per file (much slower on large date ranges).
+
+Already-existing cache files are skipped unless --overwrite is given.
+
+Station selection: use -i/--input (station list) or --all for all indexed stations.
+Date range: use --start / --end to restrict which files are processed.
+
+Examples:
+  es-pos process ppsd
+  es-pos process ppsd --overwrite
+  es-pos process ppsd -i ShakeAlert --start 2026-01-01 --end 2026-01-31
+  es-pos process ppsd --data-dir /data/archive/arrow
+""",
+    )
+    ppsd_proc_p.add_argument(
+        "-i", "--input",
+        action="append",
+        metavar="LIST",
+        dest="input",
+        help=(
+            "Station list name or file.  May be repeated.  "
+            "Resolved as: path, path+.jsonl, data/station-lists/<name>.jsonl.  "
+            "Mutually exclusive with --all."
+        ),
+    )
+    ppsd_proc_p.add_argument(
+        "--all", action="store_true",
+        help="Process all .arrow files under DATA_DIR (default: ./data/arrow).  Mutually exclusive with -i.",
+    )
+    ppsd_proc_p.add_argument(
+        "--data-dir",
+        metavar="PATH",
+        help="Root of the Arrow data tree (default: ./data/arrow).",
+    )
+    ppsd_proc_p.add_argument(
+        "--start",
+        metavar="YYYY-MM-DD",
+        help="Only process files on or after this date.",
+    )
+    ppsd_proc_p.add_argument(
+        "--end",
+        metavar="YYYY-MM-DD",
+        help="Only process files on or before this date.",
+    )
+    ppsd_proc_p.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Regenerate cache files even if they already exist.",
+    )
+    ppsd_proc_p.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Number of parallel worker threads (default: number of CPU cores).",
+    )
+    ppsd_proc_p.add_argument(
+        "--quiet", "-q",
+        action="store_true",
+        help="Suppress per-file progress output.",
+    )
+
     comp_p = process_sub.add_parser(
         "completeness",
         help="Generate .completeness.arrow files for all downloaded position files.",
@@ -930,6 +1011,106 @@ def _cmd_process_completeness(args: argparse.Namespace) -> None:
     )
 
 
+def _cmd_process_ppsd(args: argparse.Namespace) -> None:
+    import datetime as _dt
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from earthscope_positions.export.ppsd_writer import (
+        cache_path_for, compute_ppsd_cache, load_ppsd_cache,
+    )
+
+    data_dir = (
+        pathlib.Path(args.data_dir) if getattr(args, "data_dir", None)
+        else _project_root() / "data" / "arrow"
+    )
+    if not data_dir.exists():
+        sys.exit(f"Data directory not found: {data_dir}")
+
+    if args.all and getattr(args, "input", None):
+        sys.exit("--all and -i/--input are mutually exclusive.")
+
+    if args.all:
+        geosncls = sorted(
+            d.name for d in data_dir.iterdir()
+            if d.is_dir() and not d.name.startswith(".")
+        )
+    elif getattr(args, "input", None):
+        geosncls = _load_geosncls_from_lists(args.input)
+    else:
+        # Default: process everything
+        geosncls = sorted(
+            d.name for d in data_dir.iterdir()
+            if d.is_dir() and not d.name.startswith(".")
+        )
+
+    if not geosncls:
+        sys.exit("No stations found.")
+
+    start = _dt.date.fromisoformat(args.start) if getattr(args, "start", None) else None
+    end   = _dt.date.fromisoformat(args.end)   if getattr(args, "end", None) else None
+
+    # Collect arrow files
+    arrow_files: list[pathlib.Path] = []
+    for gs in geosncls:
+        gs_dir = data_dir / gs
+        if not gs_dir.exists():
+            continue
+        prefix = gs + "_"
+        for p in sorted(gs_dir.rglob("*.arrow")):
+            if ".completeness" in p.name or "_ppsd" in p.name:
+                continue
+            stem = p.stem
+            if not stem.startswith(prefix):
+                continue
+            rest = stem[len(prefix):]
+            try:
+                file_date = _dt.date(int(rest[:4]), int(rest[4:6]), int(rest[6:8]))
+            except (ValueError, IndexError):
+                continue
+            if start and file_date < start:
+                continue
+            if end and file_date > end:
+                continue
+            arrow_files.append(p)
+
+    if not arrow_files:
+        print("No Arrow files found for the selected stations/date range.", file=sys.stderr)
+        sys.exit(0)
+
+    # Separate files that need (re)computation
+    todo = [p for p in arrow_files if args.overwrite or not cache_path_for(p).exists()]
+    skip = len(arrow_files) - len(todo)
+    print(
+        f"Found {len(arrow_files)} file(s).  "
+        f"To compute: {len(todo)}  |  Already cached: {skip}",
+        file=sys.stderr,
+    )
+    if not todo:
+        print("All caches up to date.", file=sys.stderr)
+        sys.exit(0)
+
+    n_workers = args.workers or (os.cpu_count() or 4)
+    done = 0
+    errors = 0
+
+    with ThreadPoolExecutor(max_workers=n_workers, thread_name_prefix="ppsd-cli") as pool:
+        futures = {pool.submit(compute_ppsd_cache, p): p for p in todo}
+        for fut in as_completed(futures):
+            p = futures[fut]
+            done += 1
+            try:
+                fut.result()
+                if not args.quiet:
+                    print(f"  [{done}/{len(todo)}] {p.name}", file=sys.stderr)
+            except Exception as exc:
+                errors += 1
+                print(f"  [error] {p}: {exc}", file=sys.stderr)
+
+    print(
+        f"\nDone.  Computed: {done - errors}  |  Errors: {errors}",
+        file=sys.stderr,
+    )
+
+
 def _cmd_replay(args: argparse.Namespace) -> None:
     from earthscope_positions.replay.replay import (
         filter_geosncls, run_cli,
@@ -1010,9 +1191,9 @@ def main() -> None:
     elif group == "process":
         process_cmd = getattr(args, "process_cmd", None)
         if process_cmd == "completeness":
-            # parse_known_args already resolved --data-dir/--overwrite/--sampling-hz
-            # into args via the nested completeness subparser definition above.
             _cmd_process_completeness(args)
+        elif process_cmd == "ppsd":
+            _cmd_process_ppsd(args)
         else:
             process_p.print_help()
             sys.exit(0)

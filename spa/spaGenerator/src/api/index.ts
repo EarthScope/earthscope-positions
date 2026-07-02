@@ -126,6 +126,12 @@ export async function replayGo(jobId: string): Promise<{ status: string }> {
   return r.data;
 }
 
+/** Start the currently-preloaded replay without supplying a job_id. Used for external curl triggers. */
+export async function replayStart(): Promise<{ status: string }> {
+  const r = await http.post<{ status: string }>("/replay/start");
+  return r.data;
+}
+
 export async function replayCancel(jobId: string): Promise<{ status: string }> {
   const r = await http.post<{ status: string }>(`/replay/${encodeURIComponent(jobId)}/cancel`);
   return r.data;

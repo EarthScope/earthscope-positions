@@ -1,5 +1,21 @@
 <template>
   <q-page class="q-pa-md">
+    <PageHelp title="Completeness &amp; Latency">
+      <p>Color-coded heatmap of data availability per station per time window.</p>
+      <div class="help-section-label">Color scale</div>
+      <ul>
+        <li><strong>White</strong> — not yet attempted</li>
+        <li><strong>Grey</strong> — fetch error (API unreachable or no data)</li>
+        <li><strong>Red → Yellow → Green</strong> — 0 % → 50 % → 100 % completeness</li>
+      </ul>
+      <div class="help-section-label">Usage</div>
+      <ul>
+        <li>Select a station list and date range, then click <strong>Load</strong></li>
+        <li>Results are paginated; use the arrows to step through stations</li>
+        <li>Click <strong>Fetch Missing</strong> to download data for stations that have never been tried</li>
+        <li>The <em>Latency</em> heatmap below shows ingest delay in seconds</li>
+      </ul>
+    </PageHelp>
 
     <!-- ── Controls ────────────────────────────────────────────────────── -->
     <div class="row items-end q-gutter-sm q-mb-sm">
@@ -338,10 +354,11 @@ const BATCH_OPTIONS = [
 ];
 
 const COMPLETENESS_LEGEND = [
-  { label: "Not tried", color: "#ffffff", border: true },
-  { label: "0%",        color: "hsl(0,100%,50%)"   },
-  { label: "50%",       color: "hsl(60,100%,60%)"  },
-  { label: "100%",      color: "hsl(120,100%,30%)" },
+  { label: "Not tried",    color: "#ffffff",           border: true },
+  { label: "Fetch error",  color: "#9e9e9e",           border: false },
+  { label: "0%",           color: "hsl(0,100%,50%)"   },
+  { label: "50%",          color: "hsl(60,100%,60%)"  },
+  { label: "100%",         color: "hsl(120,100%,30%)" },
 ];
 
 // Linear piecewise: 0 s → green, 1.5 s → yellow, 5 s → red

@@ -37,6 +37,7 @@ import re
 import sys
 import time
 from collections import defaultdict
+import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
@@ -61,6 +62,10 @@ _data_dir_override: pathlib.Path | None = None
 SCAN_INTERVAL_S = 60  # seconds between background index refreshes
 
 _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="completeness-gen")
+_ppsd_pool = ThreadPoolExecutor(
+    max_workers=max(2, (os.cpu_count() or 4)),
+    thread_name_prefix="ppsd-cache",
+)
 
 # Loaded at startup for the station builder map endpoint
 _station_builder_coords = None  # earthscope_positions.coordinates.Coordinates | None
@@ -121,7 +126,7 @@ def _scan_data_dir_sync(data_dir: pathlib.Path) -> dict[str, list[tuple[dt.date,
     if not data_dir.exists():
         return index
     for arrow_path in sorted(data_dir.rglob("*.arrow")):
-        if ".completeness" in arrow_path.name:
+        if ".completeness" in arrow_path.name or "_ppsd" in arrow_path.name:
             continue
         # Expected layout: data_dir/GEOSNCL/YYYYMM/GEOSNCL_<dateT>_<dateT>.arrow
         try:
@@ -1047,8 +1052,7 @@ class _ReplayPreloadBody(BaseModel):
     start_time: str = ""
     stop_time: str = ""
     filter_centers: list[str] = []
-    filter_solutions: list[str] = []
-    filter_types: list[str] = []
+    filter_sol_types: list[str] = []
     time_scale: float = 1.0
     apply_latency: bool = True
     bootstrap_server: str = "localhost:9092"
@@ -1096,8 +1100,7 @@ async def api_replay_preload(body: _ReplayPreloadBody) -> JSONResponse:
     geosncls = _replay_mod.filter_geosncls(
         geosncls,
         body.filter_centers,
-        body.filter_solutions,
-        body.filter_types,
+        body.filter_sol_types,
     )
 
     start_data_ms = int(start_dt.timestamp() * 1000)
@@ -1122,6 +1125,22 @@ async def api_replay_preload(body: _ReplayPreloadBody) -> JSONResponse:
 @app.get("/api/replay/status")
 async def api_replay_status() -> JSONResponse:
     return JSONResponse(_replay_mod.get_state())
+
+
+@app.post("/api/replay/start", response_model=None)
+async def api_replay_start() -> JSONResponse:
+    """Start the currently-preloaded replay (no job_id required — for external curl triggers)."""
+    state = _replay_mod.get_state()
+    status = state.get("status")
+    if status == "running" or status == "starting":
+        return JSONResponse({"status": "running", "job_id": state.get("job_id")})
+    ok = _replay_mod.start_preloaded()
+    if not ok:
+        return JSONResponse(
+            {"error": f"No preloaded replay ready (status={status!r})"},
+            status_code=409,
+        )
+    return JSONResponse({"status": "running"})
 
 
 @app.post("/api/replay/{job_id}/go", response_model=None)
@@ -1159,44 +1178,113 @@ async def api_readme() -> JSONResponse:
     return JSONResponse({"content": path.read_text(encoding="utf-8")})
 
 
+# ── /api/station-lists/filter-options ────────────────────────────────────────
+
+def _all_list_geosncls() -> list[str]:
+    """Return a deduplicated sorted list of all geosncls from every station list file."""
+    d = _station_lists_dir()
+    if not d.exists():
+        return []
+    seen: set[str] = set()
+    for path in sorted(d.iterdir()):
+        if path.suffix not in (".jsonl", ".json"):
+            continue
+        try:
+            records = _read_station_list_file(path)
+            for rec in records:
+                g = rec.get("geosncl") or rec.get("edid", "")
+                if g:
+                    seen.add(g)
+        except Exception:
+            pass
+    return sorted(seen)
+
+
+@app.get("/api/station-lists/filter-options")
+async def api_station_lists_filter_options(
+    lists: list[str] = Query([]),
+) -> JSONResponse:
+    """Return available centers and combined sol_type codes for the given lists.
+
+    If lists is empty, scans all station list files.
+    """
+    if lists:
+        geosncl_set: set[str] = set()
+        for lst in lists:
+            geosncl_set.update(_geosncls_for_list(lst))
+        geosncls = sorted(geosncl_set)
+    else:
+        geosncls = _all_list_geosncls()
+
+    centers_set:   set[str] = set()
+    sol_types_set: set[str] = set()
+    for gs in geosncls:
+        parts = gs.split(".")
+        if len(parts) < 4:
+            continue
+        centers_set.add(parts[1])
+        loc = parts[3]
+        if len(loc) >= 2:
+            sol_types_set.add(loc[:2])
+
+    return JSONResponse({
+        "centers":   sorted(centers_set),
+        "sol_types": sorted(sol_types_set),
+    })
+
+
 # ── /api/ppsd ─────────────────────────────────────────────────────────────────
 
+_SOL_LABELS: dict[str, str] = {
+    "0": "CWU", "1": "PIVOT", "2": "RTNet", "3": "Septa", "4": "RTX", "5": "Net", "6": "JPL",
+}
+_TYPE_LABELS: dict[str, str] = {
+    "0": "Fast", "1": "RTK", "2": "Compl", "3": "F+C",
+}
 _PPP_SOL_LABELS: dict[str, str] = {
     "0": "CWU Fastlane", "1": "Trimble PIVOT", "2": "RTNet",
     "3": "Septentrio", "4": "RTX on-board", "5": "Network", "6": "JPL PPP",
-}
-_TYPE_LABELS: dict[str, str] = {
-    "0": "PPP/AR FAST", "1": "DIF/RTK", "2": "PPP/AR COMPLETE", "3": "PPP/AR FAST+COMPL",
 }
 _CENTER_LABELS: dict[str, str] = {
     "PB": "EarthScope", "PW": "CWU", "NC": "USGS Menlo Park", "BK": "UCB", "CI": "USGS Pasadena",
 }
 
 
+def _sol_type_label(code: str) -> str:
+    """Return a readable label for a 2-char sol_type code like '30' → 'Septa Fast'."""
+    sol = _SOL_LABELS.get(code[0], code[0]) if code else ""
+    typ = _TYPE_LABELS.get(code[1], code[1]) if len(code) > 1 else ""
+    return f"{sol} {typ}".strip()
+
+
 def _ppsd_group_key(gs: str, mode: str) -> str | None:
+    if mode == "all":
+        return "__all__"
     parts = gs.split(".")
     if len(parts) < 4:
         return None
     center = parts[1]
     loc = parts[3]
-    sol = loc[0] if loc else ""
+    sol_type = loc[:2]
     if mode == "by-center":
         return center
     if mode == "by-solution":
-        return sol
+        return sol_type
     if mode == "by-center-solution":
-        return f"{center}\x00{sol}"
+        return f"{center}\x00{sol_type}"
     return gs  # by-stream: key = geosncl itself
 
 
 def _ppsd_group_label(key: str, mode: str) -> str:
+    if mode == "all":
+        return "All Stations"
     if mode == "by-center":
         return f"{key} ({_CENTER_LABELS.get(key, key)})"
     if mode == "by-solution":
-        return f"Sol-{key} ({_PPP_SOL_LABELS.get(key, key)})"
+        return f"Sol {key} ({_sol_type_label(key)})"
     if mode == "by-center-solution":
-        c, s = key.split("\x00", 1)
-        return f"{c}.{s} ({_CENTER_LABELS.get(c, c)} / {_PPP_SOL_LABELS.get(s, s)})"
+        c, st = key.split("\x00", 1)
+        return f"{c}.{st} ({_CENTER_LABELS.get(c, c)} / {_sol_type_label(st)})"
     return key  # by-stream
 
 
@@ -1207,8 +1295,7 @@ async def api_ppsd_run(
     end: str = Query(...),
     mode: str = Query("by-stream"),
     centers: str = Query(""),    # comma-sep filter; empty = all
-    solutions: str = Query(""),  # comma-sep filter; empty = all
-    types: str = Query(""),      # comma-sep filter; empty = all
+    sol_types: str = Query(""),  # comma-sep combined 2-char codes; empty = all
 ) -> StreamingResponse:
     def _sse(obj: dict) -> str:
         return f"data: {json.dumps(obj)}\n\n"
@@ -1227,27 +1314,24 @@ async def api_ppsd_run(
             yield _sse({"type": "done", "code": 1})
             return
 
-        center_f   = [c.strip() for c in centers.split(",")   if c.strip()]
-        solution_f = [s.strip() for s in solutions.split(",") if s.strip()]
-        type_f     = [t.strip() for t in types.split(",")     if t.strip()]
+        center_f    = [c.strip() for c in centers.split(",")   if c.strip()]
+        sol_type_f  = [s.strip() for s in sol_types.split(",") if s.strip()]
 
         # Resolve all geosncls from the selected lists
         geosncl_set: set[str] = set()
         for lst in lists:
             geosncl_set.update(_geosncls_for_list(lst))
 
-        # Filter by center / solution / type
+        # Filter by center / sol_type (combined 2-char code)
         def _matches(gs: str) -> bool:
             parts = gs.split(".")
             if len(parts) < 4:
                 return True
             c   = parts[1]
             loc = parts[3]
-            s   = loc[0] if loc else ""
-            t   = loc[1] if len(loc) > 1 else ""
-            if center_f   and c not in center_f:   return False
-            if solution_f and s not in solution_f: return False
-            if type_f     and t not in type_f:     return False
+            st  = loc[:2]
+            if center_f   and c  not in center_f:   return False
+            if sol_type_f and st not in sol_type_f: return False
             return True
 
         filtered = sorted(g for g in geosncl_set if _matches(g))
@@ -1283,45 +1367,71 @@ async def api_ppsd_run(
             groups = [(k, sorted(v)) for k, v in sorted(group_map.items())]
 
         n_groups = len(groups)
-        yield _sse({"type": "log", "msg":
-            f"{len(gs_files)} stream(s) with data → {n_groups} group(s)  ({start} → {end})"})
 
         if n_groups == 0:
             yield _sse({"type": "error", "msg": "All groups are empty after filtering."})
             yield _sse({"type": "done", "code": 1})
             return
 
-        output_root = _project_root() / "data" / "plots" / "ppsd"
+        from earthscope_positions.export import ppsd_writer
+
+        # ── Phase 1: precompute missing caches in parallel ────────────────────
+        all_files = sorted({f for _, files in groups for f in files})
+        missing = [f for f in all_files if ppsd_writer.load_ppsd_cache(f) is None]
+
+        yield _sse({"type": "log", "msg":
+            f"{len(gs_files)} stream(s), {n_groups} group(s), {len(all_files)} file(s)"
+            f"  ({start} → {end})  —  {len(all_files) - len(missing)} cached, {len(missing)} to compute"})
+
         loop = asyncio.get_event_loop()
+
+        if missing:
+            n_workers = max(2, (os.cpu_count() or 4))
+            yield _sse({"type": "log", "msg":
+                f"Computing PPSD cache for {len(missing)} file(s) using {n_workers} workers…"})
+            n_cached = 0
+            futs = [
+                asyncio.ensure_future(loop.run_in_executor(_ppsd_pool, ppsd_writer.ensure_ppsd_cache, f))
+                for f in missing
+            ]
+            for coro in asyncio.as_completed(futs):
+                try:
+                    await coro
+                except Exception as exc:
+                    yield _sse({"type": "error", "msg": f"Cache compute error: {exc}"})
+                n_cached += 1
+                yield _sse({"type": "progress",
+                            "msg": f"Cached {n_cached}/{len(missing)}",
+                            "current": n_cached, "total": len(missing)})
+
+        # ── Phase 2: merge cached data and render one PNG per group ───────────
+        yield _sse({"type": "log", "msg": f"Rendering {n_groups} plot(s) from cached histograms…"})
+        run_dir = _project_root() / "data" / "plots" / "ppsd" / f"{start}_{end}"
         written_total = 0
 
         for i, (key, files) in enumerate(groups):
             label = _ppsd_group_label(key, mode)
-            yield _sse({"type": "progress", "msg": f"Processing {i + 1} of {n_groups}: {label}",
-                        "current": i + 1, "total": n_groups})
+            title_prefix = "" if mode == "by-stream" else "Combined"
 
-            separate = (mode == "by-stream")
-            group_label = None if separate else key.replace("\x00", ".")
-
-            def _run(files=files, separate=separate, group_label=group_label):
-                from earthscope_positions.export.ppsd_writer import write_ppsd
-                return write_ppsd(
-                    files, output_root,
-                    start=start_date, end=end_date,
-                    separate=separate, verbose=False,
-                    group_label=group_label,
+            def _render(files=files, label=label, title_prefix=title_prefix):
+                from earthscope_positions.export import ppsd_writer as pw
+                return pw.write_ppsd_from_caches(
+                    files, run_dir,
+                    label=label, title_prefix=title_prefix,
                 )
 
             try:
-                written: list[pathlib.Path] = await loop.run_in_executor(_executor, _run)
-                written_total += len(written)
-                for p in written:
+                p: pathlib.Path | None = await loop.run_in_executor(_executor, _render)
+                if p:
+                    written_total += 1
                     try:
                         rel = str(p.relative_to(_project_root()))
                     except ValueError:
                         rel = str(p)
                     yield _sse({"type": "file", "path": rel, "label": label,
                                 "current": i + 1, "total": n_groups})
+                else:
+                    yield _sse({"type": "log", "msg": f"  {label}: no valid data — skipped"})
             except Exception as exc:
                 yield _sse({"type": "error", "msg": f"{label}: {exc}"})
 

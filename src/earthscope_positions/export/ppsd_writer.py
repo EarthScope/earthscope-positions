@@ -10,6 +10,11 @@ X-axis:  log10(period) from 1 s to 10 000 s
 Y-axis:  power in dB (m²/Hz)
 Output:  3-panel PNG  (East | North | Up)  per station or per station-group
 
+Cache:
+  Each source arrow file gets a sidecar *_ppsd.arrow* file storing a sparse
+  representation of the three (E, N, U) histograms.  Subsequent runs skip the
+  FFT step entirely and just merge the cached counts.
+
 CLI:
   es-pos export ppsd --all
   es-pos export ppsd data/arrow/P143.CI.LY_.20/202601/*.arrow
@@ -28,6 +33,7 @@ matplotlib.use("Agg")
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
+import pyarrow as pa
 import pyarrow.ipc as ipc
 
 # ── PPSD parameters (matching MonitorApplication.java) ────────────────────────
@@ -55,12 +61,6 @@ _P_BINS      = np.clip(
     0, N_PERIOD_BINS - 1,
 )
 
-# For each period bin: indices into _KS whose log-period maps to that bin.
-# Used to average linear power within a period bin before histogramming.
-_BIN_INDICES: list[np.ndarray] = [
-    np.where(_P_BINS == p)[0] for p in range(N_PERIOD_BINS)
-]
-
 # Right-axis sigma labels (white-noise standard deviation)
 _SIGMA_M      = [0.0001, 0.0003, 0.001, 0.003, 0.01, 0.03, 0.1, 0.3, 1.0]
 _SIGMA_LABELS = ["0.1mm", "0.3mm", "1mm", "3mm", "1cm", "3cm", "10cm", "30cm", "1m"]
@@ -70,6 +70,16 @@ _PERIOD_TICKS_S = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000]
 _PERIOD_TICK_LABELS = ["1s", "2s", "5s", "10s", "20s", "50s",
                        "100s", "200s", "500s", "1ks", "2ks", "5ks", "10ks"]
 _PERIOD_TICK_X = [np.log10(p) for p in _PERIOD_TICKS_S]
+
+# ── Sparse cache schema ────────────────────────────────────────────────────────
+PPSD_CACHE_SUFFIX = "_ppsd.arrow"
+
+_CACHE_SCHEMA = pa.schema([
+    pa.field("component", pa.uint8()),   # 0=E, 1=N, 2=U
+    pa.field("p_bin",     pa.uint16()),
+    pa.field("q_bin",     pa.uint16()),
+    pa.field("count",     pa.uint32()),
+])
 
 
 # ---------------------------------------------------------------------------
@@ -90,45 +100,45 @@ def ppsd_colormap() -> mcolors.LinearSegmentedColormap:
 
 
 # ---------------------------------------------------------------------------
-# Core computation
+# Core computation (vectorized)
 # ---------------------------------------------------------------------------
 
 def accumulate_ppsd(signal: np.ndarray, histogram: np.ndarray) -> int:
     """Add Hanning-windowed, 50%-overlap FFT segments into *histogram* (in-place).
 
-    Full-resolution power spectrum is computed first; linear power is then
-    averaged within each log-period bin (downsample in frequency space) before
-    the single averaged value is placed in the histogram.  This gives every
-    period bin exactly one count per frame regardless of how many FFT bins it
-    contains, and avoids biasing short-period bins by their higher FFT density.
-
-    Returns the number of frames added."""
+    Linear power is averaged per log-period bin via np.bincount (vectorized),
+    then the bin's dB value is histogrammed.  Returns the number of frames added.
+    """
     n = len(signal)
     if n < WINDOW:
         return 0
     frames = 0
+    bin_counts = np.bincount(_P_BINS, minlength=N_PERIOD_BINS).astype(float)
+    valid_period = bin_counts > 0  # period bins that have at least one FFT bin
+
     for start in range(0, n - WINDOW + 1, STEP):
         segment = signal[start : start + WINDOW] * _HANNING
         padded = np.zeros(NFFT)
         padded[:WINDOW] = segment
         fft_vals = np.fft.rfft(padded)
-        # Full-resolution linear power spectrum
+
         power = (np.abs(fft_vals) ** 2) / _HANNING_WSS
         power[1:-1] *= 2.0
-        power_ks = power[_KS]  # select in-range frequency bins (linear power)
+        power_ks = power[_KS]
 
-        # Downsample in frequency: average linear power within each period bin,
-        # then convert the averaged value to dB for histogramming.
-        for p_bin, idx in enumerate(_BIN_INDICES):
-            if len(idx) == 0:
-                continue
-            avg_db = 10.0 * np.log10(float(power_ks[idx].mean()) or 1e-60)
-            if not np.isfinite(avg_db):
-                continue
-            q_bin = int((avg_db - POWER_MIN) / (POWER_MAX - POWER_MIN) * N_POWER_BINS)
-            if 0 <= q_bin < N_POWER_BINS:
-                histogram[p_bin, q_bin] += 1
+        # Average linear power within each period bin (vectorized)
+        bin_sum = np.bincount(_P_BINS, weights=power_ks, minlength=N_PERIOD_BINS)
+        avg_lin = np.where(valid_period, bin_sum / np.where(valid_period, bin_counts, 1.0), 0.0)
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            avg_db = np.where(avg_lin > 0, 10.0 * np.log10(avg_lin), -1e9)
+
+        q_bins = ((avg_db - POWER_MIN) / (POWER_MAX - POWER_MIN) * N_POWER_BINS).astype(int)
+        in_range = valid_period & (q_bins >= 0) & (q_bins < N_POWER_BINS)
+
+        np.add.at(histogram, (np.where(in_range)[0], q_bins[in_range]), 1)
         frames += 1
+
     return frames
 
 
@@ -147,6 +157,168 @@ def load_arrow_enu(path: pathlib.Path) -> tuple[np.ndarray, np.ndarray, np.ndarr
     n = np.array([v if v is not None else np.nan for v in north], dtype=float)
     u = np.array([v if v is not None else np.nan for v in up],    dtype=float)
     return e, n, u
+
+
+# ---------------------------------------------------------------------------
+# Sparse PPSD cache
+# ---------------------------------------------------------------------------
+
+def cache_path_for(arrow_path: pathlib.Path) -> pathlib.Path:
+    return arrow_path.with_name(arrow_path.stem + PPSD_CACHE_SUFFIX)
+
+
+def _histograms_to_sparse(
+    hist_e: np.ndarray, hist_n: np.ndarray, hist_u: np.ndarray,
+    frames_e: int, frames_n: int, frames_u: int,
+    geosncl: str, date_str: str,
+) -> pa.Table | None:
+    """Convert three dense histograms to a single sparse Arrow table."""
+    rows_comp: list[int] = []
+    rows_p:    list[int] = []
+    rows_q:    list[int] = []
+    rows_cnt:  list[int] = []
+
+    for comp_idx, hist in enumerate([hist_e, hist_n, hist_u]):
+        ps, qs = np.nonzero(hist)
+        for p, q in zip(ps.tolist(), qs.tolist()):
+            rows_comp.append(comp_idx)
+            rows_p.append(int(p))
+            rows_q.append(int(q))
+            rows_cnt.append(int(hist[p, q]))
+
+    if not rows_comp:
+        return None
+
+    metadata = {
+        b"geosncl":      geosncl.encode(),
+        b"date":         date_str.encode(),
+        b"frames_e":     str(frames_e).encode(),
+        b"frames_n":     str(frames_n).encode(),
+        b"frames_u":     str(frames_u).encode(),
+        b"window":       str(WINDOW).encode(),
+        b"nfft":         str(NFFT).encode(),
+        b"power_min":    str(POWER_MIN).encode(),
+        b"power_max":    str(POWER_MAX).encode(),
+        b"n_period_bins": str(N_PERIOD_BINS).encode(),
+        b"n_power_bins":  str(N_POWER_BINS).encode(),
+    }
+    schema = _CACHE_SCHEMA.with_metadata(metadata)
+    return pa.table(
+        {
+            "component": np.array(rows_comp, dtype=np.uint8),
+            "p_bin":     np.array(rows_p,    dtype=np.uint16),
+            "q_bin":     np.array(rows_q,    dtype=np.uint16),
+            "count":     np.array(rows_cnt,  dtype=np.uint32),
+        },
+        schema=schema,
+    )
+
+
+def compute_ppsd_cache(arrow_path: pathlib.Path) -> pathlib.Path | None:
+    """Compute PPSD for one arrow file and write a sparse sidecar cache.
+
+    Returns the cache path on success, None if the file has no valid data.
+    Safe to call from a thread pool — all numpy operations release the GIL.
+    """
+    try:
+        east, north, up = load_arrow_enu(arrow_path)
+    except Exception:
+        return None
+
+    mask = np.isfinite(east) & np.isfinite(north) & np.isfinite(up)
+    e, n, u = east[mask], north[mask], up[mask]
+
+    hist_e = np.zeros((N_PERIOD_BINS, N_POWER_BINS), dtype=np.int64)
+    hist_n = np.zeros((N_PERIOD_BINS, N_POWER_BINS), dtype=np.int64)
+    hist_u = np.zeros((N_PERIOD_BINS, N_POWER_BINS), dtype=np.int64)
+
+    frames_e = accumulate_ppsd(e, hist_e)
+    frames_n = accumulate_ppsd(n, hist_n)
+    frames_u = accumulate_ppsd(u, hist_u)
+
+    if frames_e == 0 and frames_n == 0 and frames_u == 0:
+        return None
+
+    geosncl = _geosncl_from_path(arrow_path) or ""
+    m = re.search(r"(\d{4})(\d{2})(\d{2})T", arrow_path.stem)
+    date_str = f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else ""
+
+    table = _histograms_to_sparse(hist_e, hist_n, hist_u, frames_e, frames_n, frames_u, geosncl, date_str)
+    if table is None:
+        return None
+
+    cp = cache_path_for(arrow_path)
+    with open(cp, "wb") as f:
+        writer = ipc.new_stream(f, table.schema)
+        writer.write_table(table)
+        writer.close()
+
+    return cp
+
+
+def load_ppsd_cache(arrow_path: pathlib.Path) -> pa.Table | None:
+    """Load the sidecar cache for *arrow_path* if it exists and is structurally valid."""
+    cp = cache_path_for(arrow_path)
+    if not cp.exists():
+        return None
+    try:
+        with open(cp, "rb") as f:
+            table = ipc.open_stream(f).read_all()
+        required = {"component", "p_bin", "q_bin", "count"}
+        if required.issubset(set(table.column_names)):
+            return table
+    except Exception:
+        pass
+    return None
+
+
+def ensure_ppsd_cache(arrow_path: pathlib.Path) -> pathlib.Path | None:
+    """Return path to a valid cache, computing it first if missing.
+
+    Called from the thread pool — returns None if the file yields no valid data.
+    """
+    if load_ppsd_cache(arrow_path) is not None:
+        return cache_path_for(arrow_path)
+    return compute_ppsd_cache(arrow_path)
+
+
+# ---------------------------------------------------------------------------
+# Merge
+# ---------------------------------------------------------------------------
+
+def merge_sparse_tables(
+    tables: list[pa.Table],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """Merge a list of sparse PPSD cache tables into three dense histograms.
+
+    Returns (hist_e, hist_n, hist_u, total_frames_e).
+    """
+    empty = (
+        np.zeros((N_PERIOD_BINS, N_POWER_BINS), dtype=np.int64),
+        np.zeros((N_PERIOD_BINS, N_POWER_BINS), dtype=np.int64),
+        np.zeros((N_PERIOD_BINS, N_POWER_BINS), dtype=np.int64),
+        0,
+    )
+    if not tables:
+        return empty
+
+    all_comp = np.concatenate([t.column("component").to_numpy() for t in tables])
+    all_p    = np.concatenate([t.column("p_bin").to_numpy()     for t in tables])
+    all_q    = np.concatenate([t.column("q_bin").to_numpy()     for t in tables])
+    all_c    = np.concatenate([t.column("count").to_numpy()     for t in tables])
+
+    hist = np.zeros((3, N_PERIOD_BINS, N_POWER_BINS), dtype=np.int64)
+    np.add.at(hist, (all_comp, all_p, all_q), all_c)
+
+    total_frames = 0
+    for t in tables:
+        meta = t.schema.metadata or {}
+        try:
+            total_frames += int(meta.get(b"frames_e", b"0"))
+        except (ValueError, TypeError):
+            pass
+
+    return hist[0], hist[1], hist[2], total_frames
 
 
 # ---------------------------------------------------------------------------
@@ -198,12 +370,10 @@ def _geosncl_from_path(arrow_path: pathlib.Path) -> str | None:
 
 
 def _safe_stem(geosncl: str) -> str:
-    """Make a filename-safe string from a geosncl (dots are fine in filenames)."""
     return geosncl
 
 
 def _date_range_label(arrow_files: Sequence[pathlib.Path]) -> str:
-    """Build a date-range string like '2026-01-02_2026-01-18' from arrow file names."""
     dates: list[dt.date] = []
     for p in arrow_files:
         m = re.search(r"(\d{8})T", p.stem)
@@ -218,7 +388,68 @@ def _date_range_label(arrow_files: Sequence[pathlib.Path]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Main: write PPSDs
+# Cache-based render (fast path used by the web API)
+# ---------------------------------------------------------------------------
+
+def write_ppsd_from_caches(
+    files: list[pathlib.Path],
+    run_dir: pathlib.Path,
+    *,
+    label: str,
+    title_prefix: str = "",
+    verbose: bool = False,
+) -> pathlib.Path | None:
+    """Merge cached PPSD data for *files* and render a PNG into *run_dir*.
+
+    Any file whose cache is missing is computed on-the-fly (fallback).
+    Returns the written PNG path, or None if no valid data was found.
+    """
+    tables: list[pa.Table] = []
+    for path in files:
+        t = load_ppsd_cache(path)
+        if t is None:
+            # Cache was missing — try to compute it now (single-threaded fallback)
+            compute_ppsd_cache(path)
+            t = load_ppsd_cache(path)
+        if t is not None:
+            tables.append(t)
+
+    if not tables:
+        return None
+
+    hist_e, hist_n, hist_u, total_frames = merge_sparse_tables(tables)
+    if total_frames == 0:
+        return None
+
+    cmap = ppsd_colormap()
+    n_files = len(files)
+    pfx = f"{title_prefix} " if title_prefix else ""
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    fig.patch.set_facecolor("white")
+    for ax, hist, comp in zip(axes, [hist_e, hist_n, hist_u], ["East", "North", "Up"]):
+        plot_ppsd_panel(
+            ax, hist,
+            f"{pfx}{comp}  ({total_frames} frames, {n_files} file{'s' if n_files != 1 else ''})",
+            cmap,
+        )
+    fig.suptitle(f"PPSD — {label}", fontsize=11, fontweight="bold")
+    plt.tight_layout()
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    safe = re.sub(r"[^\w.+()-]", "_", label)
+    out = run_dir / f"ppsd-{safe}.png"
+    plt.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    if verbose:
+        print(f"  [ppsd] {label}: {total_frames} frames, {n_files} files → {out}", file=sys.stderr)
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Legacy: write PPSDs directly (used by CLI)
 # ---------------------------------------------------------------------------
 
 def write_ppsd(
@@ -231,18 +462,13 @@ def write_ppsd(
     verbose: bool = True,
     group_label: str | None = None,
 ) -> list[pathlib.Path]:
-    """
-    Compute and write PPSD plots.
+    """Compute and write PPSD plots (legacy direct path, used by CLI).
 
     separate=True (default): one 3-panel PNG per geosncl.
     separate=False: accumulate all files into one combined plot.
-    group_label: override the label used for the combined plot filename/title.
-
-    Returns list of written PNG paths.
     """
     cmap = ppsd_colormap()
 
-    # Filter by date range if requested
     if start is not None or end is not None:
         filtered: list[pathlib.Path] = []
         for p in arrow_files:
@@ -270,7 +496,6 @@ def write_ppsd(
     written: list[pathlib.Path] = []
 
     if separate:
-        # Group by geosncl
         groups: dict[str, list[pathlib.Path]] = {}
         for p in arrow_files:
             g = _geosncl_from_path(p)
@@ -283,7 +508,6 @@ def write_ppsd(
             if out:
                 written.append(out)
     else:
-        # Combine all into one
         if group_label:
             label = group_label
         else:

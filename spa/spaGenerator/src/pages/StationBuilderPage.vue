@@ -24,21 +24,16 @@ const PROC_CENTERS: Record<string, string> = {
   CI: 'USGS Pasadena',
 };
 
-const PPP_SOLUTIONS: Record<string, string> = {
-  '0': 'CWU Fastlane',
-  '1': 'Trimble PIVOT/RTX',
-  '2': 'RTNet',
-  '3': 'Septentrio on-board',
-  '4': 'Trimble RTX on-board',
-  '5': 'Network (RTNet+Trimble)',
-  '6': 'JPL PPP Client',
-};
-
-const SOLUTION_TYPES: Record<string, string> = {
-  '0': 'PPP/AR FAST',
-  '1': 'DIF/RTK',
-  '2': 'PPP/AR COMPLETE',
-  '3': 'PPP/AR FAST+COMPLETE',
+const SOL_TYPE_LABELS: Record<string, string> = {
+  '00': 'CWU Fast',
+  '10': 'PIVOT Fast',
+  '12': 'PIVOT Complete',
+  '13': 'PIVOT Fast+Compl',
+  '20': 'RTNet Fast',
+  '30': 'Septa Fast',
+  '40': 'RTX Fast',
+  '50': 'Network Fast',
+  '60': 'JPL Fast',
 };
 
 const COLOR_UNSELECTED = '#9E9E9E';
@@ -68,8 +63,7 @@ const shiftHeld  = ref(false);
 
 // Filters (all = no filtering)
 const filterCenters   = ref<string[]>(Object.keys(PROC_CENTERS));
-const filterSolutions = ref<string[]>(Object.keys(PPP_SOLUTIONS));
-const filterTypes     = ref<string[]>(Object.keys(SOLUTION_TYPES));
+const filterSolTypes  = ref<string[]>(Object.keys(SOL_TYPE_LABELS));
 
 // Saved lists
 const listOptions    = ref<string[]>([]);
@@ -105,23 +99,19 @@ const selRectStyle = computed(() => {
 function passesFilter(gs: string): boolean {
   const parts = gs.split('.');
   if (parts.length < 4) return true;
-  const center = parts[1] ?? '';
-  const loc    = parts[3] ?? '';
-  const sol    = loc[0] ?? '';
-  const typ    = loc[1] ?? '';
+  const center   = parts[1] ?? '';
+  const solType  = (parts[3] ?? '').substring(0, 2);
   return filterCenters.value.includes(center)
-    && filterSolutions.value.includes(sol)
-    && filterTypes.value.includes(typ);
+    && (filterSolTypes.value.includes(solType) || filterSolTypes.value.length === 0);
 }
 
 function describeStream(gs: string): string {
   const parts = gs.split('.');
   if (parts.length < 4) return gs;
-  const ctr = PROC_CENTERS[parts[1] ?? ''] ?? parts[1] ?? '';
-  const loc  = parts[3] ?? '';
-  const sol  = PPP_SOLUTIONS[loc[0] ?? ''] ?? loc[0] ?? '?';
-  const typ  = SOLUTION_TYPES[loc[1] ?? ''] ?? loc[1] ?? '?';
-  return `${ctr} · ${sol} · ${typ}`;
+  const ctr     = PROC_CENTERS[parts[1] ?? ''] ?? parts[1] ?? '';
+  const solType = (parts[3] ?? '').substring(0, 2);
+  const label   = SOL_TYPE_LABELS[solType] ?? solType;
+  return `${ctr} · ${solType} ${label}`;
 }
 
 // ── Marker colours ────────────────────────────────────────────────────────────
@@ -500,6 +490,25 @@ watch(selectedLists, (names) => loadFromSelectedLists(names));
 
 <template>
   <q-page class="column no-wrap" style="height:calc(100vh - 50px); overflow:hidden">
+    <PageHelp title="Station Builder">
+      <p>Build reusable station lists by selecting stations on an interactive map.</p>
+      <div class="help-section-label">Selecting stations</div>
+      <ul>
+        <li><strong>Click</strong> a dot to select or deselect a single station (turns blue when selected)</li>
+        <li><strong>Shift + drag</strong> on the map to rectangle-select all stations in an area</li>
+        <li>Toggle <strong>Union</strong> (add) vs <strong>Intersection</strong> (keep shared) to control how new selections combine</li>
+      </ul>
+      <div class="help-section-label">Filtering</div>
+      <ul>
+        <li>Use the center and stream-type checkboxes in the left panel to narrow visible stations</li>
+        <li>Click <strong>Apply</strong> after changing filters</li>
+      </ul>
+      <div class="help-section-label">Saving</div>
+      <ul>
+        <li>Enter a name in the Save field and click <strong>Save</strong> to store the selection as a list</li>
+        <li>Saved lists appear in all other pages (Completeness, Positions, PPSD, Replay)</li>
+      </ul>
+    </PageHelp>
 
     <!-- ── Top controls bar ─────────────────────────────────────────────────── -->
     <div class="row items-center q-gutter-xs q-px-sm q-py-xs flex-shrink-0"
@@ -573,22 +582,12 @@ watch(selectedLists, (names) => loadFromSelectedLists(names));
             />
           </div>
 
-          <!-- PPP Solution -->
-          <div class="text-overline text-grey-7 q-mb-xs">PPP Solution</div>
+          <!-- Stream Type (PPP solution + solution type combined) -->
+          <div class="text-overline text-grey-7 q-mb-xs">Stream Type</div>
           <div class="column q-gutter-none q-mb-sm">
             <q-checkbox
-              v-for="[k, v] in Object.entries(PPP_SOLUTIONS)" :key="k"
-              v-model="filterSolutions" :val="k" dense size="xs"
-              :label="`${k}: ${v}`"
-            />
-          </div>
-
-          <!-- Solution Type -->
-          <div class="text-overline text-grey-7 q-mb-xs">Solution Type</div>
-          <div class="column q-gutter-none q-mb-sm">
-            <q-checkbox
-              v-for="[k, v] in Object.entries(SOLUTION_TYPES)" :key="k"
-              v-model="filterTypes" :val="k" dense size="xs"
+              v-for="[k, v] in Object.entries(SOL_TYPE_LABELS)" :key="k"
+              v-model="filterSolTypes" :val="k" dense size="xs"
               :label="`${k}: ${v}`"
             />
           </div>

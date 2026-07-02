@@ -51,13 +51,13 @@ def _set(**kw: Any) -> None:
 def filter_geosncls(
     geosncls: list[str],
     centers: list[str],
-    solutions: list[str],
-    types: list[str],
+    sol_types: list[str],
 ) -> list[str]:
-    """Keep only geosncls matching the given center / PPP-solution / type lists.
+    """Keep only geosncls matching the given center and combined sol_type lists.
 
     Empty list for any parameter means "accept all".
-    GEOSNCL format: STATION.CENTER.LY_.ST  where ST[0]=solution, ST[1]=type.
+    GEOSNCL format: STATION.CENTER.LY_.ST  where ST[:2] is the combined
+    2-character solution+type code (e.g. "30" = Septa Fast).
     """
     out = []
     for gs in geosncls:
@@ -65,13 +65,11 @@ def filter_geosncls(
         if len(parts) < 4:
             out.append(gs)
             continue
-        center = parts[1]
-        loc    = parts[3]
-        sol    = loc[0] if loc else ""
-        typ    = loc[1] if len(loc) > 1 else ""
-        if centers   and center not in centers:   continue
-        if solutions and sol    not in solutions: continue
-        if types     and typ    not in types:     continue
+        center   = parts[1]
+        loc      = parts[3]
+        sol_type = loc[:2]
+        if centers   and center   not in centers:   continue
+        if sol_types and sol_type not in sol_types: continue
         out.append(gs)
     return out
 
@@ -100,7 +98,7 @@ def find_arrow_files(
         prefix = gs + "_"
         station_files: list[pathlib.Path] = []
         for p in sorted(gs_dir.rglob("*.arrow")):
-            if ".completeness" in p.name:
+            if ".completeness" in p.name or "_ppsd" in p.name:
                 continue
             stem = p.stem
             if not stem.startswith(prefix):
@@ -323,13 +321,27 @@ def _replay_worker(
 
     try:
         producer = Producer({
-            "bootstrap.servers":  bootstrap,
-            "security.protocol":  "PLAINTEXT",
-            "batch.num.messages": 500,
-            "linger.ms":          10,
+            "bootstrap.servers":         bootstrap,
+            "security.protocol":         "PLAINTEXT",
+            "batch.num.messages":        500,
+            "linger.ms":                 10,
+            # Fail fast when broker is unreachable:
+            "socket.timeout.ms":         10_000,
+            "request.timeout.ms":        10_000,
+            "message.timeout.ms":        15_000,   # give up on each message after 15s
+            "delivery.timeout.ms":       15_000,
+            "reconnect.backoff.max.ms":  2_000,
+            "socket.connection.setup.timeout.ms": 8_000,
         })
     except Exception as exc:
         _set(status="error", error=f"Kafka producer init failed: {exc}")
+        return
+
+    # Probe reachability: request metadata (times out quickly with settings above).
+    try:
+        producer.list_topics(timeout=8)
+    except Exception as exc:
+        _set(status="error", error=f"Kafka broker unreachable ({bootstrap}): {exc}")
         return
 
     total = get_state().get("total_messages", 0)
@@ -396,7 +408,14 @@ def _replay_worker(
                 except StopIteration:
                     del gens[item.gen_id]
 
-        producer.flush(timeout=30)
+        # Flush in small increments so the cancel event can bail out promptly.
+        # producer.flush(timeout) returns the number of messages still in-queue.
+        flush_deadline = time.monotonic() + 20.0
+        while time.monotonic() < flush_deadline and not cancel.is_set():
+            n_left = producer.flush(timeout=0.5)
+            if n_left == 0:
+                break
+
         elapsed = int(time.time() * 1000) - start_wall_ms
         if cancel.is_set():
             _set(status="canceled", sent=sent, elapsed_ms=elapsed)
@@ -460,14 +479,54 @@ def start_replay(job_id: str) -> bool:
 
 
 def cancel_replay(job_id: str | None = None) -> bool:
-    """Cancel a running replay. Returns False if nothing to cancel."""
+    """Cancel a running or preloaded replay.
+
+    Returns True when the cancel is accepted (including when the replay is already
+    in a terminal state — done/canceled/error — so the caller never gets a spurious
+    409).  Returns False only when the job_id doesn't match.
+    """
     with _lock:
         status = _state.get("status")
-        if status not in ("running", "starting"):
-            return False
         if job_id is not None and _state.get("job_id") != job_id:
             return False
+        if status == "preloaded":
+            # Wasn't running yet — just reset to idle so the caller can re-preload.
+            _state.clear()
+            _state["status"] = "idle"
+            return True
+        if status in ("done", "canceled", "error", "idle"):
+            # Already terminal — nothing to do, but don't report a spurious error.
+            return True
+        if status not in ("running", "starting"):
+            return False
     _cancel.set()
+    return True
+
+
+def start_preloaded() -> bool:
+    """Start the currently-preloaded replay without requiring the caller to know the job_id.
+
+    Returns False if nothing is preloaded or a replay is already running.
+    """
+    global _replay_thread
+    with _lock:
+        if _state.get("status") != "preloaded":
+            return False
+        files  = list(_state.get("files", []))
+        config = dict(_state.get("config", {}))
+        config["start_replay_wall_ms"] = int(time.time() * 1000)
+        _state["config"] = config
+        _state["status"] = "starting"
+
+    _cancel.clear()
+    t = threading.Thread(
+        target=_replay_worker,
+        args=(files, config, _cancel),
+        daemon=True,
+        name="replay-run",
+    )
+    _replay_thread = t
+    t.start()
     return True
 
 

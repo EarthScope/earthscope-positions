@@ -1,5 +1,23 @@
 <template>
   <q-page class="q-pa-md">
+    <PageHelp title="Replay">
+      <p>Stream historical GNSS position data into a Kafka topic at a controlled rate.</p>
+      <div class="help-section-label">Setup</div>
+      <ul>
+        <li>Configure the bootstrap server, topic name, station lists, time range, and stream filters</li>
+        <li>Click <strong>Preload</strong> to check data availability before committing to a full replay</li>
+      </ul>
+      <div class="help-section-label">Timing</div>
+      <ul>
+        <li><strong>Time scale</strong>: 1× = real-time; 10× = ten times faster</li>
+        <li><strong>Apply latency</strong>: shifts each message's send time by its original ingest delay, simulating live ingest</li>
+      </ul>
+      <div class="help-section-label">Running</div>
+      <ul>
+        <li>Click <strong>Start Replay</strong> to begin; monitor progress with the message counter</li>
+        <li>Click <strong>Cancel</strong> to stop an in-progress replay</li>
+      </ul>
+    </PageHelp>
 
     <!-- ── Two-column layout ────────────────────────────────────────────── -->
     <div class="row q-col-gutter-md">
@@ -64,7 +82,7 @@
             <div class="text-caption text-grey-6 q-mt-xs">Processing centers</div>
             <div class="row q-gutter-xs">
               <q-chip
-                v-for="c in ALL_CENTERS"
+                v-for="c in availableCenters"
                 :key="c"
                 :selected="filterCenters.includes(c)"
                 clickable
@@ -77,36 +95,20 @@
               >{{ c }}</q-chip>
             </div>
 
-            <div class="text-caption text-grey-6">PPP solutions</div>
+            <div class="text-caption text-grey-6">Stream type</div>
             <div class="row q-gutter-xs">
               <q-chip
-                v-for="s in ALL_SOLUTIONS"
-                :key="s.v"
-                :selected="filterSolutions.includes(s.v)"
+                v-for="code in availableSolTypes"
+                :key="code"
+                :selected="filterSolTypes.includes(code)"
                 clickable
                 dense
                 size="sm"
-                :color="filterSolutions.includes(s.v) ? 'primary' : 'grey-3'"
-                :text-color="filterSolutions.includes(s.v) ? 'white' : 'black'"
+                :color="filterSolTypes.includes(code) ? 'primary' : 'grey-3'"
+                :text-color="filterSolTypes.includes(code) ? 'white' : 'black'"
                 :disable="isActive"
-                @click="toggleItem(filterSolutions, s.v)"
-              >{{ s.v }} {{ s.label }}</q-chip>
-            </div>
-
-            <div class="text-caption text-grey-6">Solution types</div>
-            <div class="row q-gutter-xs">
-              <q-chip
-                v-for="t in ALL_TYPES"
-                :key="t.v"
-                :selected="filterTypes.includes(t.v)"
-                clickable
-                dense
-                size="sm"
-                :color="filterTypes.includes(t.v) ? 'primary' : 'grey-3'"
-                :text-color="filterTypes.includes(t.v) ? 'white' : 'black'"
-                :disable="isActive"
-                @click="toggleItem(filterTypes, t.v)"
-              >{{ t.v }} {{ t.label }}</q-chip>
+                @click="toggleItem(filterSolTypes, code)"
+              >{{ code }} {{ solTypeLabel(code) }}</q-chip>
             </div>
 
             <q-separator class="q-my-xs" />
@@ -479,6 +481,7 @@ import {
   replayPreload,
   getReplayStatus,
   replayGo,
+  replayStart,
   replayCancel,
   replayReset,
   openFetchMissingStream,
@@ -487,25 +490,24 @@ import type { ReplayState, FetchEvent } from "../types";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const ALL_CENTERS  = ["PB", "PW", "NC", "BK", "CI"];
-const ALL_SOLUTIONS = [
-  { v: "0", label: "CWU Fastlane"       },
-  { v: "1", label: "Trimble PIVOT"      },
-  { v: "2", label: "RTNet"              },
-  { v: "3", label: "Septentrio"         },
-  { v: "4", label: "RTX on-board"       },
-  { v: "5", label: "Network"            },
-  { v: "6", label: "JPL PPP"            },
-];
-const ALL_TYPES = [
-  { v: "0", label: "PPP/AR FAST"         },
-  { v: "1", label: "DIF/RTK"             },
-  { v: "2", label: "PPP/AR COMPLETE"     },
-  { v: "3", label: "PPP/AR FAST+COMPL."  },
-];
+const ALL_CENTERS   = ["PB", "PW", "NC", "BK", "CI"];
+const ALL_SOL_TYPES = ["00", "10", "12", "13", "20", "30", "40", "60"];
 
 const DEFAULT_BOOTSTRAP = "localhost:9092";
 const DEFAULT_TOPIC     = "protected.gnss.positions.shakealert.geojson.compact";
+
+// ─── Label helpers ────────────────────────────────────────────────────────────
+
+const SOL_LABELS: Record<string, string> = {
+  "0": "CWU", "1": "PIVOT", "2": "RTNet", "3": "Septa", "4": "RTX", "5": "Net", "6": "JPL",
+};
+const TYPE_LABELS: Record<string, string> = {
+  "0": "Fast", "1": "RTK", "2": "Compl", "3": "F+C",
+};
+
+function solTypeLabel(code: string): string {
+  return `${SOL_LABELS[code[0]] ?? code[0]} ${TYPE_LABELS[code[1]] ?? (code[1] ?? "")}`.trim();
+}
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
@@ -516,10 +518,11 @@ const startDate = ref("");
 const stopDate  = ref("");
 const dateRange = ref<{ from: string; to: string } | null>(null);
 
-// Filters (empty = accept all)
-const filterCenters   = ref<string[]>([]);
-const filterSolutions = ref<string[]>([]);
-const filterTypes     = ref<string[]>([]);
+// Filters — populated from API; all selected by default (empty = all on backend)
+const availableCenters  = ref<string[]>([]);
+const availableSolTypes = ref<string[]>([]);
+const filterCenters     = ref<string[]>([]);
+const filterSolTypes    = ref<string[]>([]);
 
 const timeScale    = ref(1.0);
 const applyLatency = ref(true);
@@ -544,8 +547,6 @@ const fetchLogEl   = ref<HTMLElement | null>(null);
 
 // Polling
 let pollTimer: ReturnType<typeof setInterval> | null = null;
-let lastSent = 0;
-let lastElapsedMs = 0;
 
 // ─── Computed ─────────────────────────────────────────────────────────────────
 
@@ -587,7 +588,7 @@ const origin = computed(() =>
   typeof window !== "undefined" ? window.location.origin : "http://localhost:8000"
 );
 const curlGo = computed(() =>
-  `curl -X POST ${origin.value}/api/replay/${replayState.value.job_id}/go`
+  `curl -X POST ${origin.value}/api/replay/start`
 );
 const curlCancel = computed(() =>
   `curl -X POST ${origin.value}/api/replay/${replayState.value.job_id}/cancel`
@@ -638,6 +639,33 @@ async function loadListOptions() {
   }
 }
 
+// ─── Filter options ───────────────────────────────────────────────────────────
+
+async function fetchFilterOptions() {
+  try {
+    const params = new URLSearchParams();
+    for (const l of selectedLists.value) params.append("lists", l);
+    const res = await fetch(`/api/station-lists/filter-options?${params}`);
+    if (!res.ok) {
+      availableCenters.value  = ALL_CENTERS;
+      availableSolTypes.value = ALL_SOL_TYPES;
+      filterCenters.value     = [...ALL_CENTERS];
+      filterSolTypes.value    = [...ALL_SOL_TYPES];
+      return;
+    }
+    const data = await res.json();
+    availableCenters.value  = data.centers?.length  ? data.centers  : ALL_CENTERS;
+    availableSolTypes.value = data.sol_types?.length ? data.sol_types : ALL_SOL_TYPES;
+    filterCenters.value  = [...availableCenters.value];
+    filterSolTypes.value = [...availableSolTypes.value];
+  } catch {
+    availableCenters.value  = ALL_CENTERS;
+    availableSolTypes.value = ALL_SOL_TYPES;
+    filterCenters.value     = [...ALL_CENTERS];
+    filterSolTypes.value    = [...ALL_SOL_TYPES];
+  }
+}
+
 // ─── Polling ──────────────────────────────────────────────────────────────────
 
 function startPolling() {
@@ -655,16 +683,23 @@ function stopPolling() {
 async function poll() {
   try {
     const s = await getReplayStatus();
+    const prev = replayState.value.status;
     replayState.value = s;
 
     if (s.status === "running" || s.status === "starting") {
-      const sent     = s.sent ?? 0;
-      const elapsed  = s.elapsed_ms ?? 0;
+      const sent    = s.sent ?? 0;
+      const elapsed = s.elapsed_ms ?? 0;
       chartPoints.value.push({ x: elapsed / 1000, y: sent });
       updateChart();
+      // Chart may not exist yet if the replay was started externally via curl.
+      if (!chart) {
+        await nextTick();
+        initChart();
+      }
     }
 
-    if (!["preloading", "running", "starting"].includes(s.status)) {
+    // Keep polling while preloaded so we detect an external curl-start.
+    if (!["preloading", "preloaded", "running", "starting"].includes(s.status)) {
       stopPolling();
     }
   } catch { /* swallow network errors */ }
@@ -733,9 +768,10 @@ async function doPreload() {
       all_stations:     false,
       start_time:       startDate.value,
       stop_time:        stopDate.value,
-      filter_centers:   filterCenters.value,
-      filter_solutions: filterSolutions.value,
-      filter_types:     filterTypes.value,
+      filter_centers:   filterCenters.value.length < availableCenters.value.length
+                          ? filterCenters.value : [],
+      filter_sol_types: filterSolTypes.value.length < availableSolTypes.value.length
+                          ? filterSolTypes.value : [],
       time_scale:       timeScale.value,
       apply_latency:    applyLatency.value,
       bootstrap_server: bootstrapServer.value,
@@ -749,11 +785,9 @@ async function doPreload() {
 }
 
 async function doGo() {
-  const jobId = replayState.value.job_id;
-  if (!jobId) return;
   chartPoints.value = [];
   try {
-    await replayGo(jobId);
+    await replayStart();
     startPolling();
     await nextTick();
     initChart();
@@ -764,8 +798,16 @@ async function doGo() {
 
 async function doCancel() {
   const jobId = replayState.value.job_id;
-  if (!jobId) return;
-  try { await replayCancel(jobId); } catch { /* ignore */ }
+  if (!jobId) {
+    await doReset();
+    return;
+  }
+  try {
+    await replayCancel(jobId);
+  } catch (e: any) {
+    // 409 means nothing was running (already done/error) — just reset to idle.
+    await doReset();
+  }
 }
 
 async function doReset() {
@@ -818,11 +860,12 @@ function startFetch() {
 
 onMounted(async () => {
   await loadListOptions();
+  await fetchFilterOptions();
   // Sync with any in-progress server state (e.g. user navigated away and back)
   try {
     const s = await getReplayStatus();
     replayState.value = s;
-    if (["preloading", "running", "starting"].includes(s.status)) {
+    if (["preloading", "preloaded", "running", "starting"].includes(s.status)) {
       startPolling();
     }
     if (s.status === "running" || s.status === "starting") {
@@ -850,6 +893,11 @@ onUnmounted(() => {
 // Re-init chart when canvas is mounted (status transitions to running)
 watch(chartCanvas, (el) => {
   if (el && isRunning.value) initChart();
+});
+
+// Refresh filter options when station lists change
+watch(selectedLists, () => {
+  fetchFilterOptions();
 });
 </script>
 

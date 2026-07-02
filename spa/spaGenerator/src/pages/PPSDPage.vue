@@ -1,5 +1,26 @@
 <template>
   <q-page class="q-pa-md">
+    <PageHelp title="PPSD Generation">
+      <p>Compute Probabilistic Power Spectral Density plots from position time series.</p>
+      <div class="help-section-label">Setup</div>
+      <ul>
+        <li>Select one or more station lists and a date range</li>
+        <li>Filter by processing center and stream type using the chips (all selected = no filter)</li>
+      </ul>
+      <div class="help-section-label">Grouping modes</div>
+      <ul>
+        <li><strong>By Processing Center</strong> — one plot per center (PB, PW, NC …)</li>
+        <li><strong>By Stream</strong> — one plot per individual station stream</li>
+        <li><strong>By Solution Type</strong> — one plot per 2-char solution code</li>
+        <li><strong>By Center × Solution</strong> — one plot per center+solution combination</li>
+        <li><strong>PPSD Generation</strong> — single plot combining all selected streams</li>
+      </ul>
+      <div class="help-section-label">Performance</div>
+      <ul>
+        <li>Cache files are built on first run; subsequent runs on the same data are nearly instant</li>
+        <li>Pre-compute caches offline with <code>es-pos process ppsd</code></li>
+      </ul>
+    </PageHelp>
     <div class="row q-col-gutter-md">
 
       <!-- ── Left: configuration ─────────────────────────────────────────── -->
@@ -62,7 +83,7 @@
             <div class="text-caption text-grey-6 q-mt-xs">Processing centers</div>
             <div class="row q-gutter-xs">
               <q-chip
-                v-for="c in ALL_CENTERS"
+                v-for="c in availableCenters"
                 :key="c"
                 :selected="filterCenters.includes(c)"
                 clickable
@@ -75,38 +96,21 @@
               >{{ c }}</q-chip>
             </div>
 
-            <!-- PPP solutions -->
-            <div class="text-caption text-grey-6">PPP solutions</div>
+            <!-- Stream types -->
+            <div class="text-caption text-grey-6">Stream type</div>
             <div class="row q-gutter-xs">
               <q-chip
-                v-for="s in ALL_SOLUTIONS"
-                :key="s.v"
-                :selected="filterSolutions.includes(s.v)"
+                v-for="code in availableSolTypes"
+                :key="code"
+                :selected="filterSolTypes.includes(code)"
                 clickable
                 dense
                 size="sm"
-                :color="filterSolutions.includes(s.v) ? 'primary' : 'grey-3'"
-                :text-color="filterSolutions.includes(s.v) ? 'white' : 'black'"
+                :color="filterSolTypes.includes(code) ? 'primary' : 'grey-3'"
+                :text-color="filterSolTypes.includes(code) ? 'white' : 'black'"
                 :disable="running"
-                @click="toggleItem(filterSolutions, s.v)"
-              >{{ s.v }} {{ s.label }}</q-chip>
-            </div>
-
-            <!-- Solution types -->
-            <div class="text-caption text-grey-6">Solution types</div>
-            <div class="row q-gutter-xs">
-              <q-chip
-                v-for="t in ALL_TYPES"
-                :key="t.v"
-                :selected="filterTypes.includes(t.v)"
-                clickable
-                dense
-                size="sm"
-                :color="filterTypes.includes(t.v) ? 'primary' : 'grey-3'"
-                :text-color="filterTypes.includes(t.v) ? 'white' : 'black'"
-                :disable="running"
-                @click="toggleItem(filterTypes, t.v)"
-              >{{ t.v }} {{ t.label }}</q-chip>
+                @click="toggleItem(filterSolTypes, code)"
+              >{{ code }} {{ solTypeLabel(code) }}</q-chip>
             </div>
 
           </q-card-section>
@@ -148,6 +152,15 @@
               label="By Center × Solution"
               :disable="!canRun || running"
               @click="runPpsd('by-center-solution')"
+              unelevated
+            />
+            <q-btn
+              class="full-width"
+              color="indigo"
+              icon="all_inclusive"
+              label="PPSD Generation"
+              :disable="!canRun || running"
+              @click="runPpsd('all')"
               unelevated
             />
 
@@ -249,40 +262,36 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, nextTick } from "vue";
+import { ref, computed, onMounted, watch, nextTick } from "vue";
 import { usePpsdJob } from "../composables/usePpsdJob";
 import type { PpsdMode } from "../types";
 
 const {
   selectedLists, startDate, endDate, dateRange,
-  filterCenters, filterSolutions, filterTypes,
+  filterCenters, filterSolTypes,
   logs, running, done, exitCode,
   progressCurrent, progressTotal, completedFiles,
   getCancel, setCancel, clearCancel,
 } = usePpsdJob();
 
-// ── Constants ──────────────────────────────────────────────────────────────
+// ── Label helpers ──────────────────────────────────────────────────────────
 
-const ALL_CENTERS = ["PB", "PW", "NC", "BK", "CI"];
-const ALL_SOLUTIONS = [
-  { v: "0", label: "CWU Fastlane"   },
-  { v: "1", label: "Trimble PIVOT"  },
-  { v: "2", label: "RTNet"          },
-  { v: "3", label: "Septentrio"     },
-  { v: "4", label: "RTX on-board"   },
-  { v: "5", label: "Network"        },
-  { v: "6", label: "JPL PPP"        },
-];
-const ALL_TYPES = [
-  { v: "0", label: "PPP/AR FAST"       },
-  { v: "1", label: "DIF/RTK"           },
-  { v: "2", label: "PPP/AR COMPLETE"   },
-  { v: "3", label: "PPP/AR FAST+COMPL."},
-];
+const SOL_LABELS: Record<string, string> = {
+  "0": "CWU", "1": "PIVOT", "2": "RTNet", "3": "Septa", "4": "RTX", "5": "Net", "6": "JPL",
+};
+const TYPE_LABELS: Record<string, string> = {
+  "0": "Fast", "1": "RTK", "2": "Compl", "3": "F+C",
+};
+
+function solTypeLabel(code: string): string {
+  return `${SOL_LABELS[code[0]] ?? code[0]} ${TYPE_LABELS[code[1]] ?? (code[1] ?? "")}`.trim();
+}
 
 // ── State ──────────────────────────────────────────────────────────────────
 
-const availableLists = ref<string[]>([]);
+const availableLists    = ref<string[]>([]);
+const availableCenters  = ref<string[]>([]);
+const availableSolTypes = ref<string[]>([]);
 const logEl = ref<{ $el?: HTMLElement } | null>(null);
 
 // ── Computed ───────────────────────────────────────────────────────────────
@@ -297,6 +306,23 @@ const canRun = computed(
     && endDate.value.length === 10
 );
 
+// ── Filter options fetch ───────────────────────────────────────────────────
+
+async function fetchFilterOptions() {
+  try {
+    const params = new URLSearchParams();
+    for (const l of selectedLists.value) params.append("lists", l);
+    const res = await fetch(`/api/station-lists/filter-options?${params}`);
+    if (!res.ok) return;
+    const data = await res.json();
+    availableCenters.value  = data.centers  ?? [];
+    availableSolTypes.value = data.sol_types ?? [];
+    // All selected by default
+    filterCenters.value  = [...availableCenters.value];
+    filterSolTypes.value = [...availableSolTypes.value];
+  } catch { /* ignore */ }
+}
+
 // ── Init ───────────────────────────────────────────────────────────────────
 
 onMounted(async () => {
@@ -305,6 +331,11 @@ onMounted(async () => {
     const data = await res.json();
     availableLists.value = data.lists ?? [];
   } catch { /* ignore */ }
+  await fetchFilterOptions();
+});
+
+watch(selectedLists, () => {
+  fetchFilterOptions();
 });
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -360,9 +391,10 @@ async function runPpsd(mode: PpsdMode) {
   params.set("start", startDate.value);
   params.set("end", endDate.value);
   params.set("mode", mode);
-  if (filterCenters.value.length)   params.set("centers",   filterCenters.value.join(","));
-  if (filterSolutions.value.length) params.set("solutions", filterSolutions.value.join(","));
-  if (filterTypes.value.length)     params.set("types",     filterTypes.value.join(","));
+  if (filterSolTypes.value.length < availableSolTypes.value.length)
+    params.set("sol_types", filterSolTypes.value.join(","));
+  if (filterCenters.value.length < availableCenters.value.length)
+    params.set("centers", filterCenters.value.join(","));
 
   const controller = new AbortController();
   setCancel(() => controller.abort());

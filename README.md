@@ -590,3 +590,10 @@ es user login
 
 Tokens are cached at `~/.earthscope/default/tokens.json` and refreshed automatically.
 The `es-pos test fetch` command also requires EarthScope VPN connectivity.
+
+
+---
+
+## Point of contact
+
+**Charlie Sievers** — charlie.sievers@earthscope.org

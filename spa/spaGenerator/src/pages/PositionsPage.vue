@@ -1,5 +1,20 @@
 <template>
   <q-page class="q-pa-md column no-wrap" style="height: calc(100vh - 50px)">
+    <PageHelp title="Positions">
+      <p>East / North / Up position time series for one or more stations.</p>
+      <div class="help-section-label">Controls</div>
+      <ul>
+        <li>Select a station list and date range; use the search box to filter by station name</li>
+        <li><strong>Shift + drag</strong> on any chart to zoom a time range; <strong>right-click</strong> to reset</li>
+        <li><strong>Shift-click</strong> a legend entry to remove that station from all plots</li>
+        <li>All three position charts share the same x-axis when zooming</li>
+      </ul>
+      <div class="help-section-label">Power spectra</div>
+      <ul>
+        <li>Charts below show frequency content per component (periods from 5 min to the full record length)</li>
+        <li>Y-axis is in scientific notation (m²/Hz)</li>
+      </ul>
+    </PageHelp>
 
     <!-- ── Controls ─────────────────────────────────────────────────────── -->
     <div class="row items-center q-gutter-sm q-mb-xs flex-shrink-0">
@@ -672,17 +687,17 @@ function _makePosChart(key: string, label: string): Chart | null {
     data: { datasets: [] },
     options: {
       animation: false, responsive: true, maintainAspectRatio: false, parsing: false,
-      interaction: { mode: "nearest", intersect: false, axis: "x" },
+      interaction: { mode: "nearest", intersect: false, axis: "xy" },
       scales: {
         x: { type: "linear", ticks: { maxTicksLimit: 8, callback: v => _epochLabel(Number(v)) }, grid: { color: "#e0e0e0" } },
-        y: { title: { display: true, text: label, font: { size: 11 } }, grid: { color: "#e0e0e0" } },
+        y: { title: { display: true, text: label, font: { size: 11 } }, grid: { color: "#e0e0e0" }, ticks: { callback: (v: number | string) => Number(v).toExponential(1) } },
       },
       plugins: {
         legend: { position: "right", labels: { font: { size: 10 }, boxWidth: 12 } },
         tooltip: {
           callbacks: {
             title: items => _epochLabel(Number(items[0].parsed.x)),
-            label: item  => `${item.dataset.label}: ${item.parsed.y?.toFixed(2) ?? "—"} mm`,
+            label: item  => `${item.dataset.label}: ${item.parsed.y?.toExponential(2) ?? "—"} mm`,
           },
         },
       },
@@ -711,7 +726,7 @@ function _makeSpecChart(key: string, label: string): Chart | null {
     data: { datasets: [] },
     options: {
       animation: false, responsive: true, maintainAspectRatio: false, parsing: false,
-      interaction: { mode: "nearest", intersect: false, axis: "x" },
+      interaction: { mode: "nearest", intersect: false, axis: "xy" },
       scales: {
         x: {
           type: "linear" as const,

@@ -116,7 +116,7 @@ export interface ReplayState {
 
 // ─── PPSD ─────────────────────────────────────────────────────────────────────
 
-export type PpsdMode = "by-stream" | "by-center" | "by-solution" | "by-center-solution";
+export type PpsdMode = "by-stream" | "by-center" | "by-solution" | "by-center-solution" | "all";
 
 export interface PpsdRunParams {
   lists: string[];
@@ -124,8 +124,7 @@ export interface PpsdRunParams {
   end: string;
   mode: PpsdMode;
   centers?: string;
-  solutions?: string;
-  types?: string;
+  sol_types?: string;
 }
 
 export interface PpsdEvent {
@@ -144,8 +143,7 @@ export interface ReplayPreloadBody {
   start_time: string;
   stop_time: string;
   filter_centers: string[];
-  filter_solutions: string[];
-  filter_types: string[];
+  filter_sol_types: string[];
   time_scale: number;
   apply_latency: boolean;
   bootstrap_server: string;

@@ -17,10 +17,9 @@ const startDate = ref("");
 const endDate = ref("");
 const dateRange = ref<{ from: string; to: string } | null>(null);
 
-// Filter state (empty = all selected)
-const filterCenters   = ref<string[]>([]);
-const filterSolutions = ref<string[]>([]);
-const filterTypes     = ref<string[]>([]);
+// Filter state (populated from API; all selected by default)
+const filterCenters  = ref<string[]>([]);
+const filterSolTypes = ref<string[]>([]);
 
 const logs = ref<PpsdLogEntry[]>([]);
 const running = ref(false);
@@ -35,7 +34,7 @@ let _cancel: (() => void) | null = null;
 export function usePpsdJob() {
   return {
     selectedLists, startDate, endDate, dateRange,
-    filterCenters, filterSolutions, filterTypes,
+    filterCenters, filterSolTypes,
     logs, running, done, exitCode,
     progressCurrent, progressTotal, completedFiles,
     getCancel, setCancel, clearCancel,
