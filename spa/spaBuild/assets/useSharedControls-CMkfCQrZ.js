@@ -1,0 +1,1 @@
+import{r as t}from"./index-BKOh4hM_.js";const e=t("all"),n=t(""),s=t(""),o=t(""),a=t(null),r=t(7),c=t("7d");function l(){return{selectedList:e,searchText:n,startDate:s,endDate:o,dateRange:a,rangeDays:r,activeWindow:c}}export{l as u};

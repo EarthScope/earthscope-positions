@@ -1,0 +1,200 @@
+<template>
+  <q-page class="row no-wrap" style="height: calc(100vh - 50px); overflow: hidden">
+
+    <!-- ── Left sidebar: collapsible tree ───────────────────────────────────── -->
+    <div class="col-auto column no-wrap bg-grey-1 border-right" style="width: 280px; min-width: 200px">
+
+      <div class="q-px-sm q-pt-sm q-pb-xs flex-shrink-0 text-caption text-weight-medium text-grey-7">
+        File Plots
+      </div>
+      <q-separator />
+
+      <q-scroll-area class="col">
+        <div v-if="rootLoading" class="flex flex-center q-pa-md">
+          <q-spinner-dots color="primary" size="28px" />
+        </div>
+        <q-list v-else dense>
+          <template v-for="{node, depth} in flatTree" :key="node.path">
+            <q-item
+              dense clickable
+              :active="selectedPath === node.path && node.type === 'file'"
+              active-class="bg-blue-1"
+              :style="{ paddingLeft: (depth * 16 + 4) + 'px' }"
+              @click="handleClick(node)"
+            >
+              <q-item-section avatar style="min-width: 22px; padding-right: 4px">
+                <!-- directory: rotating caret -->
+                <q-icon
+                  v-if="node.type === 'dir'"
+                  name="chevron_right"
+                  size="16px"
+                  color="grey-6"
+                  :class="['caret-icon', expanded.has(node.path) && 'caret-open']"
+                />
+                <!-- file: image icon -->
+                <q-icon v-else name="image" size="15px" color="blue-grey-4" />
+              </q-item-section>
+
+              <q-item-section>
+                <q-item-label class="text-caption" style="word-break: break-all">
+                  {{ node.name }}
+                </q-item-label>
+              </q-item-section>
+
+              <!-- spinner while dir children are loading -->
+              <q-item-section v-if="node.type === 'dir' && loadingPaths.has(node.path)" side>
+                <q-spinner size="12px" color="grey-5" />
+              </q-item-section>
+            </q-item>
+          </template>
+
+          <q-item v-if="!rootLoading && tree.length === 0" dense>
+            <q-item-section>
+              <q-item-label class="text-caption text-grey-5 q-pa-sm">No plots found</q-item-label>
+            </q-item-section>
+          </q-item>
+        </q-list>
+      </q-scroll-area>
+    </div>
+
+    <!-- ── Right panel: image display ──────────────────────────────────────── -->
+    <div class="col column items-center justify-center bg-white" style="overflow: auto; padding: 16px">
+
+      <div v-if="!selectedPath" class="text-center text-grey-4">
+        <q-icon name="photo_library" size="64px" />
+        <div class="text-caption q-mt-sm">Select a plot from the tree</div>
+      </div>
+
+      <div v-else class="column items-center" style="max-width: 100%; width: 100%">
+        <div class="text-caption text-grey-6 q-mb-sm self-start" style="word-break: break-all">
+          {{ selectedPath }}
+        </div>
+        <div v-if="imageLoading" class="flex flex-center q-pa-xl">
+          <q-spinner-dots color="primary" size="40px" />
+        </div>
+        <img
+          v-show="!imageLoading && imageOk"
+          :src="imageUrl"
+          :alt="selectedPath"
+          style="max-width: 100%; height: auto; border: 1px solid #e0e0e0"
+          @load="onImageLoad"
+          @error="onImageError"
+        />
+        <div v-if="!imageLoading && !imageOk" class="text-negative text-caption q-mt-md">
+          <q-icon name="broken_image" size="32px" />
+          <div>Failed to load image</div>
+        </div>
+      </div>
+    </div>
+
+  </q-page>
+</template>
+
+<script setup lang="ts">
+import { ref, computed, onMounted } from "vue";
+import axios from "axios";
+
+interface Entry {
+  name: string;
+  type: "file" | "dir";
+  path: string;
+}
+
+interface TreeNode {
+  name: string;
+  path: string;
+  type: "file" | "dir";
+  children: TreeNode[] | null; // null = not yet fetched
+}
+
+const tree        = ref<TreeNode[]>([]);
+const expanded    = ref(new Set<string>());
+const loadingPaths = ref(new Set<string>());
+const rootLoading = ref(false);
+
+const selectedPath  = ref("");
+const imageLoading  = ref(false);
+const imageOk       = ref(false);
+
+const imageUrl = computed(() =>
+  selectedPath.value ? `/api/plots/img?path=${encodeURIComponent(selectedPath.value)}` : ""
+);
+
+// Flatten expanded tree into a depth-tagged list for rendering
+const flatTree = computed<{ node: TreeNode; depth: number }[]>(() => {
+  const out: { node: TreeNode; depth: number }[] = [];
+  function traverse(nodes: TreeNode[], depth: number) {
+    for (const node of nodes) {
+      out.push({ node, depth });
+      if (node.type === "dir" && expanded.value.has(node.path) && node.children) {
+        traverse(node.children, depth + 1);
+      }
+    }
+  }
+  traverse(tree.value, 0);
+  return out;
+});
+
+async function fetchChildren(node: TreeNode): Promise<void> {
+  if (node.children !== null) return;
+  loadingPaths.value.add(node.path);
+  try {
+    const r = await axios.get<{ entries: Entry[] }>("/api/plots/list", { params: { path: node.path } });
+    node.children = r.data.entries.map((e) => ({
+      name: e.name,
+      path: e.path,
+      type: e.type,
+      children: null,
+    }));
+  } catch {
+    node.children = [];
+  } finally {
+    loadingPaths.value.delete(node.path);
+  }
+}
+
+function toggleDir(node: TreeNode) {
+  if (expanded.value.has(node.path)) {
+    expanded.value.delete(node.path);
+  } else {
+    expanded.value.add(node.path);
+    fetchChildren(node);
+  }
+}
+
+function handleClick(node: TreeNode) {
+  if (node.type === "dir") {
+    toggleDir(node);
+  } else {
+    selectedPath.value = node.path;
+    imageLoading.value = true;
+    imageOk.value = false;
+  }
+}
+
+function onImageLoad() { imageLoading.value = false; imageOk.value = true; }
+function onImageError() { imageLoading.value = false; imageOk.value = false; }
+
+onMounted(async () => {
+  rootLoading.value = true;
+  try {
+    const r = await axios.get<{ entries: Entry[] }>("/api/plots/list", { params: { path: "" } });
+    tree.value = r.data.entries.map((e) => ({ name: e.name, path: e.path, type: e.type, children: null }));
+  } finally {
+    rootLoading.value = false;
+  }
+});
+</script>
+
+<style scoped>
+.border-right {
+  border-right: 1px solid #e0e0e0;
+}
+.caret-icon {
+  transition: transform 0.15s ease;
+  flex-shrink: 0;
+}
+.caret-open {
+  transform: rotate(90deg);
+}
+</style>

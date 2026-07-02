@@ -28,10 +28,19 @@ dependencies = [
 
     # Utilities
     "pydantic>=2.0.0",
+
+    # Analysis and plotting (used by positions_diagnose_plot)
+    "pandas>=2.0.0",
+    "matplotlib>=3.7.0",
+
+    # Web server
+    "fastapi>=0.110.0",
+    "uvicorn>=0.27.0",
 ]
 
 [project.scripts]
-es-positions = "earthscope_positions.cli:main"
+es-pos = "earthscope_positions.es_pos:main"
+inspect = "earthscope_positions.arrow_inspect:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

@@ -1,0 +1,67 @@
+# MiniSEED Output Path Specification
+# =====================================
+# Edit this file to control where MiniSEED files are written and how they are named.
+# Run:  es-pos export miniseed --help  for full usage.
+#
+# Output path is assembled as:
+#   {root}/{directory}/{filename}{extension}
+#
+# ── Template variables ────────────────────────────────────────────────────────
+#
+#   {network}    Network code from geosncl          e.g. "PW"
+#   {station}    Station code from geosncl          e.g. "DEEJ"
+#   {location}   Location code from geosncl         e.g. "00"
+#   {channel}    3-char SEED channel code            e.g. "LYE"
+#   {geosncl}    Full original geosncl string        e.g. "DEEJ.PW.LY_.00"
+#   {year}       4-digit year of first sample        e.g. "2026"
+#   {month}      Zero-padded month (01-12)           e.g. "01"
+#   {day}        Zero-padded day of month (01-31)    e.g. "14"
+#   {julday}     Zero-padded day of year (001-366)   e.g. "014"
+#   {hour}       Zero-padded hour of first sample    e.g. "00"
+#
+# ── Channel codes ─────────────────────────────────────────────────────────────
+#
+# Input "LY_" base produces these 3-char SEED channel codes (one file each):
+#
+#   LYE   East position              float64  metres
+#   LYN   North position             float64  metres
+#   LYZ   Up position                float64  metres
+#   LY1   East uncertainty (sigEE)   float64  metres
+#   LY2   North uncertainty (sigNN)  float64  metres
+#   LY3   Up uncertainty (sigUU)     float64  metres
+#   LYQ   Quality channel            int32    (raw value)
+#   LYL   Ingest latency             int32    milliseconds
+#
+# ── FDSN Source Identifier ────────────────────────────────────────────────────
+#
+# Each MiniSEED 3 record uses the identifier:
+#   FDSN:{network}_{station}_{location}_{band}_{source}_{subsource}
+#   e.g.  FDSN:PW_DEEJ_00_L_Y_E
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Root output directory (absolute or relative to working directory).
+root = "data/miniseed"
+
+# Sub-directory tree under root.
+# Classic SEED Day-Volume (SDS) layout shown below.
+# Alternative flat layout:  directory = "{network}/{station}"
+directory = "{year}/{network}/{station}/{channel}.D"
+
+# Filename without extension.
+# "D" suffix is the SEED day-data convention.
+filename = "{network}.{station}.{location}.{channel}.D.{year}.{julday}"
+
+# File extension appended after filename.
+extension = ".mseed"
+
+[encoding]
+# Maximum samples per MiniSEED record.
+# Each contiguous gap-free segment is chunked into records of this size.
+# 4096 samples = ~68 minutes at 1 Hz.  Increase for fewer, larger records.
+max_samples_per_record = 4096
+
+# Gap threshold as a multiple of the nominal sample interval.
+# A time jump larger than (gap_factor × interval) starts a new record.
+# 1.5 → at 1 Hz, any gap > 1.5 s triggers a split.
+gap_factor = 1.5

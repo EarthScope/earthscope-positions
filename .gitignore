@@ -20,6 +20,10 @@ logs/
 *.arrow
 *.parquet
 
+# SPA dev artifacts
+spa/spaGenerator/node_modules/
+spa/spaGenerator/.vite/
+
 # IDE / OS
 .vscode/
 .DS_Store
