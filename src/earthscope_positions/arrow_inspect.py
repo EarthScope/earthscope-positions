@@ -1,7 +1,8 @@
 """
 arrow_inspect — display contents of Apache Arrow IPC files.
 
-Auto-detects both IPC file format (.arrow) and IPC stream format (.arrows).
+Auto-detects IPC file format (.arrow), IPC stream format (.arrows), and
+JSON error payloads written by failed curl downloads.
 
 Usage:
     arrow_inspect /tmp/test.arrow
@@ -15,6 +16,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import io
+import json
 import pathlib
 import sys
 
@@ -22,8 +24,8 @@ import pyarrow as pa
 import pyarrow.ipc
 
 
-def _read(path: pathlib.Path) -> tuple[pa.Table, str]:
-    """Return (table, format) where format is 'file' or 'stream'."""
+def _read(path: pathlib.Path) -> tuple[pa.Table | dict, str]:
+    """Return (table, format) where format is 'file', 'stream', or 'json-error'."""
     data = path.read_bytes()
     buf = io.BytesIO(data)
     try:
@@ -37,7 +39,12 @@ def _read(path: pathlib.Path) -> tuple[pa.Table, str]:
         return table, "stream"
     except pa.ArrowInvalid:
         pass
-    sys.exit(f"ERROR: {path.name} is not a valid Arrow file or stream.")
+    try:
+        payload = json.loads(data.decode(errors="replace"))
+        return payload, "json-error"
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        pass
+    sys.exit(f"ERROR: {path.name} is not a valid Arrow file, stream, or JSON payload.")
 
 
 def _fmt_bytes(n: int) -> str:
@@ -128,11 +135,22 @@ def _print_stats(table: pa.Table) -> None:
 
 def _inspect(path: pathlib.Path, args: argparse.Namespace) -> None:
     size = path.stat().st_size
-    table, fmt = _read(path)
+    result, fmt = _read(path)
 
     bar = "─" * 64
     print(f"\n{bar}")
     print(f"  {path.name}")
+
+    if fmt == "json-error":
+        print(f"  format: JSON error payload  │  size: {_fmt_bytes(size)}")
+        print(bar)
+        print("  *** This file contains a JSON error response, not Arrow data. ***")
+        print("  *** It was likely written by a failed curl download.           ***")
+        print()
+        print(json.dumps(result, indent=2))
+        return
+
+    table: pa.Table = result  # type: ignore[assignment]
     print(f"  format: IPC {fmt}  │  rows: {table.num_rows:,}  │  cols: {table.num_columns}  │  size: {_fmt_bytes(size)}")
     print(bar)
 
@@ -162,7 +180,8 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description="""Display contents of Apache Arrow IPC files.
 
-Auto-detects IPC file format (.arrow) and IPC stream format (.arrows).
+Auto-detects IPC file format (.arrow), IPC stream format (.arrows), and
+JSON error payloads written by failed curl downloads.
 Timestamps stored as integer milliseconds-since-epoch are shown as ISO 8601.
 
 Examples:

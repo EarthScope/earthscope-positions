@@ -1,10 +1,16 @@
 """
 PPSD (Probabilistic Power Spectral Density) writer for GNSS position Arrow files.
 
-Algorithm matches ~/python/src/csievers/positions/plot_ppsd.py / MonitorApplication.java:
-  WINDOW = 1024  (Hanning window)
-  STEP   = 512   (50 % overlap)
-  NFFT   = 32768 (zero-padded for frequency resolution)
+Algorithm:
+  Direct DFT at N_PERIOD_BINS logarithmically-spaced target periods, evaluated
+  on 50%-overlapping Hanning-windowed segments.  The DFT is computed via a
+  precomputed (N_PERIOD_BINS × WINDOW) complex basis matrix, giving exact power
+  estimates at each target period without the bin-mapping approximation of the
+  FFT approach.
+
+  WINDOW = 16384 samples (4.55 h at 1 Hz) covers the full period axis up to
+  10 000 s (2.78 h).  NaN gaps are handled by substituting zero and rescaling
+  the window normalisation, so time-axis integrity is preserved.
 
 X-axis:  log10(period) from 1 s to 10 000 s
 Y-axis:  power in dB (m²/Hz)
@@ -13,7 +19,7 @@ Output:  3-panel PNG  (East | North | Up)  per station or per station-group
 Cache:
   Each source arrow file gets a sidecar *_ppsd.arrow* file storing a sparse
   representation of the three (E, N, U) histograms.  Subsequent runs skip the
-  FFT step entirely and just merge the cached counts.
+  DFT step entirely and just merge the cached counts.
 
 CLI:
   es-pos export ppsd --all
@@ -36,29 +42,35 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.ipc as ipc
 
-# ── PPSD parameters (matching MonitorApplication.java) ────────────────────────
-WINDOW       = 1024
-STEP         = 512
-NFFT         = 32768
-POWER_MIN    = -80.0
-POWER_MAX    =  20.0
-LOG_PERIOD_MIN = 0.0    # log10(1 s)
-LOG_PERIOD_MAX = 4.0    # log10(10 000 s)
+# ── PPSD parameters ────────────────────────────────────────────────────────────
+WINDOW         = 16384   # samples per analysis window (16384 s at 1 Hz = 4.55 h)
+STEP           = 8192    # 50% overlap
+POWER_MIN      = -80.0
+POWER_MAX      =  20.0
+LOG_PERIOD_MIN = 0.0     # log10(1 s)
+LOG_PERIOD_MAX = 4.0     # log10(10 000 s)
 N_PERIOD_BINS  = 67
 N_POWER_BINS   = 100
+MIN_VALID_FRAC = 0.80    # skip windows with more than 20% NaN
 # ──────────────────────────────────────────────────────────────────────────────
 
-_HANNING     = 0.5 * (1.0 - np.cos(2.0 * np.pi * np.arange(WINDOW) / (WINDOW - 1)))
-_HANNING_WSS = float(np.sum(_HANNING ** 2))
+# Target periods (seconds): 67 exact log-spaced values, 1 s → 10 000 s
+_TARGET_PERIODS = 10.0 ** np.linspace(LOG_PERIOD_MIN, LOG_PERIOD_MAX, N_PERIOD_BINS)
 
-_KS          = np.arange(1, NFFT // 2 + 1)
-_LOG_PERIODS = np.log10(NFFT / _KS.astype(float))
-_IN_RANGE    = (_LOG_PERIODS >= LOG_PERIOD_MIN) & (_LOG_PERIODS <= LOG_PERIOD_MAX)
-_KS          = _KS[_IN_RANGE]
-_LOG_PERIODS = _LOG_PERIODS[_IN_RANGE]
-_P_BINS      = np.clip(
-    ((_LOG_PERIODS - LOG_PERIOD_MIN) / (LOG_PERIOD_MAX - LOG_PERIOD_MIN) * N_PERIOD_BINS).astype(int),
-    0, N_PERIOD_BINS - 1,
+# Nyquist mask: for 1 Hz data the minimum resolvable period is 2 samples.
+# Bins at T < 2 s are aliased (T=1 s is the DC alias) and must be excluded.
+_NYQUIST_MASK = _TARGET_PERIODS >= 2.0  # shape (N_PERIOD_BINS,)
+
+# Hanning window of length WINDOW
+_HANNING     = 0.5 * (1.0 - np.cos(2.0 * np.pi * np.arange(WINDOW) / (WINDOW - 1)))
+_HANNING_WSS = float(np.sum(_HANNING ** 2))   # full-window normalisation
+
+# DFT basis matrix: (N_PERIOD_BINS, WINDOW), complex128, pre-multiplied by the
+# Hanning weights so  _DFT_BASES @ signal  gives the windowed DFT at every
+# target period in a single BLAS matrix-vector call (~17 MB, loaded once).
+_DFT_BASES = (
+    np.exp(-1j * 2.0 * np.pi * np.arange(WINDOW)[None, :] / _TARGET_PERIODS[:, None])
+    * _HANNING[None, :]
 )
 
 # Right-axis sigma labels (white-noise standard deviation)
@@ -100,43 +112,52 @@ def ppsd_colormap() -> mcolors.LinearSegmentedColormap:
 
 
 # ---------------------------------------------------------------------------
-# Core computation (vectorized)
+# Core computation (DFT-based)
 # ---------------------------------------------------------------------------
 
 def accumulate_ppsd(signal: np.ndarray, histogram: np.ndarray) -> int:
-    """Add Hanning-windowed, 50%-overlap FFT segments into *histogram* (in-place).
+    """Add Hanning-windowed DFT frames into *histogram* (in-place).
 
-    Linear power is averaged per log-period bin via np.bincount (vectorized),
-    then the bin's dB value is histogrammed.  Returns the number of frames added.
+    Computes the one-sided power spectral density at each of the
+    N_PERIOD_BINS target periods via direct DFT, giving exact frequency
+    control and reliable estimates for all periods up to WINDOW samples.
+
+    NaN samples are replaced with zero and the window normalisation is
+    rescaled to the valid-sample fraction, preserving time-axis integrity.
+
+    Returns the number of frames added.
     """
     n = len(signal)
     if n < WINDOW:
         return 0
+
     frames = 0
-    bin_counts = np.bincount(_P_BINS, minlength=N_PERIOD_BINS).astype(float)
-    valid_period = bin_counts > 0  # period bins that have at least one FFT bin
-
     for start in range(0, n - WINDOW + 1, STEP):
-        segment = signal[start : start + WINDOW] * _HANNING
-        padded = np.zeros(NFFT)
-        padded[:WINDOW] = segment
-        fft_vals = np.fft.rfft(padded)
+        seg = signal[start : start + WINDOW]
+        valid = np.isfinite(seg)
+        n_valid = int(valid.sum())
+        if n_valid < int(WINDOW * MIN_VALID_FRAC):
+            continue
 
-        power = (np.abs(fft_vals) ** 2) / _HANNING_WSS
-        power[1:-1] *= 2.0
-        power_ks = power[_KS]
+        # Substitute NaN with 0, subtract mean of valid samples to remove DC
+        mean_val = seg[valid].mean()
+        seg_clean = np.where(valid, seg - mean_val, 0.0)
 
-        # Average linear power within each period bin (vectorized)
-        bin_sum = np.bincount(_P_BINS, weights=power_ks, minlength=N_PERIOD_BINS)
-        avg_lin = np.where(valid_period, bin_sum / np.where(valid_period, bin_counts, 1.0), 0.0)
+        # Effective window sum-of-squares (accounts for NaN → 0 substitution)
+        wss_eff = float(np.dot(_HANNING ** 2, valid.astype(np.float64)))
+        if wss_eff < 1e-30:
+            continue
 
-        with np.errstate(divide="ignore", invalid="ignore"):
-            avg_db = np.where(avg_lin > 0, 10.0 * np.log10(avg_lin), -1e9)
+        # One-sided DFT power at all target periods (single BLAS call)
+        X     = _DFT_BASES @ seg_clean       # (N_PERIOD_BINS,) complex
+        power = np.abs(X) ** 2 / wss_eff * 2.0  # ×2 for one-sided PSD
 
-        q_bins = ((avg_db - POWER_MIN) / (POWER_MAX - POWER_MIN) * N_POWER_BINS).astype(int)
-        in_range = valid_period & (q_bins >= 0) & (q_bins < N_POWER_BINS)
+        with np.errstate(divide="ignore"):
+            db = np.where(power > 0.0, 10.0 * np.log10(power), -1e9)
 
-        np.add.at(histogram, (np.where(in_range)[0], q_bins[in_range]), 1)
+        q     = ((db - POWER_MIN) / (POWER_MAX - POWER_MIN) * N_POWER_BINS).astype(int)
+        good  = (q >= 0) & (q < N_POWER_BINS) & _NYQUIST_MASK
+        np.add.at(histogram, (np.where(good)[0], q[good]), 1)
         frames += 1
 
     return frames
@@ -147,7 +168,11 @@ def accumulate_ppsd(signal: np.ndarray, histogram: np.ndarray) -> int:
 # ---------------------------------------------------------------------------
 
 def load_arrow_enu(path: pathlib.Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Load an Arrow IPC stream file and return (east, north, up) as float64 arrays."""
+    """Load an Arrow IPC stream file and return (east, north, up) as float64 arrays.
+
+    Missing values are preserved as NaN (not removed) so that time-axis
+    integrity is maintained for the DFT computation.
+    """
     with open(path, "rb") as f:
         table = ipc.open_stream(f).read_all()
     east  = table.column("east").to_pylist()
@@ -190,15 +215,15 @@ def _histograms_to_sparse(
         return None
 
     metadata = {
-        b"geosncl":      geosncl.encode(),
-        b"date":         date_str.encode(),
-        b"frames_e":     str(frames_e).encode(),
-        b"frames_n":     str(frames_n).encode(),
-        b"frames_u":     str(frames_u).encode(),
-        b"window":       str(WINDOW).encode(),
-        b"nfft":         str(NFFT).encode(),
-        b"power_min":    str(POWER_MIN).encode(),
-        b"power_max":    str(POWER_MAX).encode(),
+        b"geosncl":       geosncl.encode(),
+        b"date":          date_str.encode(),
+        b"frames_e":      str(frames_e).encode(),
+        b"frames_n":      str(frames_n).encode(),
+        b"frames_u":      str(frames_u).encode(),
+        b"window":        str(WINDOW).encode(),
+        b"algorithm":     b"dft",
+        b"power_min":     str(POWER_MIN).encode(),
+        b"power_max":     str(POWER_MAX).encode(),
         b"n_period_bins": str(N_PERIOD_BINS).encode(),
         b"n_power_bins":  str(N_POWER_BINS).encode(),
     }
@@ -225,16 +250,13 @@ def compute_ppsd_cache(arrow_path: pathlib.Path) -> pathlib.Path | None:
     except Exception:
         return None
 
-    mask = np.isfinite(east) & np.isfinite(north) & np.isfinite(up)
-    e, n, u = east[mask], north[mask], up[mask]
-
     hist_e = np.zeros((N_PERIOD_BINS, N_POWER_BINS), dtype=np.int64)
     hist_n = np.zeros((N_PERIOD_BINS, N_POWER_BINS), dtype=np.int64)
     hist_u = np.zeros((N_PERIOD_BINS, N_POWER_BINS), dtype=np.int64)
 
-    frames_e = accumulate_ppsd(e, hist_e)
-    frames_n = accumulate_ppsd(n, hist_n)
-    frames_u = accumulate_ppsd(u, hist_u)
+    frames_e = accumulate_ppsd(east,  hist_e)
+    frames_n = accumulate_ppsd(north, hist_n)
+    frames_u = accumulate_ppsd(up,    hist_u)
 
     if frames_e == 0 and frames_n == 0 and frames_u == 0:
         return None
@@ -243,7 +265,11 @@ def compute_ppsd_cache(arrow_path: pathlib.Path) -> pathlib.Path | None:
     m = re.search(r"(\d{4})(\d{2})(\d{2})T", arrow_path.stem)
     date_str = f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else ""
 
-    table = _histograms_to_sparse(hist_e, hist_n, hist_u, frames_e, frames_n, frames_u, geosncl, date_str)
+    table = _histograms_to_sparse(
+        hist_e, hist_n, hist_u,
+        frames_e, frames_n, frames_u,
+        geosncl, date_str,
+    )
     if table is None:
         return None
 
@@ -257,7 +283,11 @@ def compute_ppsd_cache(arrow_path: pathlib.Path) -> pathlib.Path | None:
 
 
 def load_ppsd_cache(arrow_path: pathlib.Path) -> pa.Table | None:
-    """Load the sidecar cache for *arrow_path* if it exists and is structurally valid."""
+    """Load the sidecar cache for *arrow_path* if it is valid and current.
+
+    Returns None if the file is missing, structurally broken, or was produced
+    by an older algorithm version (triggering recomputation).
+    """
     cp = cache_path_for(arrow_path)
     if not cp.exists():
         return None
@@ -265,15 +295,21 @@ def load_ppsd_cache(arrow_path: pathlib.Path) -> pa.Table | None:
         with open(cp, "rb") as f:
             table = ipc.open_stream(f).read_all()
         required = {"component", "p_bin", "q_bin", "count"}
-        if required.issubset(set(table.column_names)):
-            return table
+        if not required.issubset(set(table.column_names)):
+            return None
+        meta = table.schema.metadata or {}
+        # Reject caches built with a different window size or algorithm
+        if meta.get(b"window") != str(WINDOW).encode():
+            return None
+        if meta.get(b"algorithm") != b"dft":
+            return None
+        return table
     except Exception:
-        pass
-    return None
+        return None
 
 
 def ensure_ppsd_cache(arrow_path: pathlib.Path) -> pathlib.Path | None:
-    """Return path to a valid cache, computing it first if missing.
+    """Return path to a valid cache, computing it first if missing or stale.
 
     Called from the thread pool — returns None if the file yields no valid data.
     """
@@ -401,14 +437,13 @@ def write_ppsd_from_caches(
 ) -> pathlib.Path | None:
     """Merge cached PPSD data for *files* and render a PNG into *run_dir*.
 
-    Any file whose cache is missing is computed on-the-fly (fallback).
+    Any file whose cache is missing or stale is computed on-the-fly (fallback).
     Returns the written PNG path, or None if no valid data was found.
     """
     tables: list[pa.Table] = []
     for path in files:
         t = load_ppsd_cache(path)
         if t is None:
-            # Cache was missing — try to compute it now (single-threaded fallback)
             compute_ppsd_cache(path)
             t = load_ppsd_cache(path)
         if t is not None:
@@ -543,11 +578,9 @@ def _write_one_ppsd(
             if verbose:
                 print(f"  [ppsd] skip {path.name}: {exc}", file=sys.stderr)
             continue
-        mask = np.isfinite(east) & np.isfinite(north) & np.isfinite(up)
-        e, n, u = east[mask], north[mask], up[mask]
-        total_frames += accumulate_ppsd(e, hist_e)
-        accumulate_ppsd(n, hist_n)
-        accumulate_ppsd(u, hist_u)
+        total_frames += accumulate_ppsd(east,  hist_e)
+        accumulate_ppsd(north, hist_n)
+        accumulate_ppsd(up,    hist_u)
         n_files += 1
 
     if total_frames == 0:

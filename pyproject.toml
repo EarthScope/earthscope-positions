@@ -38,6 +38,12 @@ dependencies = [
     "uvicorn>=0.27.0",
 ]
 
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0.0",
+    "responses>=0.25.0",   # intercept `requests` calls (positions fetch API)
+]
+
 [project.scripts]
 es-pos = "earthscope_positions.es_pos:main"
 inspect = "earthscope_positions.arrow_inspect:main"
@@ -51,3 +57,13 @@ where = ["src"]
 [tool.setuptools_scm]
 version_scheme = "post-release"
 write_to = "src/earthscope_positions/_version.py"
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra"
+# No test may reach the network. `responses` (used by the fetch tests) already
+# blocks unregistered `requests` calls; this keeps the intent explicit.
+markers = [
+    "network: test that is allowed to hit the real network (deselected by default)",
+]

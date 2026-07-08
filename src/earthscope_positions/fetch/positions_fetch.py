@@ -160,7 +160,13 @@ def _release_lock(geosncl_dir: pathlib.Path) -> None:
 
 
 def _load_no_data(geosncl_dir: pathlib.Path) -> set[str]:
-    """Return set of date strings (YYYY-MM-DD) that have been attempted (any result)."""
+    """Return set of date strings (YYYY-MM-DD) where the API confirmed no data.
+
+    Only dates with result "no-data" block future retries.  Dates recorded as
+    "error-NNN" are excluded so they are re-attempted automatically — a request
+    error (e.g. a bad date format that has since been fixed) should not
+    permanently suppress a date.
+    """
     dates: set[str] = set()
     jsonl = geosncl_dir / _NO_DATA_FILE
     if jsonl.exists():
@@ -170,7 +176,9 @@ def _load_no_data(geosncl_dir: pathlib.Path) -> set[str]:
                 continue
             try:
                 rec = orjson.loads(line)
-                if d := rec.get("date"):
+                d = rec.get("date")
+                result = rec.get("result", "no-data")
+                if d and not result.startswith("error-"):
                     dates.add(d)
             except Exception:
                 pass
@@ -358,8 +366,8 @@ def _fetch_one_day(
             _API_BASE,
             params={
                 "stream_id": edid,
-                "start_datetime": day_start.isoformat(),
-                "end_datetime": day_end.isoformat(),
+                "start_datetime": day_start.strftime("%Y-%m-%d"),
+                "end_datetime": day_end.strftime("%Y-%m-%d"),
             },
             headers={
                 "accept": "application/vnd.apache.arrow.stream",
@@ -585,6 +593,24 @@ def _run_parallel(
 # ---------------------------------------------------------------------------
 
 
+def _parse_jsonl_line(raw_line: bytes) -> dict | None:
+    """Parse one JSONL line, stripping a grep-style 'filename:' prefix if needed."""
+    line = raw_line.strip()
+    if not line:
+        return None
+    try:
+        return orjson.loads(line)
+    except orjson.JSONDecodeError:
+        # Recover from grep artifact: "path/to/file.jsonl:{...}"
+        idx = line.find(b"{")
+        if idx > 0:
+            try:
+                return orjson.loads(line[idx:])
+            except orjson.JSONDecodeError:
+                pass
+    return None
+
+
 def _load_station_list(path_str: str) -> list[dict]:
     p = pathlib.Path(path_str)
     stem = p.stem if p.suffix in (".jsonl", ".json") else p.name
@@ -601,7 +627,7 @@ def _load_station_list(path_str: str) -> list[dict]:
             raw = c.read_bytes()
             if c.suffix == ".json":
                 return orjson.loads(raw)
-            return [orjson.loads(line) for line in raw.splitlines() if line.strip()]
+            return [r for line in raw.splitlines() if (r := _parse_jsonl_line(line)) is not None]
     tried = ", ".join(str(c) for c in dict.fromkeys(candidates))
     sys.exit(f"Station list not found. Tried: {tried}")
 
@@ -656,6 +682,142 @@ def _cmd_get(args) -> None:
         for ds, de in day_segs
         for rec in stations_sorted
     ]
+    progress = _Progress(len(all_tasks))
+    _run_parallel(all_tasks, args.workers, progress)
+    progress.finish()
+    print(f"Done: {progress.summary()}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Command: retry
+# ---------------------------------------------------------------------------
+
+
+def _retry_result_matches(result: str, pattern: str) -> bool:
+    """Return True when *result* matches *pattern*.
+
+    Pattern rules (case-insensitive):
+      "error-422"  – exact match on that one code
+      "error-*"    – any error-NNN result
+      "*"          – every result (including "no-data")
+    """
+    p = pattern.lower()
+    r = result.lower()
+    if p in ("*", "all"):
+        return True
+    if p in ("error", "error-*", "errors"):
+        return r.startswith("error-")
+    return r == p
+
+
+def _build_edid_map(data_dir: pathlib.Path) -> dict[str, str]:
+    """Scan all station-list JSONL files and return {geosncl: edid}."""
+    mapping: dict[str, str] = {}
+    sl_dir = _project_root() / "data" / "station-lists"
+    search_dirs = [sl_dir, data_dir.parent / "station-lists"]
+    for directory in dict.fromkeys(search_dirs):
+        if not directory.exists():
+            continue
+        for sl_file in sorted(directory.glob("*.jsonl")):
+            try:
+                for line in sl_file.read_bytes().splitlines():
+                    if not line.strip():
+                        continue
+                    rec = orjson.loads(line)
+                    gs  = rec.get("geosncl") or rec.get("edid", "")
+                    eid = rec.get("edid")    or rec.get("geosncl", "")
+                    if gs and eid:
+                        mapping.setdefault(gs, eid)
+            except Exception:
+                pass
+    return mapping
+
+
+def _cmd_retry(args) -> None:
+    """Retry all no_data.jsonl entries whose result matches --result."""
+    data_dir = (
+        pathlib.Path(args.data_dir)
+        if getattr(args, "data_dir", None)
+        else _project_root() / "data" / "arrow"
+    )
+    if not data_dir.exists():
+        sys.exit(f"Data directory not found: {data_dir}")
+
+    pattern = getattr(args, "result", "error-*") or "error-*"
+    edid_map = _build_edid_map(data_dir)
+
+    # Collect all matching (edid, geosncl, date) tuples; deduplicate.
+    seen: set[tuple[str, str]] = set()
+    candidates: list[tuple[str, str, dt.date]] = []
+
+    for no_data_file in sorted(data_dir.rglob("no_data.jsonl")):
+        geosncl = no_data_file.parent.name
+        try:
+            lines = no_data_file.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            continue
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = orjson.loads(line)
+            except Exception:
+                continue
+            result   = rec.get("result", "")
+            date_str = rec.get("date", "")
+            if not date_str or not _retry_result_matches(result, pattern):
+                continue
+            key = (geosncl, date_str)
+            if key in seen:
+                continue
+            seen.add(key)
+            edid = edid_map.get(geosncl, geosncl)
+            try:
+                candidates.append((edid, geosncl, dt.date.fromisoformat(date_str)))
+            except ValueError:
+                pass
+
+    if not candidates:
+        print(
+            f"No entries matching result={pattern!r} found under {data_dir}",
+            file=sys.stderr,
+        )
+        return
+
+    candidates.sort(key=lambda t: (t[1], t[2]))
+
+    if args.dry_run:
+        print(
+            f"Would retry {len(candidates)} entry/entries "
+            f"(result matches {pattern!r}):",
+            file=sys.stderr,
+        )
+        for edid, gs, day in candidates[:30]:
+            print(f"  {gs}  {day}", file=sys.stderr)
+        if len(candidates) > 30:
+            print(f"  … and {len(candidates) - 30} more", file=sys.stderr)
+        return
+
+    print(
+        f"Retrying {len(candidates)} entry/entries "
+        f"(result matches {pattern!r}) …",
+        file=sys.stderr,
+    )
+
+    token = _ensure_token()
+    all_tasks = []
+    for edid, geosncl, day in candidates:
+        day_start = dt.datetime(day.year, day.month, day.day, tzinfo=_UTC)
+        day_end   = day_start + dt.timedelta(days=1)
+        all_tasks.append((
+            token, edid, geosncl,
+            day_start, day_end,
+            False,         # force
+            True,          # redownload — removes error entry on success
+            _MAX_RETRIES,
+        ))
+
     progress = _Progress(len(all_tasks))
     _run_parallel(all_tasks, args.workers, progress)
     progress.finish()
@@ -810,6 +972,50 @@ Example:
         help="Output Arrow file path.",
     )
 
+    # --- retry ---
+    retry_p = sub.add_parser(
+        "retry",
+        help="Retry all previously failed fetch requests (error-NNN entries).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="""Scan every no_data.jsonl file under the data directory and retry any
+entry whose recorded result matches --result (default: all error-* codes).
+
+Examples:
+  # Retry all errors found anywhere in ./data/arrow:
+  positions_fetch retry
+
+  # Retry only 422 errors:
+  positions_fetch retry --result error-422
+
+  # Preview what would be retried without downloading:
+  positions_fetch retry --dry-run
+""",
+    )
+    retry_p.add_argument(
+        "--data-dir",
+        metavar="PATH",
+        default=None,
+        help="Root of the Arrow data tree to scan (default: ./data/arrow).",
+    )
+    retry_p.add_argument(
+        "--result",
+        metavar="PATTERN",
+        default="error-*",
+        help="Result pattern to retry: 'error-*' (all errors, default), 'error-422', etc.",
+    )
+    retry_p.add_argument(
+        "--workers",
+        type=int,
+        default=_DEFAULT_WORKERS,
+        metavar="N",
+        help=f"Parallel download workers (default: {_DEFAULT_WORKERS}).",
+    )
+    retry_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print matching entries without downloading.",
+    )
+
     return ap, get_p, concat_p
 
 
@@ -823,6 +1029,8 @@ def main() -> None:
         _cmd_get(args)
     elif args.command == "concat":
         _cmd_concat(args)
+    elif args.command == "retry":
+        _cmd_retry(args)
 
 
 if __name__ == "__main__":

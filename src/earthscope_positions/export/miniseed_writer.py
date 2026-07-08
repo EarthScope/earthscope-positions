@@ -293,6 +293,45 @@ def _out_path(spec: dict, variables: dict) -> pathlib.Path:
 # Main conversion entry point
 # ---------------------------------------------------------------------------
 
+def expected_out_paths(arrow_path: pathlib.Path, spec: dict) -> list[pathlib.Path]:
+    """Return the 8 expected MiniSEED output paths from the filename alone (no file read)."""
+    try:
+        geosncl = _geosncl_from_path(arrow_path)
+        gsid = parse_geosncl(geosncl)
+    except ValueError:
+        return []
+    stem = arrow_path.stem
+    prefix = geosncl + "_"
+    if not stem.startswith(prefix):
+        return []
+    rest = stem[len(prefix):]
+    if len(rest) < 8 or (len(rest) > 8 and rest[8] != "T"):
+        return []
+    try:
+        file_date = dt.date(int(rest[:4]), int(rest[4:6]), int(rest[6:8]))
+    except (ValueError, IndexError):
+        return []
+    d = dt.datetime(file_date.year, file_date.month, file_date.day, tzinfo=dt.timezone.utc)
+    doy_str = f"{d.timetuple().tm_yday:03d}"
+    paths = []
+    for subsource in CHANNELS:
+        channel = f"{gsid.band}{gsid.source}{subsource}"
+        variables = {
+            "network":  gsid.network,
+            "station":  gsid.station,
+            "location": gsid.location,
+            "channel":  channel,
+            "geosncl":  geosncl,
+            "year":     str(d.year),
+            "month":    f"{d.month:02d}",
+            "day":      f"{d.day:02d}",
+            "julday":   doy_str,
+            "hour":     "00",
+        }
+        paths.append(_out_path(spec, variables))
+    return paths
+
+
 def write_arrow_to_miniseed(
     arrow_path: pathlib.Path,
     spec: dict,

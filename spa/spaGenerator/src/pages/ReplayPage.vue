@@ -1,23 +1,5 @@
 <template>
   <q-page class="q-pa-md">
-    <PageHelp title="Replay">
-      <p>Stream historical GNSS position data into a Kafka topic at a controlled rate.</p>
-      <div class="help-section-label">Setup</div>
-      <ul>
-        <li>Configure the bootstrap server, topic name, station lists, time range, and stream filters</li>
-        <li>Click <strong>Preload</strong> to check data availability before committing to a full replay</li>
-      </ul>
-      <div class="help-section-label">Timing</div>
-      <ul>
-        <li><strong>Time scale</strong>: 1× = real-time; 10× = ten times faster</li>
-        <li><strong>Apply latency</strong>: shifts each message's send time by its original ingest delay, simulating live ingest</li>
-      </ul>
-      <div class="help-section-label">Running</div>
-      <ul>
-        <li>Click <strong>Start Replay</strong> to begin; monitor progress with the message counter</li>
-        <li>Click <strong>Cancel</strong> to stop an in-progress replay</li>
-      </ul>
-    </PageHelp>
 
     <!-- ── Two-column layout ────────────────────────────────────────────── -->
     <div class="row q-col-gutter-md">
@@ -43,7 +25,23 @@
               emit-value
               map-options
               :disable="isActive"
-            />
+            >
+              <template #option="scope">
+                <q-item v-bind="scope.itemProps">
+                  <q-item-section>
+                    <q-item-label>{{ scope.opt.label }}</q-item-label>
+                  </q-item-section>
+                  <q-menu context-menu>
+                    <q-list dense style="min-width:140px">
+                      <q-item clickable v-close-popup @click.stop="confirmDeleteList(scope.opt.value)">
+                        <q-item-section avatar><q-icon name="delete" color="negative" size="18px" /></q-item-section>
+                        <q-item-section>Delete</q-item-section>
+                      </q-item>
+                    </q-list>
+                  </q-menu>
+                </q-item>
+              </template>
+            </q-select>
 
             <!-- Date-time range -->
             <div class="row q-gutter-xs">
@@ -263,7 +261,7 @@
               </template>
             </q-card-section>
 
-            <q-card-actions class="q-pa-md q-pt-xs row q-gutter-sm">
+            <q-card-actions class="q-pa-md q-pt-xs row q-gutter-sm items-start">
               <q-btn
                 label="Go"
                 icon="play_arrow"
@@ -273,10 +271,25 @@
                 :disable="!replayState.job_id"
                 @click="doGo"
               />
-              <div v-if="replayState.job_id" class="curl-block q-pa-sm rounded-borders">
-                <div class="text-caption text-grey-6 q-mb-xs">or trigger via curl:</div>
-                <code class="text-caption">{{ curlGo }}</code>
-                <q-btn flat dense round icon="content_copy" size="xs" class="q-ml-xs" @click="copy(curlGo)" />
+              <q-btn
+                label="Cancel"
+                icon="stop"
+                color="negative"
+                outline
+                no-caps
+                disable
+              />
+              <div class="col-12 row q-gutter-sm q-mt-xs">
+                <div class="curl-block q-pa-sm rounded-borders">
+                  <div class="text-caption text-grey-6 q-mb-xs">start via curl:</div>
+                  <code class="text-caption">{{ curlGo }}</code>
+                  <q-btn flat dense round icon="content_copy" size="xs" class="q-ml-xs" @click="copy(curlGo)" />
+                </div>
+                <div class="curl-block q-pa-sm rounded-borders">
+                  <div class="text-caption text-grey-6 q-mb-xs">cancel via curl:</div>
+                  <code class="text-caption">{{ curlCancel }}</code>
+                  <q-btn flat dense round icon="content_copy" size="xs" class="q-ml-xs" @click="copy(curlCancel)" />
+                </div>
               </div>
             </q-card-actions>
           </q-card>
@@ -295,7 +308,7 @@
             <q-separator />
             <q-card-section>
               <!-- Stats row -->
-              <div class="row q-gutter-md q-mb-md">
+              <div class="row q-gutter-md q-mb-sm">
                 <div>
                   <div class="text-h5 text-positive">{{ fmtNum(replayState.sent) }}</div>
                   <div class="text-caption text-grey-6">Messages sent</div>
@@ -306,11 +319,27 @@
                 </div>
                 <div>
                   <div class="text-h5">{{ fmtElapsed(replayState.elapsed_ms) }}</div>
-                  <div class="text-caption text-grey-6">Elapsed</div>
+                  <div class="text-caption text-grey-6">Elapsed (wall)</div>
                 </div>
                 <div v-if="sendRate !== null">
                   <div class="text-h5">{{ sendRate }}/s</div>
                   <div class="text-caption text-grey-6">Send rate</div>
+                </div>
+              </div>
+
+              <!-- Data time row -->
+              <div class="row q-gutter-md q-mb-md items-end">
+                <div>
+                  <div class="text-subtitle2 text-blue-grey-7">{{ fmtDataTime(replayState.current_data_time_ms) }}</div>
+                  <div class="text-caption text-grey-6">Current data time</div>
+                </div>
+                <div>
+                  <div class="text-subtitle2">{{ fmtSeconds(replayState.replay_elapsed_s) }}</div>
+                  <div class="text-caption text-grey-6">Into replay</div>
+                </div>
+                <div>
+                  <div class="text-subtitle2">{{ fmtSeconds(replayState.replay_remaining_s) }}</div>
+                  <div class="text-caption text-grey-6">Remaining</div>
                 </div>
               </div>
 
@@ -333,7 +362,15 @@
               </div>
             </q-card-section>
 
-            <q-card-actions class="q-pa-md q-pt-xs row q-gutter-sm">
+            <q-card-actions class="q-pa-md q-pt-xs row q-gutter-sm items-start">
+              <q-btn
+                label="Go"
+                icon="play_arrow"
+                color="positive"
+                unelevated
+                no-caps
+                disable
+              />
               <q-btn
                 label="Cancel"
                 icon="stop"
@@ -342,10 +379,17 @@
                 no-caps
                 @click="doCancel"
               />
-              <div v-if="replayState.job_id" class="curl-block q-pa-sm rounded-borders">
-                <div class="text-caption text-grey-6 q-mb-xs">cancel via curl:</div>
-                <code class="text-caption">{{ curlCancel }}</code>
-                <q-btn flat dense round icon="content_copy" size="xs" class="q-ml-xs" @click="copy(curlCancel)" />
+              <div class="col-12 row q-gutter-sm q-mt-xs">
+                <div class="curl-block q-pa-sm rounded-borders">
+                  <div class="text-caption text-grey-6 q-mb-xs">start via curl:</div>
+                  <code class="text-caption">{{ curlGo }}</code>
+                  <q-btn flat dense round icon="content_copy" size="xs" class="q-ml-xs" @click="copy(curlGo)" />
+                </div>
+                <div class="curl-block q-pa-sm rounded-borders">
+                  <div class="text-caption text-grey-6 q-mb-xs">cancel via curl:</div>
+                  <code class="text-caption">{{ curlCancel }}</code>
+                  <q-btn flat dense round icon="content_copy" size="xs" class="q-ml-xs" @click="copy(curlCancel)" />
+                </div>
               </div>
             </q-card-actions>
           </q-card>
@@ -474,7 +518,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, watch, nextTick } from "vue";
+import { ref, computed, onMounted, onUnmounted, onActivated, onDeactivated, watch, nextTick } from "vue";
 import type { Chart as ChartType } from "chart.js";
 import {
   getStationLists,
@@ -487,6 +531,7 @@ import {
   openFetchMissingStream,
 } from "../api";
 import type { ReplayState, FetchEvent } from "../types";
+import { useListDelete } from "../composables/useListDelete";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -591,7 +636,7 @@ const curlGo = computed(() =>
   `curl -X POST ${origin.value}/api/replay/start`
 );
 const curlCancel = computed(() =>
-  `curl -X POST ${origin.value}/api/replay/${replayState.value.job_id}/cancel`
+  `curl -X POST ${origin.value}/api/replay/cancel`
 );
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -607,6 +652,19 @@ function fmtElapsed(ms: number | undefined): string {
   if (s < 60)   return `${s}s`;
   if (s < 3600) return `${Math.floor(s/60)}m ${s%60}s`;
   return `${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m`;
+}
+
+function fmtSeconds(s: number | undefined): string {
+  if (s === undefined || s === null) return "—";
+  const sec = Math.round(s);
+  if (sec < 60)   return `${sec}s`;
+  if (sec < 3600) return `${Math.floor(sec/60)}m ${sec%60}s`;
+  return `${Math.floor(sec/3600)}h ${Math.floor((sec%3600)/60)}m`;
+}
+
+function fmtDataTime(ms: number | undefined): string {
+  if (!ms) return "—";
+  return new Date(ms).toISOString().replace("T", " ").slice(0, 19) + " UTC";
 }
 
 function toggleItem(list: string[], item: string): void {
@@ -629,6 +687,8 @@ async function copy(text: string) {
 }
 
 // ─── Station lists ────────────────────────────────────────────────────────────
+
+const { confirmDeleteList } = useListDelete(loadListOptions);
 
 async function loadListOptions() {
   try {
@@ -713,6 +773,10 @@ async function initChart() {
 
   const { Chart, LineController, LineElement, PointElement, LinearScale, Title, Tooltip } =
     await import("chart.js");
+
+  // Component may have unmounted while the dynamic import was in flight.
+  if (!chartCanvas.value) return;
+
   Chart.register(LineController, LineElement, PointElement, LinearScale, Title, Tooltip);
 
   chart = new Chart(chartCanvas.value, {
@@ -797,16 +861,11 @@ async function doGo() {
 }
 
 async function doCancel() {
-  const jobId = replayState.value.job_id;
-  if (!jobId) {
-    await doReset();
-    return;
-  }
   try {
-    await replayCancel(jobId);
-  } catch (e: any) {
-    // 409 means nothing was running (already done/error) — just reset to idle.
-    await doReset();
+    await replayCancel();
+    // Poll will detect status="canceled" within ~1s and stop itself.
+  } catch {
+    // 409 = already in a terminal state — poll will pick it up.
   }
 }
 
@@ -890,6 +949,18 @@ onUnmounted(() => {
   if (chart) { chart.destroy(); chart = null; }
 });
 
+// If ESLayout uses <keep-alive>, onMounted/onUnmounted only fire once.
+// onActivated/onDeactivated fire on every route switch in that case.
+onActivated(() => {
+  if (["preloading", "preloaded", "running", "starting"].includes(replayStatus.value)) {
+    startPolling();
+  }
+});
+onDeactivated(() => {
+  stopPolling();
+  if (chart) { chart.destroy(); chart = null; }
+});
+
 // Re-init chart when canvas is mounted (status transitions to running)
 watch(chartCanvas, (el) => {
   if (el && isRunning.value) initChart();
@@ -903,8 +974,6 @@ watch(selectedLists, () => {
 
 <style scoped>
 .config-card {
-  position: sticky;
-  top: 8px;
 }
 .curl-block {
   background: #f5f5f5;

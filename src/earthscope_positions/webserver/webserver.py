@@ -37,7 +37,6 @@ import re
 import sys
 import time
 from collections import defaultdict
-import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
@@ -47,8 +46,9 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.ipc as ipc
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -63,7 +63,7 @@ SCAN_INTERVAL_S = 60  # seconds between background index refreshes
 
 _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="completeness-gen")
 _ppsd_pool = ThreadPoolExecutor(
-    max_workers=max(2, (os.cpu_count() or 4)),
+    max_workers=20,
     thread_name_prefix="ppsd-cache",
 )
 
@@ -527,6 +527,24 @@ def _build_station_buckets(
 app = FastAPI(title="GNSS Positions", docs_url="/api/docs")
 
 
+class _NoCacheMiddleware(BaseHTTPMiddleware):
+    """Add Cache-Control: no-store to every response except versioned SPA assets.
+
+    Vite's hashed bundles under /assets/ are content-addressed and safe to
+    cache indefinitely.  Everything else (index.html, API responses, favicon)
+    must not be cached so browsers always pick up the latest build.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        if not request.url.path.startswith("/assets/"):
+            response.headers["Cache-Control"] = "no-store"
+        return response
+
+
+app.add_middleware(_NoCacheMiddleware)
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     global _index_lock, _gen_locks_mu, _station_builder_coords
@@ -546,6 +564,13 @@ async def _startup() -> None:
         print(f"  coords   : {len(_station_builder_coords)} stations", file=sys.stderr)
     except Exception as exc:
         print(f"  coords   : not found ({exc})", file=sys.stderr)
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    # Signal any running replay to stop so the Kafka producer can flush and
+    # release its internal C threads before the process exits.
+    _replay_mod.cancel_replay()
 
     # Mount SPA assets
     spa = _spa_dir()
@@ -598,6 +623,186 @@ async def api_station_lists() -> dict:
     return {"lists": _list_station_list_names()}
 
 
+@app.get("/api/station-lists/filter-options")
+async def api_station_lists_filter_options(
+    lists: list[str] = Query([]),
+) -> JSONResponse:
+    """Return available centers and combined sol_type codes for the given lists.
+
+    If lists is empty, scans all station list files.
+    """
+    if lists:
+        geosncl_set: set[str] = set()
+        for lst in lists:
+            geosncl_set.update(_geosncls_for_list(lst))
+        geosncls = sorted(geosncl_set)
+    else:
+        geosncls = _all_list_geosncls()
+
+    centers_set:   set[str] = set()
+    sol_types_set: set[str] = set()
+    for gs in geosncls:
+        parts = gs.split(".")
+        if len(parts) < 4:
+            continue
+        centers_set.add(parts[1])
+        loc = parts[3]
+        if len(loc) >= 2:
+            sol_types_set.add(loc[:2])
+
+    return JSONResponse({
+        "centers":   sorted(centers_set),
+        "sol_types": sorted(sol_types_set),
+    })
+
+
+_NCEDC_METADATA_URL = "https://ncedc.org/outgoing/gps/ShakeAlert/metadata/"
+
+
+@app.get("/api/station-lists/shakealert-datasource")
+async def api_shakealert_datasource() -> StreamingResponse:
+    """Run es-pos stations get datasource --network-name SHAKE:ShakeAlert -o ShakeAlert."""
+    def _sse(obj: dict) -> str:
+        return f"data: {json.dumps(obj)}\n\n"
+
+    async def generate():
+        cmd = [
+            sys.executable, "-m", "earthscope_positions.es_pos",
+            "stations", "get", "datasource",
+            "--network-name", "SHAKE:ShakeAlert",
+            "-o", "ShakeAlert",
+        ]
+        yield _sse({"type": "log", "msg":
+            "es-pos stations get datasource --network-name SHAKE:ShakeAlert -o ShakeAlert"})
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=str(_project_root()),
+        )
+        async for raw in proc.stdout:  # type: ignore[union-attr]
+            line = raw.decode(errors="replace").rstrip()
+            if line:
+                yield _sse({"type": "log", "msg": line})
+        await proc.wait()
+        if proc.returncode == 0:
+            yield _sse({"type": "done", "code": 0,
+                        "msg": "Saved ShakeAlert.jsonl. Reload station lists to use it."})
+        else:
+            yield _sse({"type": "done", "code": proc.returncode,
+                        "msg": f"Command exited with code {proc.returncode}"})
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+def _fetch_url_sync(url: str) -> bytes:
+    import urllib.request
+    with urllib.request.urlopen(url, timeout=30) as r:
+        return r.read()
+
+
+@app.get("/api/station-lists/update-active-from-ncedc")
+async def api_update_active_from_ncedc() -> StreamingResponse:
+    """Download chanfile_XX.dat from NCEDC, cross-reference existing lists, write XX-Active.jsonl."""
+    def _sse(obj: dict) -> str:
+        return f"data: {json.dumps(obj)}\n\n"
+
+    async def generate():
+        loop = asyncio.get_event_loop()
+
+        yield _sse({"type": "log", "msg": f"Fetching index: {_NCEDC_METADATA_URL}"})
+        try:
+            html_bytes = await loop.run_in_executor(None, _fetch_url_sync, _NCEDC_METADATA_URL)
+        except Exception as exc:
+            yield _sse({"type": "error", "msg": f"Failed to fetch index: {exc}"})
+            yield _sse({"type": "done", "code": 1})
+            return
+
+        chanfile_codes = sorted(set(re.findall(r'chanfile_(\w+)\.dat', html_bytes.decode(errors="replace"))))
+        if not chanfile_codes:
+            yield _sse({"type": "error", "msg": "No chanfile_XX.dat files found."})
+            yield _sse({"type": "done", "code": 1})
+            return
+
+        yield _sse({"type": "log", "msg": f"Found {len(chanfile_codes)} chanfile(s): {', '.join(chanfile_codes)}"})
+
+        # Build cross-reference from all existing station-list files
+        yield _sse({"type": "log", "msg": "Cross-referencing existing station lists…"})
+        all_records: dict[str, dict] = {}
+        d = _station_lists_dir()
+        for path in sorted(d.iterdir()):
+            if path.suffix not in (".jsonl", ".json"):
+                continue
+            try:
+                for rec in _read_station_list_file(path):
+                    gs = rec.get("geosncl") or rec.get("edid", "")
+                    if gs and gs not in all_records:
+                        all_records[gs] = rec
+            except Exception:
+                pass
+        yield _sse({"type": "log", "msg": f"  {len(all_records)} unique stream(s) in existing lists."})
+
+        created: list[str] = []
+
+        for code in chanfile_codes:
+            center = code.upper()
+            url = f"{_NCEDC_METADATA_URL}chanfile_{code}.dat"
+            yield _sse({"type": "log", "msg": f"\nDownloading chanfile_{code}.dat…"})
+
+            try:
+                content = await loop.run_in_executor(None, _fetch_url_sync, url)
+            except Exception as exc:
+                yield _sse({"type": "error", "msg": f"  Failed: {exc}"})
+                continue
+
+            geosncls: set[str] = set()
+            for line in content.decode(errors="replace").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts_row = line.split()
+                if len(parts_row) < 4:
+                    continue
+                network, station, location, channel = parts_row[0], parts_row[1], parts_row[2], parts_row[3]
+                base_chan = channel[:2] + "_" if len(channel) >= 2 else channel
+                geosncls.add(f"{station}.{network}.{base_chan}.{location}")
+
+            yield _sse({"type": "log", "msg": f"  {len(geosncls)} unique stream(s) in chanfile."})
+
+            records: list[dict] = []
+            found = 0
+            for gs in sorted(geosncls):
+                if gs in all_records:
+                    records.append(all_records[gs])
+                    found += 1
+                else:
+                    records.append({"geosncl": gs})
+            yield _sse({"type": "log", "msg": f"  {found}/{len(geosncls)} matched in existing lists."})
+
+            list_name = f"{center}-Active"
+            d.mkdir(parents=True, exist_ok=True)
+            out_path = d / f"{list_name}.jsonl"
+            out_path.write_text(
+                "\n".join(json.dumps(rec, ensure_ascii=False) for rec in records) + "\n",
+                encoding="utf-8",
+            )
+            created.append(list_name)
+            yield _sse({"type": "log", "msg": f"  → Saved {list_name}.jsonl ({len(records)} stream(s))"})
+
+        yield _sse({"type": "done", "code": 0,
+                    "msg": f"Done. Created/updated: {', '.join(created)}. Reload the page to see new lists."})
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.get("/api/station-lists/{name}", response_model=None)
 async def api_get_station_list(name: str) -> JSONResponse:
     name = name.strip()
@@ -619,6 +824,21 @@ async def api_get_station_list(name: str) -> JSONResponse:
         return JSONResponse({"name": name, "geosncls": sorted(set(g for g in geosncls if g))})
     except Exception as exc:
         return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.delete("/api/station-lists/{name}", response_model=None)
+async def api_delete_station_list(name: str) -> JSONResponse:
+    name = name.strip()
+    if not name or ".." in name or "/" in name or "\\" in name:
+        return JSONResponse({"error": "Invalid list name"}, status_code=400)
+    d = _station_lists_dir()
+    for suffix in (".jsonl", ".json"):
+        path = d / f"{name}{suffix}"
+        if path.exists():
+            path.unlink()
+            _log.info("[station-lists] deleted %r", name)
+            return JSONResponse({"deleted": name})
+    return JSONResponse({"error": "Not found"}, status_code=404)
 
 
 class _SaveListBody(BaseModel):
@@ -1154,11 +1374,11 @@ async def api_replay_go(job_id: str) -> JSONResponse:
     return JSONResponse({"status": "running"})
 
 
-@app.post("/api/replay/{job_id}/cancel", response_model=None)
-async def api_replay_cancel(job_id: str) -> JSONResponse:
-    ok = _replay_mod.cancel_replay(job_id)
+@app.post("/api/replay/cancel", response_model=None)
+async def api_replay_cancel() -> JSONResponse:
+    ok = _replay_mod.cancel_replay()
     if not ok:
-        return JSONResponse({"error": "Nothing to cancel (wrong job_id or not running)"}, status_code=409)
+        return JSONResponse({"error": "Nothing to cancel"}, status_code=409)
     return JSONResponse({"status": "canceling"})
 
 
@@ -1178,8 +1398,6 @@ async def api_readme() -> JSONResponse:
     return JSONResponse({"content": path.read_text(encoding="utf-8")})
 
 
-# ── /api/station-lists/filter-options ────────────────────────────────────────
-
 def _all_list_geosncls() -> list[str]:
     """Return a deduplicated sorted list of all geosncls from every station list file."""
     d = _station_lists_dir()
@@ -1198,39 +1416,6 @@ def _all_list_geosncls() -> list[str]:
         except Exception:
             pass
     return sorted(seen)
-
-
-@app.get("/api/station-lists/filter-options")
-async def api_station_lists_filter_options(
-    lists: list[str] = Query([]),
-) -> JSONResponse:
-    """Return available centers and combined sol_type codes for the given lists.
-
-    If lists is empty, scans all station list files.
-    """
-    if lists:
-        geosncl_set: set[str] = set()
-        for lst in lists:
-            geosncl_set.update(_geosncls_for_list(lst))
-        geosncls = sorted(geosncl_set)
-    else:
-        geosncls = _all_list_geosncls()
-
-    centers_set:   set[str] = set()
-    sol_types_set: set[str] = set()
-    for gs in geosncls:
-        parts = gs.split(".")
-        if len(parts) < 4:
-            continue
-        centers_set.add(parts[1])
-        loc = parts[3]
-        if len(loc) >= 2:
-            sol_types_set.add(loc[:2])
-
-    return JSONResponse({
-        "centers":   sorted(centers_set),
-        "sol_types": sorted(sol_types_set),
-    })
 
 
 # ── /api/ppsd ─────────────────────────────────────────────────────────────────
@@ -1375,43 +1560,36 @@ async def api_ppsd_run(
 
         from earthscope_positions.export import ppsd_writer
 
-        # ── Phase 1: precompute missing caches in parallel ────────────────────
         all_files = sorted({f for _, files in groups for f in files})
-        missing = [f for f in all_files if ppsd_writer.load_ppsd_cache(f) is None]
-
         yield _sse({"type": "log", "msg":
-            f"{len(gs_files)} stream(s), {n_groups} group(s), {len(all_files)} file(s)"
-            f"  ({start} → {end})  —  {len(all_files) - len(missing)} cached, {len(missing)} to compute"})
+            f"{n_groups} group(s), {len(all_files)} file(s)  ({start} → {end})"})
 
         loop = asyncio.get_event_loop()
-
-        if missing:
-            n_workers = max(2, (os.cpu_count() or 4))
-            yield _sse({"type": "log", "msg":
-                f"Computing PPSD cache for {len(missing)} file(s) using {n_workers} workers…"})
-            n_cached = 0
-            futs = [
-                asyncio.ensure_future(loop.run_in_executor(_ppsd_pool, ppsd_writer.ensure_ppsd_cache, f))
-                for f in missing
-            ]
-            for coro in asyncio.as_completed(futs):
-                try:
-                    await coro
-                except Exception as exc:
-                    yield _sse({"type": "error", "msg": f"Cache compute error: {exc}"})
-                n_cached += 1
-                yield _sse({"type": "progress",
-                            "msg": f"Cached {n_cached}/{len(missing)}",
-                            "current": n_cached, "total": len(missing)})
-
-        # ── Phase 2: merge cached data and render one PNG per group ───────────
-        yield _sse({"type": "log", "msg": f"Rendering {n_groups} plot(s) from cached histograms…"})
         run_dir = _project_root() / "data" / "plots" / "ppsd" / f"{start}_{end}"
         written_total = 0
 
         for i, (key, files) in enumerate(groups):
             label = _ppsd_group_label(key, mode)
             title_prefix = "" if mode == "by-stream" else "Combined"
+
+            yield _sse({"type": "progress",
+                        "msg": f"({i + 1}/{n_groups}) : Generating {label}",
+                        "current": i + 1, "total": n_groups})
+
+            # Load / compute caches for this group in parallel (20 workers)
+            futs = [
+                asyncio.ensure_future(loop.run_in_executor(_ppsd_pool, ppsd_writer.ensure_ppsd_cache, f))
+                for f in files
+            ]
+            n_loaded = 0
+            n_files = len(files)
+            for coro in asyncio.as_completed(futs):
+                try:
+                    await coro
+                except Exception as exc:
+                    yield _sse({"type": "error", "msg": f"  cache error: {exc}"})
+                n_loaded += 1
+                yield _sse({"type": "log", "msg": f"\tLoaded {n_loaded} / {n_files}."})
 
             def _render(files=files, label=label, title_prefix=title_prefix):
                 from earthscope_positions.export import ppsd_writer as pw

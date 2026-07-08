@@ -12,11 +12,6 @@ export interface PpsdCompletedFile {
   label: string;
 }
 
-const selectedLists = ref<string[]>([]);
-const startDate = ref("");
-const endDate = ref("");
-const dateRange = ref<{ from: string; to: string } | null>(null);
-
 // Filter state (populated from API; all selected by default)
 const filterCenters  = ref<string[]>([]);
 const filterSolTypes = ref<string[]>([]);
@@ -33,7 +28,6 @@ let _cancel: (() => void) | null = null;
 
 export function usePpsdJob() {
   return {
-    selectedLists, startDate, endDate, dateRange,
     filterCenters, filterSolTypes,
     logs, running, done, exitCode,
     progressCurrent, progressTotal, completedFiles,

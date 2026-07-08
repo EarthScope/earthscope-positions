@@ -346,6 +346,44 @@ def write_arrow_to_full_geojson(
 # Convenience: write both formats from one Arrow file
 # ---------------------------------------------------------------------------
 
+def expected_out_paths(
+    arrow_path: pathlib.Path,
+    spec: dict,
+    formats: tuple[str, ...] = ("compact", "full"),
+) -> list[pathlib.Path]:
+    """Return expected GeoJSON output paths from the filename alone (no file read)."""
+    try:
+        geosncl = _geosncl_from_path(arrow_path)
+        station, network, chan_base, location = _parse_geosncl(geosncl)
+    except ValueError:
+        return []
+    stem = arrow_path.stem
+    prefix = geosncl + "_"
+    if not stem.startswith(prefix):
+        return []
+    rest = stem[len(prefix):]
+    if len(rest) < 8 or (len(rest) > 8 and rest[8] != "T"):
+        return []
+    try:
+        file_date = dt.date(int(rest[:4]), int(rest[4:6]), int(rest[6:8]))
+    except (ValueError, IndexError):
+        return []
+    d = dt.datetime(file_date.year, file_date.month, file_date.day, tzinfo=dt.timezone.utc)
+    pvars = {
+        "geosncl":  geosncl,
+        "station":  station,
+        "network":  network,
+        "location": location,
+        "channel":  chan_base,
+        "year":     str(d.year),
+        "month":    f"{d.month:02d}",
+        "day":      f"{d.day:02d}",
+        "julday":   f"{d.timetuple().tm_yday:03d}",
+        "hour":     "00",
+    }
+    return [_out_path(spec[fmt], pvars) for fmt in formats if fmt in spec]
+
+
 def write_arrow_to_geojson(
     arrow_path: pathlib.Path,
     spec: dict,

@@ -1,20 +1,5 @@
 <template>
   <q-page class="q-pa-md column no-wrap" style="height: calc(100vh - 50px)">
-    <PageHelp title="Positions">
-      <p>East / North / Up position time series for one or more stations.</p>
-      <div class="help-section-label">Controls</div>
-      <ul>
-        <li>Select a station list and date range; use the search box to filter by station name</li>
-        <li><strong>Shift + drag</strong> on any chart to zoom a time range; <strong>right-click</strong> to reset</li>
-        <li><strong>Shift-click</strong> a legend entry to remove that station from all plots</li>
-        <li>All three position charts share the same x-axis when zooming</li>
-      </ul>
-      <div class="help-section-label">Power spectra</div>
-      <ul>
-        <li>Charts below show frequency content per component (periods from 5 min to the full record length)</li>
-        <li>Y-axis is in scientific notation (m²/Hz)</li>
-      </ul>
-    </PageHelp>
 
     <!-- ── Controls ─────────────────────────────────────────────────────── -->
     <div class="row items-center q-gutter-sm q-mb-xs flex-shrink-0">
@@ -25,7 +10,23 @@
         dense outlined emit-value map-options
         style="min-width: 180px"
         @update:model-value="reloadStations"
-      />
+      >
+        <template #option="scope">
+          <q-item v-bind="scope.itemProps">
+            <q-item-section>
+              <q-item-label>{{ scope.opt.label }}</q-item-label>
+            </q-item-section>
+            <q-menu v-if="scope.opt.value !== 'all'" context-menu>
+              <q-list dense style="min-width:140px">
+                <q-item clickable v-close-popup @click.stop="confirmDeleteList(scope.opt.value)">
+                  <q-item-section avatar><q-icon name="delete" color="negative" size="18px" /></q-item-section>
+                  <q-item-section>Delete</q-item-section>
+                </q-item>
+              </q-list>
+            </q-menu>
+          </q-item>
+        </template>
+      </q-select>
       <q-input
         v-model="searchText"
         label="Filter stations"
@@ -150,11 +151,18 @@
             <canvas :ref="el => setCanvas(comp.key, el)" class="chart-canvas" />
           </div>
 
-          <!-- Power spectra -->
-          <div class="text-subtitle2 text-grey-8 q-mt-md q-mb-xs">Power Spectra</div>
-          <div v-for="comp in COMPONENTS" :key="'s_' + comp.key" class="chart-block q-mb-sm">
-            <div class="text-caption text-grey-7 q-mb-xs">{{ comp.specLabel }}</div>
-            <canvas :ref="el => setSpecCanvas(comp.key, el)" class="chart-canvas" />
+          <!-- Scatter plots: E-N, N-U, U-E -->
+          <div class="row no-wrap q-col-gutter-xs q-mb-sm" style="flex-shrink: 0">
+            <div v-for="sc in SCATTER_DEFS" :key="'sc_' + sc.key" class="col chart-block-sq">
+              <canvas :ref="el => setScatterCanvas(sc.key, el)" class="chart-canvas-full" />
+            </div>
+          </div>
+
+          <!-- Histograms: E, N, U -->
+          <div class="row no-wrap q-col-gutter-xs q-mb-sm" style="flex-shrink: 0">
+            <div v-for="h in HIST_DEFS" :key="'h_' + h.key" class="col chart-block-sm">
+              <canvas :ref="el => setHistCanvas(h.key, el)" class="chart-canvas-full" />
+            </div>
           </div>
         </template>
       </div>
@@ -233,6 +241,7 @@ import { Chart, registerables } from "chart.js";
 import { getStationLists, getStations, getPositions, getDataRange, openFetchMissingStream, saveStationList } from "../api";
 import type { PositionTrace, FetchEvent } from "../types";
 import { useSharedControls } from "../composables/useSharedControls";
+import { useListDelete } from "../composables/useListDelete";
 
 Chart.register(...registerables);
 
@@ -247,9 +256,21 @@ const TIME_WINDOWS = [
 ] as const;
 
 const COMPONENTS = [
-  { key: "east",  label: "East (mm)",  specLabel: "East PSD (mm²)"  },
-  { key: "north", label: "North (mm)", specLabel: "North PSD (mm²)" },
-  { key: "up",    label: "Up (mm)",    specLabel: "Up PSD (mm²)"    },
+  { key: "east",  label: "East (mm)"  },
+  { key: "north", label: "North (mm)" },
+  { key: "up",    label: "Up (mm)"    },
+] as const;
+
+const SCATTER_DEFS = [
+  { key: "en", xComp: "east"  as const, yComp: "north" as const, xLabel: "E (mm)", yLabel: "N (mm)" },
+  { key: "nu", xComp: "north" as const, yComp: "up"    as const, xLabel: "N (mm)", yLabel: "U (mm)" },
+  { key: "ue", xComp: "up"    as const, yComp: "east"  as const, xLabel: "U (mm)", yLabel: "E (mm)" },
+] as const;
+
+const HIST_DEFS = [
+  { key: "east",  comp: "east"  as const, label: "E (mm)" },
+  { key: "north", comp: "north" as const, label: "N (mm)" },
+  { key: "up",    comp: "up"    as const, label: "U (mm)" },
 ] as const;
 
 const COLORS = [
@@ -263,6 +284,7 @@ const COLORS = [
 
 const listOptions = ref<{ label: string; value: string }[]>([]);
 const { selectedList, searchText, startDate, endDate, dateRange, rangeDays, activeWindow } = useSharedControls();
+const { confirmDeleteList } = useListDelete(loadListOptions);
 const stationsLoading = ref(false);
 
 const downsampleEnabled  = ref(true);
@@ -282,23 +304,23 @@ const positionCache    = ref<Map<string, PositionTrace>>(new Map());
 const positionsLoading = ref(false);
 
 // ── Chart objects (plain, not reactive – Vue proxy breaks Chart.js) ──────────
-const _canvas:     Record<string, HTMLCanvasElement | null> = { east: null, north: null, up: null };
-const _chart:      Record<string, Chart | null>             = { east: null, north: null, up: null };
-const _specCanvas: Record<string, HTMLCanvasElement | null> = { east: null, north: null, up: null };
-const _specChart:  Record<string, Chart | null>             = { east: null, north: null, up: null };
+const _canvas:        Record<string, HTMLCanvasElement | null> = { east: null, north: null, up: null };
+const _chart:         Record<string, Chart | null>             = { east: null, north: null, up: null };
+const _scatterCanvas: Record<string, HTMLCanvasElement | null> = { en: null, nu: null, ue: null };
+const _scatterChart:  Record<string, Chart | null>             = { en: null, nu: null, ue: null };
+const _histCanvas:    Record<string, HTMLCanvasElement | null> = { east: null, north: null, up: null };
+const _histChart:     Record<string, Chart | null>             = { east: null, north: null, up: null };
+const _histStats:     Record<string, { mean: number; std: number } | null> = { east: null, north: null, up: null };
 
 // Cleanup functions for canvas event listeners
-const _canvasCleanup:     Record<string, (() => void) | null> = { east: null, north: null, up: null };
-const _specCanvasCleanup: Record<string, (() => void) | null> = { east: null, north: null, up: null };
+const _canvasCleanup: Record<string, (() => void) | null> = { east: null, north: null, up: null };
 
 // ── Zoom state (reactive, watched to sync charts) ───────────────────────────
-const _posZoom  = ref<{ min: number; max: number } | null>(null);
-const _specZoom = ref<{ min: number; max: number } | null>(null);
+const _posZoom = ref<{ min: number; max: number } | null>(null);
 
 // ── Interaction state (plain, not reactive – updated on every mouse event) ───
-const _posDragState  = { active: false, chartKey: "", startPx: 0, currentPx: 0 };
-const _specDragState = { active: false, chartKey: "", startPx: 0, currentPx: 0 };
-const _crosshair     = { posX: null as number | null, specX: null as number | null };
+const _posDragState = { active: false, chartKey: "", startPx: 0, currentPx: 0, justZoomed: false };
+const _crosshair    = { posX: null as number | null };
 
 // ── Save Selection dialog ────────────────────────────────────────────────────
 const saveOpen     = ref(false);
@@ -401,8 +423,8 @@ onMounted(async () => {
 });
 
 onBeforeUnmount(() => {
-  [...Object.values(_chart), ...Object.values(_specChart)].forEach(c => c?.destroy());
-  [...Object.values(_canvasCleanup), ...Object.values(_specCanvasCleanup)].forEach(fn => fn?.());
+  [...Object.values(_chart), ...Object.values(_scatterChart), ...Object.values(_histChart)].forEach(c => c?.destroy());
+  Object.values(_canvasCleanup).forEach(fn => fn?.());
 });
 
 // ─── Station lists ────────────────────────────────────────────────────────────
@@ -529,28 +551,25 @@ function setCanvas(key: string, el: unknown) {
     _canvasCleanup[key]?.(); _canvasCleanup[key] = null;
   } else {
     _canvas[key] = canvas;
-    _canvasCleanup[key] = _attachListeners(canvas, key, "pos");
+    _canvasCleanup[key] = _attachListeners(canvas, key);
   }
 }
-function setSpecCanvas(key: string, el: unknown) {
+function setScatterCanvas(key: string, el: unknown) {
   const canvas = el as HTMLCanvasElement | null;
-  if (!canvas) {
-    _specChart[key]?.destroy(); _specChart[key] = null;
-    _specCanvasCleanup[key]?.(); _specCanvasCleanup[key] = null;
-  } else {
-    _specCanvas[key] = canvas;
-    _specCanvasCleanup[key] = _attachListeners(canvas, key, "spec");
-  }
+  if (!canvas) { _scatterChart[key]?.destroy(); _scatterChart[key] = null; }
+  else { _scatterCanvas[key] = canvas; }
+}
+function setHistCanvas(key: string, el: unknown) {
+  const canvas = el as HTMLCanvasElement | null;
+  if (!canvas) { _histChart[key]?.destroy(); _histChart[key] = null; }
+  else { _histCanvas[key] = canvas; }
 }
 
-function _attachListeners(canvas: HTMLCanvasElement, chartKey: string, group: "pos" | "spec"): () => void {
-  const drag = group === "pos" ? _posDragState : _specDragState;
-  const zoomRef = group === "pos" ? _posZoom : _specZoom;
-  const getChart = () => group === "pos" ? _chart[chartKey] : _specChart[chartKey];
-  const renderPeers = () => {
-    const peers = group === "pos" ? Object.values(_chart) : Object.values(_specChart);
-    peers.forEach(c => c?.render());
-  };
+function _attachListeners(canvas: HTMLCanvasElement, chartKey: string): () => void {
+  const drag = _posDragState;
+  const zoomRef = _posZoom;
+  const getChart = () => _chart[chartKey];
+  const renderPeers = () => { Object.values(_chart).forEach(c => c?.render()); };
 
   const onMousedown = (e: MouseEvent) => {
     if (!e.shiftKey) return;
@@ -562,9 +581,7 @@ function _attachListeners(canvas: HTMLCanvasElement, chartKey: string, group: "p
   const onMousemove = (e: MouseEvent) => {
     const chart = getChart();
     if (chart) {
-      const xVal = chart.scales["x"]?.getValueForPixel(e.offsetX);
-      if (group === "pos") _crosshair.posX = xVal ?? null;
-      else                 _crosshair.specX = xVal ?? null;
+      _crosshair.posX = chart.scales["x"]?.getValueForPixel(e.offsetX) ?? null;
       renderPeers();
     }
     if (drag.active && drag.chartKey === chartKey) {
@@ -582,14 +599,16 @@ function _attachListeners(canvas: HTMLCanvasElement, chartKey: string, group: "p
       const xMax = Math.max(drag.startPx, drag.currentPx);
       const dMin = chart.scales["x"]?.getValueForPixel(xMin);
       const dMax = chart.scales["x"]?.getValueForPixel(xMax);
-      if (dMin !== undefined && dMax !== undefined && dMax > dMin)
+      if (dMin !== undefined && dMax !== undefined && dMax > dMin) {
         zoomRef.value = { min: dMin, max: dMax };
+        drag.justZoomed = true;
+      }
     }
     drag.active = false;
   };
 
   const onMouseleave = () => {
-    if (group === "pos") _crosshair.posX = null; else _crosshair.specX = null;
+    _crosshair.posX = null;
     if (drag.active && drag.chartKey === chartKey) drag.active = false;
     renderPeers();
   };
@@ -623,12 +642,12 @@ function _epochLabel(ms: number): string {
     + " " + d.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", timeZone: "UTC", hour12: false });
 }
 
-function _interactionPlugin(chartKey: string, group: "pos" | "spec"): object {
-  const drag   = group === "pos" ? _posDragState : _specDragState;
-  const xhair  = group === "pos" ? (() => _crosshair.posX) : (() => _crosshair.specX);
+function _interactionPlugin(chartKey: string): object {
+  const drag  = _posDragState;
+  const xhair = () => _crosshair.posX;
 
   return {
-    id: `iact-${group}-${chartKey}`,
+    id: `iact-pos-${chartKey}`,
     afterDraw(chart: Chart) {
       const ctx = chart.ctx;
       const { left, right, top, bottom } = chart.chartArea;
@@ -665,9 +684,10 @@ function _interactionPlugin(chartKey: string, group: "pos" | "spec"): object {
   };
 }
 
-function _makeOnClick(group: "pos" | "spec"): (e: any, elems: any[], chart: Chart) => void {
+function _makeOnClick(): (e: any, elems: any[], chart: Chart) => void {
   return (event, elements, chart) => {
     if (!event.native?.shiftKey) return;
+    if (_posDragState.justZoomed) { _posDragState.justZoomed = false; return; }
     let dsIdx = elements.length > 0 ? elements[0].datasetIndex : -1;
     if (dsIdx < 0) {
       const nearest = chart.getElementsAtEventForMode(event.native, "nearest", { intersect: false }, false);
@@ -701,62 +721,9 @@ function _makePosChart(key: string, label: string): Chart | null {
           },
         },
       },
-      onClick: _makeOnClick("pos"),
+      onClick: _makeOnClick(),
     },
-    plugins: [_interactionPlugin(key, "pos")] as any,
-  });
-}
-
-// Tick positions (cycles/day) for the linear spectra x-axis, chosen so each maps
-// to a round period (5m → 288 cpd, 10m → 144, … 1d → 1 cpd).
-const _SPEC_TICKS = [1, 2, 4, 8, 24, 48, 96, 144, 288]; // cpd
-
-function _specFreqLabel(v: number | string): string {
-  const f = Number(v); if (!f) return "";
-  const p = 1 / f;
-  if (p >= 1)       return `${p.toFixed(0)}d`;
-  if (p * 24 >= 1)  return `${(p * 24).toFixed(0)}h`;
-  return `${(p * 1440).toFixed(0)}m`;
-}
-
-function _makeSpecChart(key: string, label: string): Chart | null {
-  const canvas = _specCanvas[key]; if (!canvas) return null;
-  return new Chart(canvas, {
-    type: "line",
-    data: { datasets: [] },
-    options: {
-      animation: false, responsive: true, maintainAspectRatio: false, parsing: false,
-      interaction: { mode: "nearest", intersect: false, axis: "xy" },
-      scales: {
-        x: {
-          type: "linear" as const,
-          min: 0,
-          max: 290,
-          afterBuildTicks: (scale: any) => {
-            scale.ticks = _SPEC_TICKS.map(v => ({ value: v }));
-          },
-          title: { display: true, text: "Frequency (cycles/day)", font: { size: 10 } },
-          ticks: { callback: _specFreqLabel },
-          grid: { color: "#e0e0e0" },
-        },
-        y: { type: "logarithmic", title: { display: true, text: label, font: { size: 11 } }, grid: { color: "#e0e0e0" } },
-      },
-      plugins: {
-        legend: { position: "right", labels: { font: { size: 10 }, boxWidth: 12 } },
-        tooltip: {
-          callbacks: {
-            title: items => {
-              const f = items[0].parsed.x; if (!f) return "";
-              const p = 1 / f;
-              return p >= 1 ? `Period: ${p.toFixed(2)} d` : p * 24 >= 1 ? `Period: ${(p*24).toFixed(2)} h` : `Period: ${(p*1440).toFixed(2)} min`;
-            },
-            label: item => `${item.dataset.label}: ${item.parsed.y?.toExponential(2) ?? "—"} mm²`,
-          },
-        },
-      },
-      onClick: _makeOnClick("spec"),
-    },
-    plugins: [_interactionPlugin(key, "spec")] as any,
+    plugins: [_interactionPlugin(key)] as any,
   });
 }
 
@@ -771,15 +738,6 @@ watch(_posZoom, zoom => {
     c.update("none");
   }
 });
-watch(_specZoom, zoom => {
-  for (const c of Object.values(_specChart)) {
-    if (!c) continue;
-    const xs = (c.options.scales as any)?.x;
-    if (!xs) continue;
-    if (zoom) { xs.min = zoom.min; xs.max = zoom.max; } else { delete xs.min; delete xs.max; }
-    c.update("none");
-  }
-});
 
 // ─── Data processing ─────────────────────────────────────────────────────────
 
@@ -787,34 +745,6 @@ function _median(arr: number[]): number {
   const s = [...arr].sort((a, b) => a - b), m = s.length >> 1;
   return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
 }
-function _nextPow2(n: number): number { let p = 1; while (p < n) p <<= 1; return p; }
-
-function _fftPower(input: number[]): number[] {
-  const n = input.length;
-  const re = [...input], im = new Array(n).fill(0);
-  let j = 0;
-  for (let i = 1; i < n; i++) {
-    let bit = n >> 1; for (; j & bit; bit >>= 1) j ^= bit; j ^= bit;
-    if (i < j) { [re[i], re[j]] = [re[j], re[i]]; }
-  }
-  for (let len = 2; len <= n; len <<= 1) {
-    const ang = -2 * Math.PI / len, wRe = Math.cos(ang), wIm = Math.sin(ang);
-    for (let i = 0; i < n; i += len) {
-      let cRe = 1, cIm = 0;
-      for (let k = 0; k < (len >> 1); k++) {
-        const h = len >> 1;
-        const uRe = re[i+k], uIm = im[i+k];
-        const vRe = re[i+k+h]*cRe - im[i+k+h]*cIm, vIm = re[i+k+h]*cIm + im[i+k+h]*cRe;
-        re[i+k] = uRe+vRe; im[i+k] = uIm+vIm;
-        re[i+k+h] = uRe-vRe; im[i+k+h] = uIm-vIm;
-        const nc = cRe*wRe - cIm*wIm; cIm = cRe*wIm + cIm*wRe; cRe = nc;
-      }
-    }
-  }
-  const half = n >> 1;
-  return Array.from({ length: half }, (_, i) => (re[i]*re[i] + im[i]*im[i]) / (n*n));
-}
-
 type Processed = { chartData: Array<{ x: number; y: number | null }>; specTimes: number[]; specVals: number[] };
 
 function processComponent(trace: PositionTrace, comp: "east" | "north" | "up"): Processed {
@@ -854,68 +784,214 @@ function processComponent(trace: PositionTrace, comp: "east" | "north" | "up"): 
   return { chartData, specTimes, specVals };
 }
 
-const _SPEC_MAX_FREQ  = 288;  // cpd — 5-minute period
-const _SPEC_N_BINS    = 500;  // linear frequency bins in [0, _SPEC_MAX_FREQ]
+// ─── Scatter / histogram chart factories ─────────────────────────────────────
 
-function computeSpectrum(times: number[], vals: number[]): Array<{ x: number; y: number }> {
-  if (vals.length < 16) return [];
-  const dts = times.slice(1).map((t, i) => (t - times[i]) / 86_400_000).filter(d => d > 0);
-  if (!dts.length) return [];
-  const dtDays = _median(dts);
-  if (dtDays <= 0) return [];
+function _makeScatterChart(key: string, xLabel: string, yLabel: string): Chart | null {
+  const canvas = _scatterCanvas[key]; if (!canvas) return null;
+  return new Chart(canvas, {
+    type: "scatter",
+    data: { datasets: [] },
+    options: {
+      animation: false, responsive: true, maintainAspectRatio: false, parsing: false,
+      scales: {
+        x: { grid: { color: "#e0e0e0" },
+             title: { display: true, text: xLabel, font: { size: 10 } },
+             ticks: { font: { size: 9 }, maxTicksLimit: 5 } },
+        y: { grid: { color: "#e0e0e0" },
+             title: { display: true, text: yLabel, font: { size: 10 } },
+             ticks: { font: { size: 9 }, maxTicksLimit: 5 } },
+      },
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: {
+          label: item => `${item.dataset.label}: (${Number(item.parsed.x).toFixed(2)}, ${Number(item.parsed.y).toFixed(2)}) mm`,
+        }},
+      },
+    },
+  });
+}
 
-  const n2 = _nextPow2(vals.length);
-  const padded = new Array(n2).fill(0);
-  for (let i = 0; i < vals.length; i++)
-    padded[i] = vals[i] * 0.5 * (1 - Math.cos(2 * Math.PI * i / Math.max(1, vals.length - 1)));
+function _histStatsPlugin(key: string): object {
+  return {
+    id: `hist-stats-${key}`,
+    afterDraw(chart: any) {
+      const stats = _histStats[key];
+      const labels = chart.data.labels as string[] | undefined;
+      if (!stats || !labels?.length || labels.length < 2) return;
+      const ctx = chart.ctx;
+      const xScale = chart.scales["x"];
+      if (!xScale) return;
+      const { top, bottom, left } = chart.chartArea;
+      // Categorical scale: equally-spaced bins.
+      // Bin centers are labels[0], labels[1], … labels[n-1].
+      // Left edge of first bin = labels[0] - binW/2; right edge of last = labels[n-1] + binW/2.
+      const n = labels.length;
+      const v0 = parseFloat(labels[0]), vN = parseFloat(labels[n - 1]);
+      if (isNaN(v0) || isNaN(vN)) return;
+      const binW = (vN - v0) / (n - 1);
+      const dataMin = v0 - binW / 2;
+      const dataRange = binW * n;
+      const chartW = xScale.right - xScale.left;
+      const dataToPx = (v: number) => xScale.left + ((v - dataMin) / dataRange) * chartW;
 
-  const power  = _fftPower(padded);
-  const bw     = _SPEC_MAX_FREQ / _SPEC_N_BINS;
-  const binSum = new Float64Array(_SPEC_N_BINS);
-  const binCnt = new Int32Array(_SPEC_N_BINS);
+      const drawLine = (v: number, color: string, dash: number[]) => {
+        const px = dataToPx(v);
+        if (px < xScale.left - 1 || px > xScale.right + 1) return;
+        ctx.save();
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash(dash);
+        ctx.beginPath(); ctx.moveTo(px, top); ctx.lineTo(px, bottom); ctx.stroke();
+        ctx.restore();
+      };
 
-  for (let k = 1; k < n2 >> 1; k++) {
-    const freq = k / (n2 * dtDays);
-    if (freq > _SPEC_MAX_FREQ) break;
-    const b = Math.min(Math.floor(freq / bw), _SPEC_N_BINS - 1);
-    if (power[k] > 0) { binSum[b] += power[k]; binCnt[b]++; }
-  }
+      drawLine(stats.mean,             "rgba(20,20,20,0.85)", []);
+      drawLine(stats.mean - stats.std, "rgba(20,20,20,0.45)", [5, 3]);
+      drawLine(stats.mean + stats.std, "rgba(20,20,20,0.45)", [5, 3]);
 
-  const result: Array<{ x: number; y: number }> = [];
-  for (let b = 0; b < _SPEC_N_BINS; b++)
-    if (binCnt[b] > 0) result.push({ x: (b + 0.5) * bw, y: binSum[b] / binCnt[b] });
-  return result;
+      ctx.save();
+      ctx.fillStyle = "rgba(0,0,0,0.78)";
+      ctx.font = "10px sans-serif";
+      ctx.textAlign = "left";
+      ctx.fillText(`μ = ${stats.mean.toFixed(2)}`, left + 4, top + 12);
+      ctx.fillText(`σ = ${stats.std.toFixed(2)}`, left + 4, top + 24);
+      ctx.restore();
+    },
+  };
+}
+
+function _makeHistChart(key: string, label: string): Chart | null {
+  const canvas = _histCanvas[key]; if (!canvas) return null;
+  return new Chart(canvas, {
+    type: "bar",
+    data: { labels: [], datasets: [] },
+    options: {
+      animation: false, responsive: true, maintainAspectRatio: false,
+      scales: {
+        x: { grid: { color: "#e0e0e0" },
+             title: { display: true, text: label, font: { size: 10 } },
+             ticks: { font: { size: 9 }, maxTicksLimit: 6 } },
+        y: { grid: { color: "#e0e0e0" }, ticks: { font: { size: 9 }, maxTicksLimit: 4 } },
+      },
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: {
+          label: item => `${item.dataset.label}: ${item.parsed.y} pts`,
+        }},
+      },
+    },
+    plugins: [_histStatsPlugin(key)] as any,
+  });
+}
+
+function _histBins(allVals: number[][], numBins: number): { labels: string[]; counts: number[][] } {
+  const flat = allVals.flat();
+  if (!flat.length) return { labels: [], counts: allVals.map(() => []) };
+  const lo = flat.reduce((a, b) => Math.min(a, b), Infinity);
+  const hi = flat.reduce((a, b) => Math.max(a, b), -Infinity);
+  if (lo === hi) return { labels: [lo.toFixed(1)], counts: allVals.map(v => [v.length]) };
+  const w = (hi - lo) / numBins;
+  const labels = Array.from({ length: numBins }, (_, i) => (lo + (i + 0.5) * w).toFixed(1));
+  const counts = allVals.map(vals => {
+    const cnt = new Array(numBins).fill(0);
+    for (const v of vals) { const b = Math.min(Math.floor((v - lo) / w), numBins - 1); cnt[b]++; }
+    return cnt;
+  });
+  return { labels, counts };
 }
 
 // ─── Chart update ─────────────────────────────────────────────────────────────
 
 function updateCharts() {
-  for (const { key, label, specLabel } of COMPONENTS) {
-    if (!_chart[key])     _chart[key]     = _makePosChart(key, label);
-    if (!_specChart[key]) _specChart[key] = _makeSpecChart(key, specLabel);
+  // Process all selected stations once; reuse across time-series, scatter, histogram
+  const processed = new Map<string, Record<"east" | "north" | "up", Processed>>();
+  for (const geosncl of selected.value) {
+    const trace = positionCache.value.get(geosncl);
+    if (!trace) continue;
+    processed.set(geosncl, {
+      east:  processComponent(trace, "east"),
+      north: processComponent(trace, "north"),
+      up:    processComponent(trace, "up"),
+    });
+  }
 
-    const posDatasets: object[] = [], specDatasets: object[] = [];
-
-    for (const geosncl of selected.value) {
-      const trace = positionCache.value.get(geosncl);
-      const col   = key as "east" | "north" | "up";
+  // ── Time-series ──────────────────────────────────────────────────────────────
+  for (const { key, label } of COMPONENTS) {
+    if (!_chart[key]) _chart[key] = _makePosChart(key, label);
+    const datasets: object[] = [];
+    for (const [geosncl, comps] of processed) {
       const color = _colorFor(geosncl);
-      let chartData: Array<{ x: number; y: number | null }> = [];
-      let specPts:   Array<{ x: number; y: number }> = [];
-      if (trace) {
-        const p = processComponent(trace, col);
-        chartData = p.chartData;
-        specPts   = computeSpectrum(p.specTimes, p.specVals);
-      }
       const base = { label: geosncl, borderColor: color, backgroundColor: color + "22",
                      borderWidth: 1, pointRadius: 0, tension: 0, spanGaps: false };
-      posDatasets.push({ ...base, data: chartData });
-      specDatasets.push({ ...base, data: specPts });
+      datasets.push({ ...base, data: comps[key as "east" | "north" | "up"].chartData });
+    }
+    const pc = _chart[key];
+    if (pc) { pc.data.datasets = datasets as any; pc.update("none"); }
+  }
+
+  // ── Scatter plots ────────────────────────────────────────────────────────────
+  // Global min/max across all components so all scatter axes share the same scale
+  let gMin = Infinity, gMax = -Infinity;
+  for (const comps of processed.values())
+    for (const c of ["east", "north", "up"] as const)
+      for (const v of comps[c].specVals) { if (v < gMin) gMin = v; if (v > gMax) gMax = v; }
+  const scatterPad = isFinite(gMin) ? Math.max((gMax - gMin) * 0.05, 0.1) : 1;
+  const scatterMin = isFinite(gMin) ? gMin - scatterPad : undefined;
+  const scatterMax = isFinite(gMax) ? gMax + scatterPad : undefined;
+
+  for (const def of SCATTER_DEFS) {
+    if (!_scatterChart[def.key])
+      _scatterChart[def.key] = _makeScatterChart(def.key, def.xLabel, def.yLabel);
+    const datasets: object[] = [];
+    for (const [geosncl, comps] of processed) {
+      const color = _colorFor(geosncl);
+      const xVals = comps[def.xComp], yVals = comps[def.yComp];
+      const xMap = new Map<number, number>();
+      for (let i = 0; i < xVals.specTimes.length; i++) xMap.set(xVals.specTimes[i], xVals.specVals[i]);
+      const pts: Array<{ x: number; y: number }> = [];
+      for (let i = 0; i < yVals.specTimes.length; i++) {
+        const x = xMap.get(yVals.specTimes[i]);
+        if (x !== undefined) pts.push({ x, y: yVals.specVals[i] });
+      }
+      datasets.push({ label: geosncl, data: pts, borderColor: color, backgroundColor: color + "66",
+                      pointRadius: 2, pointHoverRadius: 4 });
+    }
+    const sc = _scatterChart[def.key];
+    if (sc) {
+      sc.data.datasets = datasets as any;
+      const sx = (sc.options.scales as any)?.x, sy = (sc.options.scales as any)?.y;
+      if (sx) { sx.min = scatterMin; sx.max = scatterMax; }
+      if (sy) { sy.min = scatterMin; sy.max = scatterMax; }
+      sc.update("none");
+    }
+  }
+
+  // ── Histograms ───────────────────────────────────────────────────────────────
+  for (const def of HIST_DEFS) {
+    if (!_histChart[def.key]) _histChart[def.key] = _makeHistChart(def.key, def.label);
+
+    // Compute combined mean & std (used by the afterDraw plugin)
+    const allFlat = [...processed.values()].flatMap(comps => comps[def.comp].specVals);
+    if (allFlat.length) {
+      const mean = allFlat.reduce((s, v) => s + v, 0) / allFlat.length;
+      const std  = Math.sqrt(allFlat.reduce((s, v) => s + (v - mean) ** 2, 0) / Math.max(1, allFlat.length - 1));
+      _histStats[def.key] = { mean, std };
+    } else {
+      _histStats[def.key] = null;
     }
 
-    const pc = _chart[key], sc = _specChart[key];
-    if (pc)  { pc.data.datasets  = posDatasets  as any; pc.update("none"); }
-    if (sc)  { sc.data.datasets  = specDatasets as any; sc.update("none"); }
+    const allVals = [...processed.values()].map(comps => comps[def.comp].specVals);
+    const { labels, counts } = _histBins(allVals, 30);
+    const hc = _histChart[def.key];
+    if (!hc) continue;
+    hc.data.labels = labels;
+    const geosncls = [...processed.keys()];
+    hc.data.datasets = geosncls.map((g, i) => {
+      const color = _colorFor(g);
+      return { label: g, data: counts[i], backgroundColor: color + "88", borderColor: color,
+               borderWidth: 0.5, barPercentage: 1.0, categoryPercentage: 0.9 };
+    }) as any;
+    hc.update("none");
   }
 }
 
@@ -977,6 +1053,9 @@ function startFetch() {
 .tree-child { padding-left: 28px; }
 .tree-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
 
-.chart-block { position: relative; height: 230px; }
-.chart-canvas { position: absolute; inset: 18px 0 0 0; height: calc(100% - 18px) !important; }
+.chart-block    { position: relative; height: 230px; flex-shrink: 0; }
+.chart-canvas   { position: absolute; inset: 18px 0 0 0; height: calc(100% - 18px) !important; }
+.chart-block-sm { position: relative; height: 160px; flex-shrink: 0; }
+.chart-block-sq { position: relative; height: 260px; flex-shrink: 0; }
+.chart-canvas-full { position: absolute; inset: 0; width: 100% !important; height: 100% !important; }
 </style>

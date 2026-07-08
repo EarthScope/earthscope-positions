@@ -1,33 +1,12 @@
 <template>
   <q-page class="q-pa-md">
-    <PageHelp title="PPSD Generation">
-      <p>Compute Probabilistic Power Spectral Density plots from position time series.</p>
-      <div class="help-section-label">Setup</div>
-      <ul>
-        <li>Select one or more station lists and a date range</li>
-        <li>Filter by processing center and stream type using the chips (all selected = no filter)</li>
-      </ul>
-      <div class="help-section-label">Grouping modes</div>
-      <ul>
-        <li><strong>By Processing Center</strong> — one plot per center (PB, PW, NC …)</li>
-        <li><strong>By Stream</strong> — one plot per individual station stream</li>
-        <li><strong>By Solution Type</strong> — one plot per 2-char solution code</li>
-        <li><strong>By Center × Solution</strong> — one plot per center+solution combination</li>
-        <li><strong>PPSD Generation</strong> — single plot combining all selected streams</li>
-      </ul>
-      <div class="help-section-label">Performance</div>
-      <ul>
-        <li>Cache files are built on first run; subsequent runs on the same data are nearly instant</li>
-        <li>Pre-compute caches offline with <code>es-pos process ppsd</code></li>
-      </ul>
-    </PageHelp>
     <div class="row q-col-gutter-md">
 
       <!-- ── Left: configuration ─────────────────────────────────────────── -->
       <div class="col-12 col-md-4 col-lg-3">
         <q-card flat bordered class="config-card">
           <q-card-section class="q-pb-xs">
-            <div class="text-subtitle1 text-weight-medium">PPSD Configuration</div>
+            <div class="text-subtitle1 text-weight-medium">PPSD Generation Configuration</div>
           </q-card-section>
           <q-separator />
           <q-card-section class="q-gutter-sm">
@@ -44,7 +23,23 @@
               emit-value
               map-options
               :disable="running"
-            />
+            >
+              <template #option="scope">
+                <q-item v-bind="scope.itemProps">
+                  <q-item-section>
+                    <q-item-label>{{ scope.opt.label }}</q-item-label>
+                  </q-item-section>
+                  <q-menu context-menu>
+                    <q-list dense style="min-width:140px">
+                      <q-item clickable v-close-popup @click.stop="confirmDeleteList(scope.opt.value)">
+                        <q-item-section avatar><q-icon name="delete" color="negative" size="18px" /></q-item-section>
+                        <q-item-section>Delete</q-item-section>
+                      </q-item>
+                    </q-list>
+                  </q-menu>
+                </q-item>
+              </template>
+            </q-select>
 
             <!-- Date range -->
             <div class="row q-gutter-xs">
@@ -129,15 +124,6 @@
             />
             <q-btn
               class="full-width"
-              color="secondary"
-              icon="show_chart"
-              label="By Stream"
-              :disable="!canRun || running"
-              @click="runPpsd('by-stream')"
-              unelevated
-            />
-            <q-btn
-              class="full-width"
               color="teal"
               icon="layers"
               label="By Solution Type"
@@ -156,11 +142,11 @@
             />
             <q-btn
               class="full-width"
-              color="indigo"
-              icon="all_inclusive"
-              label="PPSD Generation"
+              color="secondary"
+              icon="show_chart"
+              label="By Stream"
               :disable="!canRun || running"
-              @click="runPpsd('all')"
+              @click="runPpsd('by-stream')"
               unelevated
             />
 
@@ -264,10 +250,12 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, watch, nextTick } from "vue";
 import { usePpsdJob } from "../composables/usePpsdJob";
+import { useSharedControls } from "../composables/useSharedControls";
+import { useListDelete } from "../composables/useListDelete";
 import type { PpsdMode } from "../types";
 
+const { selectedLists, startDate, endDate, dateRange } = useSharedControls();
 const {
-  selectedLists, startDate, endDate, dateRange,
   filterCenters, filterSolTypes,
   logs, running, done, exitCode,
   progressCurrent, progressTotal, completedFiles,
@@ -325,12 +313,18 @@ async function fetchFilterOptions() {
 
 // ── Init ───────────────────────────────────────────────────────────────────
 
-onMounted(async () => {
+async function loadAvailableLists() {
   try {
     const res = await fetch("/api/station-lists");
     const data = await res.json();
     availableLists.value = data.lists ?? [];
   } catch { /* ignore */ }
+}
+
+const { confirmDeleteList } = useListDelete(loadAvailableLists);
+
+onMounted(async () => {
+  await loadAvailableLists();
   await fetchFilterOptions();
 });
 

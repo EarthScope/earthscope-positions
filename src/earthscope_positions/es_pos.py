@@ -402,6 +402,10 @@ Examples:
         "--quiet", "-q", action="store_true",
         help="Suppress per-file progress output.",
     )
+    gj_p.add_argument(
+        "--force", action="store_true",
+        help="Re-convert files even if output already exists.",
+    )
 
     ms_p = export_sub.add_parser(
         "miniseed",
@@ -480,6 +484,10 @@ Examples:
     ms_p.add_argument(
         "--quiet", "-q", action="store_true",
         help="Suppress per-file progress output.",
+    )
+    ms_p.add_argument(
+        "--force", action="store_true",
+        help="Re-convert files even if output already exists.",
     )
 
     # ── export ppsd ──────────────────────────────────────────────────────────
@@ -768,7 +776,10 @@ def _resolve_export_arrow_files(
     elif getattr(args, "input", None):
         geosncls = _load_geosncls_from_lists(args.input)
     else:
-        sys.exit("Specify -i/--input <list> or --all to select stations.")
+        geosncls = sorted(
+            d.name for d in data_dir.iterdir()
+            if d.is_dir() and not d.name.startswith(".")
+        )
 
     if not geosncls:
         sys.exit("No stations found in the specified list(s).")
@@ -786,6 +797,9 @@ def _resolve_export_arrow_files(
             if not stem.startswith(prefix):
                 continue
             rest = stem[len(prefix):]
+            # Skip sidecars like _ppsd.arrow: after YYYYMMDD only 'T' is valid
+            if len(rest) < 8 or (len(rest) > 8 and rest[8] != "T"):
+                continue
             try:
                 file_date = dt.date(int(rest[:4]), int(rest[4:6]), int(rest[6:8]))
             except (ValueError, IndexError):
@@ -861,7 +875,9 @@ def _cmd_export_ppsd(args: argparse.Namespace) -> None:
 
 
 def _cmd_export_geojson(args: argparse.Namespace) -> None:
-    from earthscope_positions.export.geojson_writer import load_spec, write_arrow_to_geojson
+    from earthscope_positions.export.geojson_writer import (
+        load_spec, write_arrow_to_geojson, expected_out_paths as gj_expected_paths,
+    )
 
     start, stop = _resolve_export_date_range(args)
     arrow_files = _resolve_export_arrow_files(args, start, stop)
@@ -901,7 +917,15 @@ def _cmd_export_geojson(args: argparse.Namespace) -> None:
         file=sys.stderr,
     )
     total_written = 0
+    total_skipped = 0
     for i, af in enumerate(arrow_files, 1):
+        if not args.force:
+            expected = gj_expected_paths(af, spec, formats)
+            if expected and all(p.exists() for p in expected):
+                if not args.quiet:
+                    print(f"[{i}/{len(arrow_files)}] [skip] {af.name}", file=sys.stderr)
+                total_skipped += 1
+                continue
         if not args.quiet:
             print(f"[{i}/{len(arrow_files)}] {af}", file=sys.stderr)
         try:
@@ -912,11 +936,14 @@ def _cmd_export_geojson(args: argparse.Namespace) -> None:
         except Exception as exc:
             print(f"  [error] {exc}", file=sys.stderr)
 
-    print(f"\nDone.  {total_written} GeoJSON file(s) written.", file=sys.stderr)
+    suffix = f", {total_skipped} skipped" if total_skipped else ""
+    print(f"\nDone.  {total_written} GeoJSON file(s) written{suffix}.", file=sys.stderr)
 
 
 def _cmd_export_miniseed(args: argparse.Namespace) -> None:
-    from earthscope_positions.export.miniseed_writer import load_spec, write_arrow_to_miniseed
+    from earthscope_positions.export.miniseed_writer import (
+        load_spec, write_arrow_to_miniseed, expected_out_paths as ms_expected_paths,
+    )
 
     start, stop = _resolve_export_date_range(args)
     arrow_files = _resolve_export_arrow_files(args, start, stop)
@@ -948,7 +975,15 @@ def _cmd_export_miniseed(args: argparse.Namespace) -> None:
         file=sys.stderr,
     )
     total_written = 0
+    total_skipped = 0
     for i, af in enumerate(arrow_files, 1):
+        if not args.force:
+            expected = ms_expected_paths(af, spec)
+            if expected and all(p.exists() for p in expected):
+                if not args.quiet:
+                    print(f"[{i}/{len(arrow_files)}] [skip] {af.name}", file=sys.stderr)
+                total_skipped += 1
+                continue
         if not args.quiet:
             print(f"[{i}/{len(arrow_files)}] {af}", file=sys.stderr)
         try:
@@ -957,7 +992,8 @@ def _cmd_export_miniseed(args: argparse.Namespace) -> None:
         except Exception as exc:
             print(f"  [error] {exc}", file=sys.stderr)
 
-    print(f"\nDone.  {total_written} MiniSEED file(s) written.", file=sys.stderr)
+    suffix = f", {total_skipped} skipped" if total_skipped else ""
+    print(f"\nDone.  {total_written} MiniSEED file(s) written{suffix}.", file=sys.stderr)
 
 
 def _cmd_webserver(args: argparse.Namespace) -> None:

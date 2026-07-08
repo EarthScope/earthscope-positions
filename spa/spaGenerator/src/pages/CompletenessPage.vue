@@ -1,21 +1,5 @@
 <template>
   <q-page class="q-pa-md">
-    <PageHelp title="Completeness &amp; Latency">
-      <p>Color-coded heatmap of data availability per station per time window.</p>
-      <div class="help-section-label">Color scale</div>
-      <ul>
-        <li><strong>White</strong> — not yet attempted</li>
-        <li><strong>Grey</strong> — fetch error (API unreachable or no data)</li>
-        <li><strong>Red → Yellow → Green</strong> — 0 % → 50 % → 100 % completeness</li>
-      </ul>
-      <div class="help-section-label">Usage</div>
-      <ul>
-        <li>Select a station list and date range, then click <strong>Load</strong></li>
-        <li>Results are paginated; use the arrows to step through stations</li>
-        <li>Click <strong>Fetch Missing</strong> to download data for stations that have never been tried</li>
-        <li>The <em>Latency</em> heatmap below shows ingest delay in seconds</li>
-      </ul>
-    </PageHelp>
 
     <!-- ── Controls ────────────────────────────────────────────────────── -->
     <div class="row items-end q-gutter-sm q-mb-sm">
@@ -31,7 +15,23 @@
         map-options
         style="min-width: 180px"
         @update:model-value="onListChange"
-      />
+      >
+        <template #option="scope">
+          <q-item v-bind="scope.itemProps">
+            <q-item-section>
+              <q-item-label>{{ scope.opt.label }}</q-item-label>
+            </q-item-section>
+            <q-menu v-if="scope.opt.value !== 'all'" context-menu>
+              <q-list dense style="min-width:140px">
+                <q-item clickable v-close-popup @click.stop="confirmDeleteList(scope.opt.value)">
+                  <q-item-section avatar><q-icon name="delete" color="negative" size="18px" /></q-item-section>
+                  <q-item-section>Delete</q-item-section>
+                </q-item>
+              </q-list>
+            </q-menu>
+          </q-item>
+        </template>
+      </q-select>
 
       <!-- Search within list -->
       <q-input
@@ -334,6 +334,7 @@ import HeatmapGrid from "../components/HeatmapGrid.vue";
 import { getStationLists, getCompleteness, openFetchMissingStream } from "../api";
 import type { CompletenessResponse, BucketData, FetchEvent } from "../types";
 import { useSharedControls } from "../composables/useSharedControls";
+import { useListDelete } from "../composables/useListDelete";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -377,6 +378,7 @@ const loading = ref(false);
 // Station list dropdown
 const listOptions = ref<{ label: string; value: string }[]>([]);
 const { selectedList, searchText, startDate, endDate, activeWindow, rangeDays, dateRange } = useSharedControls();
+const { confirmDeleteList } = useListDelete(loadListOptions);
 
 // Pagination
 const page = ref(0);

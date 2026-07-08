@@ -111,6 +111,9 @@ export interface ReplayState {
   missing_not_fetched?: string[];
   sent?: number;
   elapsed_ms?: number;
+  current_data_time_ms?: number;
+  replay_elapsed_s?: number;
+  replay_remaining_s?: number;
   error?: string;
 }
 

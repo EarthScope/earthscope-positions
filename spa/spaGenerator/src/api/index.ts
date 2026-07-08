@@ -132,8 +132,8 @@ export async function replayStart(): Promise<{ status: string }> {
   return r.data;
 }
 
-export async function replayCancel(jobId: string): Promise<{ status: string }> {
-  const r = await http.post<{ status: string }>(`/replay/${encodeURIComponent(jobId)}/cancel`);
+export async function replayCancel(): Promise<{ status: string }> {
+  const r = await http.post<{ status: string }>("/replay/cancel");
   return r.data;
 }
 

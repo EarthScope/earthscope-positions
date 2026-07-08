@@ -18,6 +18,7 @@ import datetime as dt
 import heapq
 import json
 import pathlib
+import sys
 import threading
 import time
 import uuid
@@ -142,68 +143,71 @@ def _file_row_gen(
     geosncl: str,
     apply_latency: bool,
 ) -> Generator[tuple[int, bytes, bytes], None, None]:
-    """Yield (arrival_ms, key_bytes, value_bytes) sorted by arrival for one Arrow file."""
+    """Yield (arrival_ms, key_bytes, value_bytes) lazily, one batch at a time.
+
+    Reads Arrow IPC batches on demand so the first next() call is fast — only
+    the first batch is read, not the entire file.  GNSS position files are
+    already time-sorted, so no cross-batch sort is needed.
+    """
     try:
-        table = ipc.open_stream(path).read_all()
+        reader = ipc.open_stream(path)
     except Exception:
         return
 
-    n = len(table)
-    if n == 0:
-        return
-
-    def _col(name: str, default: Any = None) -> list:
-        try:
-            return table.column(name).to_pylist()
-        except Exception:
-            return [default] * n
-
-    times = _col("time")
-    east  = _col("east")
-    north = _col("north")
-    up    = _col("up")
-    sigEE = _col("sigEE")
-    sigNN = _col("sigNN")
-    sigUU = _col("sigUU")
-    q_col = _col("qChannel")
-    lats  = _col("ingestLatency", 0)
-
-    valid = [t for t in times if t is not None]
-    rate: int | float = 1
-    if len(valid) >= 2:
-        diffs = sorted(
-            valid[i + 1] - valid[i]
-            for i in range(min(200, len(valid) - 1))
-            if valid[i + 1] != valid[i]
-        )
-        if diffs:
-            med_ms = float(diffs[len(diffs) // 2])
-            if med_ms > 0:
-                hz = 1000.0 / med_ms
-                rate = int(hz) if hz == int(hz) else hz
-
     key_b = geosncl.encode("utf-8")
-    rows: list[tuple[int, bytes]] = []
-    for i in range(n):
-        t = times[i]
-        if t is None:
-            continue
-        lat      = lats[i] or 0
-        arrival  = t + lat if apply_latency else t
-        rec      = {
-            "time": t,
-            "Q":    q_col[i],
-            "type": "ENU",
-            "SNCL": geosncl,
-            "coor": [east[i], north[i], up[i]],
-            "err":  [sigEE[i], sigNN[i], sigUU[i]],
-            "rate": rate,
-        }
-        rows.append((arrival, json.dumps(rec, separators=(",", ":")).encode("utf-8")))
+    rate: int | float = 1
 
-    rows.sort(key=lambda x: x[0])
-    for arrival, val_b in rows:
-        yield arrival, key_b, val_b
+    for batch in reader:
+        n = batch.num_rows
+        if n == 0:
+            continue
+
+        def _col(name: str, default: Any = None) -> list:
+            try:
+                return batch.column(name).to_pylist()
+            except Exception:
+                return [default] * n
+
+        times = _col("time")
+        east  = _col("east")
+        north = _col("north")
+        up    = _col("up")
+        sigEE = _col("sigEE")
+        sigNN = _col("sigNN")
+        sigUU = _col("sigUU")
+        q_col = _col("qChannel")
+        lats  = _col("ingestLatency", 0)
+
+        # Compute sample rate from the first batch; reuse for subsequent batches.
+        valid = [t for t in times if t is not None]
+        if len(valid) >= 2:
+            diffs = sorted(
+                valid[i + 1] - valid[i]
+                for i in range(min(200, len(valid) - 1))
+                if valid[i + 1] != valid[i]
+            )
+            if diffs:
+                med_ms = float(diffs[len(diffs) // 2])
+                if med_ms > 0:
+                    hz = 1000.0 / med_ms
+                    rate = int(hz) if hz == int(hz) else hz
+
+        for i in range(n):
+            t = times[i]
+            if t is None:
+                continue
+            lat     = lats[i] or 0
+            arrival = t + lat if apply_latency else t
+            rec = {
+                "time": t,
+                "Q":    q_col[i],
+                "type": "ENU",
+                "SNCL": geosncl,
+                "coor": [east[i], north[i], up[i]],
+                "err":  [sigEE[i], sigNN[i], sigUU[i]],
+                "rate": rate,
+            }
+            yield arrival, key_b, json.dumps(rec, separators=(",", ":")).encode("utf-8")
 
 
 # ─── Preload worker ───────────────────────────────────────────────────────────
@@ -264,17 +268,57 @@ def _preload_worker(
     config: dict,
 ) -> None:
     try:
+        apply_latency: bool = config.get("apply_latency", True)
         _set(status="preloading", error=None)
         found, missing = find_arrow_files(geosncls, start, stop, data_dir)
 
         total = 0
+        min_arrival: int | None = None
+        max_arrival: int | None = None
+
         for _, p in found:
             try:
                 reader = ipc.open_stream(p)
                 for batch in reader:
                     total += batch.num_rows
+                    if batch.num_rows == 0:
+                        continue
+                    try:
+                        schema_names = batch.schema.names
+                        times = batch.column("time").to_pylist()
+                        lats = (
+                            batch.column("ingestLatency").to_pylist()
+                            if "ingestLatency" in schema_names
+                            else [0] * batch.num_rows
+                        )
+                        for t, lat in zip(times, lats):
+                            if t is None:
+                                continue
+                            arr = t + (lat or 0) if apply_latency else t
+                            if min_arrival is None or arr < min_arrival:
+                                min_arrival = arr
+                            if max_arrival is None or arr > max_arrival:
+                                max_arrival = arr
+                    except Exception:
+                        pass
             except Exception:
                 pass
+
+        # Override start anchor with the actual first data timestamp so the
+        # first message is sent immediately when replay starts, not after an
+        # artificial wall-time delay equal to (data_start - user_start_param).
+        if min_arrival is not None:
+            config["start_data_ms"] = min_arrival
+            _fmt = lambda ms: dt.datetime.fromtimestamp(ms / 1000, tz=_UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+            print(
+                f"[replay] preload done — {total:,} rows  {len(found)} file(s)  "
+                f"start_data={_fmt(min_arrival)}  end_data={_fmt(max_arrival) if max_arrival else '?'}",
+                file=sys.stderr,
+            )
+        else:
+            print(f"[replay] preload done — {total:,} rows  {len(found)} file(s)  (no arrival times found)", file=sys.stderr)
+        if max_arrival is not None:
+            config["end_data_ms"] = max_arrival
 
         job_id = str(uuid.uuid4())
         found_geosncls = len({gs for gs, _ in found})
@@ -317,6 +361,7 @@ def _replay_worker(
     topic: str           = config.get("topic",
                                "protected.gnss.positions.shakealert.geojson.compact")
     start_data_ms: int   = config["start_data_ms"]
+    end_data_ms: int     = config.get("end_data_ms", start_data_ms)
     start_wall_ms: int   = config["start_replay_wall_ms"]
 
     try:
@@ -347,6 +392,16 @@ def _replay_worker(
     total = get_state().get("total_messages", 0)
     _set(status="running", sent=0, elapsed_ms=0, error=None)
 
+    def _ts(ms: int) -> str:
+        return dt.datetime.fromtimestamp(ms / 1000, tz=_UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    print(
+        f"[replay] Go — {len(files)} file(s)  {total:,} msg  "
+        f"start_data={_ts(start_data_ms)}  end_data={_ts(end_data_ms)}  "
+        f"scale={time_scale}×  latency={apply_latency}",
+        file=sys.stderr,
+    )
+
     # Build generators and seed the heap
     gens: dict[int, Generator] = {}
     heap: list[_HeapItem] = []
@@ -363,8 +418,21 @@ def _replay_worker(
         except StopIteration:
             pass
 
+    if heap:
+        first_arrival = heap[0].arrival_ms
+        delta_s = (first_arrival - start_data_ms) / 1000.0
+        print(
+            f"[replay] first item arrival={_ts(first_arrival)}  "
+            f"offset_from_start={delta_s:+.1f}s  heap_size={len(heap)}",
+            file=sys.stderr,
+        )
+    else:
+        print("[replay] heap is EMPTY — no data to send", file=sys.stderr)
+
     sent = 0
     last_update = time.monotonic()
+    last_log    = time.monotonic()
+    last_arrival_ms = start_data_ms
 
     try:
         while heap and not cancel.is_set():
@@ -389,15 +457,32 @@ def _replay_worker(
             producer.produce(topic, key=item.key_b, value=item.val_b)
             producer.poll(0)
             sent += 1
+            last_arrival_ms = item.arrival_ms
 
             now = time.monotonic()
             if now - last_update >= 1.0:
+                elapsed_data_ms = last_arrival_ms - start_data_ms
+                remaining_data_ms = max(0, end_data_ms - last_arrival_ms)
                 _set(
                     sent=sent,
                     elapsed_ms=int(time.time() * 1000) - start_wall_ms,
                     total_messages=total,
+                    current_data_time_ms=last_arrival_ms,
+                    replay_elapsed_s=elapsed_data_ms / 1000.0 / time_scale,
+                    replay_remaining_s=remaining_data_ms / 1000.0 / time_scale,
                 )
                 last_update = now
+
+            if now - last_log >= 5.0:
+                pct = 100.0 * sent / total if total else 0.0
+                wall_elapsed = int(time.time() * 1000) - start_wall_ms
+                print(
+                    f"[replay]   {sent:,}/{total:,} ({pct:.1f}%)  "
+                    f"data_time={_ts(last_arrival_ms)}  "
+                    f"wall={wall_elapsed/1000:.0f}s",
+                    file=sys.stderr,
+                )
+                last_log = now
 
             gen = gens.get(item.gen_id)
             if gen is not None:

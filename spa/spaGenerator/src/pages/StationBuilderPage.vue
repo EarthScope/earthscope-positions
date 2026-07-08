@@ -4,6 +4,7 @@ import { useQuasar } from 'quasar';
 import axios from 'axios';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
+import { useListDelete } from '../composables/useListDelete';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -277,6 +278,8 @@ function applyFilters() {
   updateAllMarkers();
 }
 
+const { confirmDeleteList } = useListDelete(loadListOptions);
+
 // ── Load / Save ───────────────────────────────────────────────────────────────
 
 async function loadListOptions() {
@@ -486,29 +489,61 @@ onUnmounted(() => {
 
 // Watch list multiselect to load those geosncl sets onto the map
 watch(selectedLists, (names) => loadFromSelectedLists(names));
+
+// ── ShakeAlert list management ────────────────────────────────────────────────
+
+interface SaLogEntry { text: string; isError: boolean; isDone: boolean }
+
+const saLog     = ref<SaLogEntry[]>([]);
+const saRunning = ref(false);
+
+async function _streamSaEndpoint(url: string) {
+  saLog.value = [];
+  saRunning.value = true;
+  try {
+    const resp = await fetch(url);
+    if (!resp.body) throw new Error('No response body');
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const parts = buf.split('\n\n');
+      buf = parts.pop() ?? '';
+      for (const part of parts) {
+        const line = part.trim();
+        if (!line.startsWith('data:')) continue;
+        try {
+          const evt = JSON.parse(line.slice(5).trim());
+          if (evt.type === 'done') {
+            saLog.value.push({ text: evt.msg ?? 'Done.', isError: evt.code !== 0, isDone: true });
+            if (evt.code === 0) await loadListOptions();
+          } else {
+            saLog.value.push({ text: evt.msg ?? '', isError: evt.type === 'error', isDone: false });
+          }
+        } catch { /* skip */ }
+      }
+    }
+  } catch (err) {
+    saLog.value.push({ text: String(err), isError: true, isDone: true });
+  } finally {
+    saRunning.value = false;
+  }
+}
+
+function fetchShakealertDatasource() {
+  _streamSaEndpoint('/api/station-lists/shakealert-datasource');
+}
+
+function updateActiveFromNcedc() {
+  _streamSaEndpoint('/api/station-lists/update-active-from-ncedc');
+}
 </script>
 
 <template>
   <q-page class="column no-wrap" style="height:calc(100vh - 50px); overflow:hidden">
-    <PageHelp title="Station Builder">
-      <p>Build reusable station lists by selecting stations on an interactive map.</p>
-      <div class="help-section-label">Selecting stations</div>
-      <ul>
-        <li><strong>Click</strong> a dot to select or deselect a single station (turns blue when selected)</li>
-        <li><strong>Shift + drag</strong> on the map to rectangle-select all stations in an area</li>
-        <li>Toggle <strong>Union</strong> (add) vs <strong>Intersection</strong> (keep shared) to control how new selections combine</li>
-      </ul>
-      <div class="help-section-label">Filtering</div>
-      <ul>
-        <li>Use the center and stream-type checkboxes in the left panel to narrow visible stations</li>
-        <li>Click <strong>Apply</strong> after changing filters</li>
-      </ul>
-      <div class="help-section-label">Saving</div>
-      <ul>
-        <li>Enter a name in the Save field and click <strong>Save</strong> to store the selection as a list</li>
-        <li>Saved lists appear in all other pages (Completeness, Positions, PPSD, Replay)</li>
-      </ul>
-    </PageHelp>
 
     <!-- ── Top controls bar ─────────────────────────────────────────────────── -->
     <div class="row items-center q-gutter-xs q-px-sm q-py-xs flex-shrink-0"
@@ -522,7 +557,23 @@ watch(selectedLists, (names) => loadFromSelectedLists(names));
         dense outlined multiple use-chips
         style="min-width:200px; max-width:340px"
         class="col-auto"
-      />
+      >
+        <template #option="scope">
+          <q-item v-bind="scope.itemProps">
+            <q-item-section>
+              <q-item-label>{{ scope.opt }}</q-item-label>
+            </q-item-section>
+            <q-menu context-menu>
+              <q-list dense style="min-width:140px">
+                <q-item clickable v-close-popup @click.stop="confirmDeleteList(scope.opt)">
+                  <q-item-section avatar><q-icon name="delete" color="negative" size="18px" /></q-item-section>
+                  <q-item-section>Delete</q-item-section>
+                </q-item>
+              </q-list>
+            </q-menu>
+          </q-item>
+        </template>
+      </q-select>
 
       <q-separator vertical class="q-mx-xs" />
 
@@ -606,6 +657,27 @@ watch(selectedLists, (names) => loadFromSelectedLists(names));
                  label="Save"
                  :disable="!listName.trim() || streamCount === 0"
                  @click="saveList" />
+
+          <q-separator class="q-my-sm" />
+
+          <!-- ShakeAlert Lists -->
+          <div class="text-overline text-grey-7 q-mb-xs">ShakeAlert Lists</div>
+          <q-btn class="full-width q-mb-xs" size="sm" color="teal" unelevated
+                 icon="download"
+                 label="Get ShakeAlert Datasource"
+                 :disable="saRunning"
+                 @click="fetchShakealertDatasource" />
+          <q-btn class="full-width q-mb-xs" size="sm" color="deep-orange" unelevated
+                 icon="refresh"
+                 label="Update XX-Active Lists"
+                 :disable="saRunning"
+                 @click="updateActiveFromNcedc" />
+          <div v-if="saLog.length" class="sa-log q-mt-xs">
+            <div
+              v-for="(e, i) in saLog" :key="i"
+              :class="e.isError ? 'text-negative' : e.isDone ? 'text-positive text-weight-medium' : 'text-grey-8'"
+            >{{ e.text }}</div>
+          </div>
 
           <q-separator class="q-my-sm" />
 
@@ -715,5 +787,17 @@ watch(selectedLists, (names) => loadFromSelectedLists(names));
   border: 1px solid #fff;
   box-shadow: 0 0 0 1px #aaa;
   flex-shrink: 0;
+}
+.sa-log {
+  font-family: monospace;
+  font-size: 0.72rem;
+  max-height: 160px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  background: rgba(0,0,0,0.04);
+  border-radius: 4px;
+  padding: 4px 6px;
+  line-height: 1.5;
 }
 </style>
