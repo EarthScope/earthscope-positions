@@ -1,7 +1,7 @@
 import axios from "axios";
 import type {
   CompletenessResponse, StationsResponse, StationListsResponse,
-  PositionsResponse, FetchEvent,
+  PositionsResponse, FetchEvent, FetchMissingBody,
   ReplayState, ReplayPreloadBody,
 } from "../types";
 
@@ -107,6 +107,137 @@ export function openFetchMissingStream(
   })();
 
   return () => controller.abort();
+}
+
+/** POST variant of fetch-missing: resolves lists + stream filters server-side.
+ *  Streams SSE via fetch(); returns a cancel function that aborts the request. */
+export function openFetchMissingPost(
+  body: FetchMissingBody,
+  onEvent: (e: FetchEvent) => void,
+): () => void {
+  const controller = new AbortController();
+
+  (async () => {
+    try {
+      const resp = await fetch("/api/fetch-missing", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+      if (!resp.body) throw new Error("No response body");
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const parts = buf.split("\n\n");
+        buf = parts.pop() ?? "";
+        for (const part of parts) {
+          const line = part.trim();
+          if (!line.startsWith("data:")) continue;
+          try {
+            onEvent(JSON.parse(line.slice(5).trim()) as FetchEvent);
+          } catch { /* ignore */ }
+        }
+      }
+    } catch (err: unknown) {
+      if ((err as Error).name !== "AbortError") {
+        onEvent({ type: "error", msg: String(err) });
+        onEvent({ type: "done", code: 1 });
+      }
+    }
+  })();
+
+  return () => controller.abort();
+}
+
+/** Save a client-rendered PNG (data URL) to data/plots/positions/. */
+export async function savePlotImage(
+  filename: string,
+  dataUrl: string,
+): Promise<{ path: string; name: string }> {
+  const r = await http.post<{ path: string; name: string }>("/plots/save", {
+    filename,
+    data_url: dataUrl,
+  });
+  return r.data;
+}
+
+// ─── Export / convert (Arrow → MiniSEED / GeoJSON) ─────────────────────────────
+
+export async function getExportSpec(
+  format: "miniseed" | "geojson",
+): Promise<{ format: string; path: string; content: string }> {
+  const r = await http.get("/export/spec", { params: { format } });
+  return r.data;
+}
+
+export async function saveExportSpec(
+  format: "miniseed" | "geojson",
+  content: string,
+): Promise<{ ok: boolean; path: string }> {
+  const r = await http.put("/export/spec", { format, content });
+  return r.data;
+}
+
+/** Stream /api/export/run via fetch(); returns a cancel function. */
+export function openExportStream(
+  params: {
+    format: "miniseed" | "geojson";
+    lists: string[];
+    start: string;
+    end: string;
+    gj_format?: "compact" | "full" | "both";
+    force?: boolean;
+  },
+  onEvent: (e: FetchEvent) => void,
+): () => void {
+  const q = new URLSearchParams();
+  q.set("format", params.format);
+  for (const l of params.lists) q.append("lists", l);
+  q.set("start", params.start);
+  q.set("end", params.end);
+  if (params.gj_format) q.set("gj_format", params.gj_format);
+  if (params.force) q.set("force", "true");
+
+  const controller = new AbortController();
+  (async () => {
+    try {
+      const resp = await fetch(`/api/export/run?${q}`, { signal: controller.signal });
+      if (!resp.body) throw new Error("No response body");
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const parts = buf.split("\n\n");
+        buf = parts.pop() ?? "";
+        for (const part of parts) {
+          const line = part.trim();
+          if (!line.startsWith("data:")) continue;
+          try { onEvent(JSON.parse(line.slice(5).trim()) as FetchEvent); } catch { /* ignore */ }
+        }
+      }
+    } catch (err: unknown) {
+      if ((err as Error).name !== "AbortError") {
+        onEvent({ type: "error", msg: String(err) });
+        onEvent({ type: "done", code: 1 });
+      }
+    }
+  })();
+  return () => controller.abort();
+}
+
+// ─── Server config ─────────────────────────────────────────────────────────────
+
+export async function getServerConfig(): Promise<{ base_url: string; hostname: string; port: number }> {
+  const r = await http.get<{ base_url: string; hostname: string; port: number }>("/config");
+  return r.data;
 }
 
 // ─── Replay ───────────────────────────────────────────────────────────────────

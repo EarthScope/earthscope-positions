@@ -432,6 +432,7 @@ def write_ppsd_from_caches(
     run_dir: pathlib.Path,
     *,
     label: str,
+    slug: str | None = None,
     title_prefix: str = "",
     verbose: bool = False,
 ) -> pathlib.Path | None:
@@ -472,7 +473,7 @@ def write_ppsd_from_caches(
     plt.tight_layout()
 
     run_dir.mkdir(parents=True, exist_ok=True)
-    safe = re.sub(r"[^\w.+()-]", "_", label)
+    safe = slug if slug else re.sub(r"[^\w.+()-]", "_", label)
     out = run_dir / f"ppsd-{safe}.png"
     plt.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)

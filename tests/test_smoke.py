@@ -14,8 +14,8 @@ def test_package_imports():
 
 
 def test_sdk_client_imports():
-    import earthscope_client  # noqa: F401
-    from earthscope_client.api.discover_api import DiscoverApi  # noqa: F401
+    from earthscope_sdk import EarthScopeClient  # noqa: F401
+    from earthscope_sdk.client.discovery.models import StreamType  # noqa: F401
 
 
 def test_arrow_helper_roundtrips():

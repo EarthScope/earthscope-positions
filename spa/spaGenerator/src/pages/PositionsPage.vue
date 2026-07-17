@@ -69,6 +69,10 @@
       <q-btn label="Select All"       dense flat no-caps size="sm" icon="select_all"  @click="selectAll" />
       <q-btn label="Save Selection"   dense flat no-caps size="sm" icon="save"
         :disable="selected.size === 0" @click="openSaveDialog" />
+      <q-btn label="Save To File"     dense flat no-caps size="sm" icon="image"
+        :disable="selected.size === 0" @click="openSavePlotDialog">
+        <q-tooltip>Write the current plots to a PNG in File Plots</q-tooltip>
+      </q-btn>
       <q-checkbox v-model="removeMean" label="Remove mean" dense size="sm" />
       <q-input v-model.number="outlierThreshold" label="Outlier (m)" type="number"
         dense outlined style="width: 95px" :min="0.01" :step="0.5" />
@@ -232,16 +236,46 @@
       </q-card>
     </q-dialog>
 
+    <!-- ── Save To File (PNG) dialog ─────────────────────────────────────── -->
+    <q-dialog v-model="savePlotOpen" persistent>
+      <q-card style="min-width: 460px">
+        <q-card-section class="row items-center q-pb-none">
+          <div class="text-h6">Save Plots To File</div>
+          <q-space />
+          <q-btn icon="close" flat round dense v-close-popup :disable="savePlotSaving" />
+        </q-card-section>
+        <q-card-section>
+          <div class="text-caption text-grey-7 q-mb-sm">
+            Writes the current plots (time-series, scatter, histograms) as a PNG to
+            <code>data/plots/positions/</code> — viewable in the <b>File Plots</b> tab.
+          </div>
+          <q-input v-model="savePlotName" label="File name" dense outlined autofocus
+            suffix=".png"
+            :error="!!savePlotError" :error-message="savePlotError"
+            @keyup.enter="doSavePlot" />
+        </q-card-section>
+        <q-card-actions align="right" class="q-pa-md">
+          <q-btn label="Cancel" flat no-caps v-close-popup :disable="savePlotSaving" />
+          <q-btn label="Save" color="primary" unelevated no-caps
+            :loading="savePlotSaving" :disable="!savePlotName.trim()"
+            @click="doSavePlot" />
+        </q-card-actions>
+      </q-card>
+    </q-dialog>
+
   </q-page>
 </template>
 
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from "vue";
+import { useQuasar } from "quasar";
 import { Chart, registerables } from "chart.js";
-import { getStationLists, getStations, getPositions, getDataRange, openFetchMissingStream, saveStationList } from "../api";
+import { getStationLists, getStations, getPositions, getDataRange, openFetchMissingStream, saveStationList, savePlotImage } from "../api";
 import type { PositionTrace, FetchEvent } from "../types";
 import { useSharedControls } from "../composables/useSharedControls";
 import { useListDelete } from "../composables/useListDelete";
+
+const $q = useQuasar();
 
 Chart.register(...registerables);
 
@@ -288,7 +322,7 @@ const { confirmDeleteList } = useListDelete(loadListOptions);
 const stationsLoading = ref(false);
 
 const downsampleEnabled  = ref(true);
-const removeMean         = ref(false);
+const removeMean         = ref(true);
 const outlierThreshold   = ref(5); // metres
 
 type TreeGroup   = { type: "group";   key: string; id: string; children: string[] };
@@ -352,6 +386,112 @@ async function doSave() {
     saveError.value = e?.response?.data?.error ?? "Failed to save.";
   } finally {
     saveRunning.value = false;
+  }
+}
+
+// ── Save To File (PNG) dialog ─────────────────────────────────────────────────
+const savePlotOpen   = ref(false);
+const savePlotSaving = ref(false);
+const savePlotName   = ref("");
+const savePlotError  = ref("");
+
+function _cleanName(s: string): string {
+  return s.replace(/[^A-Za-z0-9._-]+/g, "_").replace(/_+/g, "_").replace(/^_|_$/g, "");
+}
+
+function _defaultPlotName(): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const d = new Date();
+  const ts = `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}`
+    + `T${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}Z`;
+  const list = selectedList.value === "all" ? "All" : selectedList.value;
+  return _cleanName(
+    `${list}_${startDate.value}_${rangeDays.value}d_${selected.value.size}streams_${ts}`,
+  );
+}
+
+function openSavePlotDialog() {
+  savePlotName.value  = _defaultPlotName();
+  savePlotError.value = "";
+  savePlotSaving.value = false;
+  savePlotOpen.value  = true;
+}
+
+/** Composite all current chart canvases (only the plots — no controls) into one
+ *  white-background PNG canvas.  Returns null if there's nothing to draw. */
+function _buildCompositeCanvas(): HTMLCanvasElement | null {
+  const ts = COMPONENTS.map(c => _chart[c.key]?.canvas).filter(Boolean) as HTMLCanvasElement[];
+  const sc = SCATTER_DEFS.map(s => _scatterChart[s.key]?.canvas).filter(Boolean) as HTMLCanvasElement[];
+  const hi = HIST_DEFS.map(h => _histChart[h.key]?.canvas).filter(Boolean) as HTMLCanvasElement[];
+  if (!ts.length && !sc.length && !hi.length) return null;
+
+  const dpr = window.devicePixelRatio || 1;
+  const gap = 10;
+  const titleH = 46;
+  const fullW = ts[0]?.clientWidth
+    || sc.reduce((s, c) => s + c.clientWidth, 0)
+    || 900;
+
+  let totalH = titleH;
+  for (const c of ts) totalH += c.clientHeight + gap;
+  if (sc.length) totalH += Math.max(...sc.map(c => c.clientHeight)) + gap;
+  if (hi.length) totalH += Math.max(...hi.map(c => c.clientHeight)) + gap;
+  totalH += gap;
+
+  const canvas = document.createElement("canvas");
+  canvas.width  = Math.round(fullW * dpr);
+  canvas.height = Math.round(totalH * dpr);
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+  ctx.scale(dpr, dpr);
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, fullW, totalH);
+
+  // Title / metadata
+  const list = selectedList.value === "all" ? "All" : selectedList.value;
+  ctx.textBaseline = "top";
+  ctx.fillStyle = "#222";
+  ctx.font = "bold 14px sans-serif";
+  ctx.fillText(`${list}   ${startDate.value} → ${endDate.value}   ${selected.value.size} stream(s)`, 8, 10);
+  ctx.font = "11px sans-serif";
+  ctx.fillStyle = "#666";
+  ctx.fillText(
+    `Generated ${new Date().toISOString().replace("T", " ").slice(0, 19)} UTC`
+      + (removeMean.value ? "  ·  mean removed" : ""),
+    8, 28,
+  );
+
+  let y = titleH;
+  for (const c of ts) { ctx.drawImage(c, 0, y, fullW, c.clientHeight); y += c.clientHeight + gap; }
+  if (sc.length) {
+    let x = 0; const h = Math.max(...sc.map(c => c.clientHeight));
+    for (const c of sc) { ctx.drawImage(c, x, y, c.clientWidth, c.clientHeight); x += c.clientWidth; }
+    y += h + gap;
+  }
+  if (hi.length) {
+    let x = 0; const h = Math.max(...hi.map(c => c.clientHeight));
+    for (const c of hi) { ctx.drawImage(c, x, y, c.clientWidth, c.clientHeight); x += c.clientWidth; }
+    y += h + gap;
+  }
+  return canvas;
+}
+
+async function doSavePlot() {
+  const name = savePlotName.value.trim();
+  if (!name) { savePlotError.value = "Name is required."; return; }
+  savePlotError.value = "";
+  savePlotSaving.value = true;
+  try {
+    const canvas = _buildCompositeCanvas();
+    if (!canvas) { savePlotError.value = "No plots to save."; savePlotSaving.value = false; return; }
+    const dataUrl = canvas.toDataURL("image/png");
+    const res = await savePlotImage(_cleanName(name), dataUrl);
+    savePlotOpen.value = false;
+    $q.notify({ type: "positive", message: `Saved ${res.name} — see File Plots (positions/).` });
+  } catch (e: any) {
+    savePlotError.value = e?.response?.data?.error ?? "Failed to save.";
+  } finally {
+    savePlotSaving.value = false;
   }
 }
 

@@ -28,9 +28,38 @@ import os
 import pathlib
 import sys
 
+from earthscope_positions import paths
+
 
 def _project_root() -> pathlib.Path:
-    return pathlib.Path(__file__).parent.parent.parent
+    return paths.project_root()
+
+
+def _add_data_dir_args(p: argparse.ArgumentParser, *, arrow: bool = True) -> None:
+    """Add --data-directory (base) and, when *arrow*, --arrow-data-directory."""
+    p.add_argument(
+        "--data-directory",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Base data directory (default: $ES_POS_DATA_DIRECTORY or ./data).  "
+            "Arrow files live under <PATH>/arrow, station lists under "
+            "<PATH>/station-lists, plots under <PATH>/plots."
+        ),
+    )
+    if arrow:
+        p.add_argument(
+            "--arrow-data-directory",
+            metavar="PATH",
+            default=None,
+            help="Override just the Arrow data root (supersedes --data-directory/arrow).",
+        )
+
+
+def _apply_data_dir_args(args: argparse.Namespace) -> None:
+    """Push the resolved --data-directory / --arrow-data-directory into `paths`."""
+    paths.set_base_dir(getattr(args, "data_directory", None))
+    paths.set_arrow_dir(getattr(args, "arrow_data_directory", None))
 
 
 def _build_top_parser() -> tuple[
@@ -135,11 +164,7 @@ Examples:
         "--all", action="store_true",
         help="Process all .arrow files under DATA_DIR (default: ./data/arrow).  Mutually exclusive with -i.",
     )
-    ppsd_proc_p.add_argument(
-        "--data-dir",
-        metavar="PATH",
-        help="Root of the Arrow data tree (default: ./data/arrow).",
-    )
+    _add_data_dir_args(ppsd_proc_p)
     ppsd_proc_p.add_argument(
         "--start",
         metavar="YYYY-MM-DD",
@@ -193,14 +218,10 @@ pre-computing them here makes the Completeness & Latency tab load faster.
 Examples:
   es-pos process completeness
   es-pos process completeness --overwrite
-  es-pos process completeness --data-dir /data/archive/arrow
+  es-pos process completeness --arrow-data-directory /data/archive/arrow
 """,
     )
-    comp_p.add_argument(
-        "--data-dir",
-        metavar="PATH",
-        help="Root of the Arrow data tree (default: ./data/arrow).",
-    )
+    _add_data_dir_args(comp_p)
     comp_p.add_argument(
         "--overwrite",
         action="store_true",
@@ -256,7 +277,7 @@ Examples:
         "--host",
         default="127.0.0.1",
         metavar="HOST",
-        help="Bind host (default: 127.0.0.1).",
+        help="Bind address (default: 127.0.0.1).  Use 0.0.0.0 to accept remote connections.",
     )
     web_p.add_argument(
         "--port",
@@ -266,10 +287,16 @@ Examples:
         help="Bind port (default: 8000).",
     )
     web_p.add_argument(
-        "--data-dir",
-        metavar="PATH",
-        help="Arrow data root (default: ./data/arrow).",
+        "--hostname",
+        default="localhost",
+        metavar="NAME",
+        help=(
+            "Externally-reachable hostname used for callback URLs shown in the UI "
+            "(e.g. the Replay curl commands).  Default: localhost.  Set this to the "
+            "server's public name/IP when running remotely."
+        ),
     )
+    _add_data_dir_args(web_p)
 
     # ── test ─────────────────────────────────────────────────────────────────
     test_p = sub.add_parser(
@@ -309,7 +336,7 @@ Use 'es-pos test <subcommand> --help' for per-command options.
 
 Subcommands:
   miniseed   Write Arrow files as MiniSEED 3 (8 channels per station-day).
-  geojson    Write Arrow files as GeoJSON (compact NDJSON or full FeatureCollection).
+  geojson    Write Arrow files as GeoJSON JSONL (compact or full Feature per line).
   ppsd       Compute Probabilistic Power Spectral Density plots (PNG).
 
 Use 'es-pos export <subcommand> --help' for per-command options.
@@ -324,21 +351,19 @@ Use 'es-pos export <subcommand> --help' for per-command options.
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description="""Write GNSS position Arrow files as GeoJSON.
 
-Two output formats (both use ENU — East, North, Up — coordinate order):
+Two output formats, both written as JSONL (one JSON object per line) and both
+using ENU — East, North, Up — coordinate order:
 
-  compact   Newline-delimited JSON (NDJSON) — one line per sample:
+  compact   *.compact.geojson.jsonl — one compact record per sample:
               {"time":...,"Q":...,"type":"ENU","SNCL":"...",
                "coor":[E,N,U],"err":[Eerr,Nerr,Uerr],"rate":1}
 
-  full      GeoJSON FeatureCollection — one file per station-day with all
-            samples as Point features:
-              {"type":"FeatureCollection",
-               "properties":{"sampleRate":1,"SNCL":"..."},
-               "features":[{"type":"Feature",
-                             "geometry":{"type":"Point","coordinates":[E,N,U]},
-                             "properties":{"coordinateType":"ENU","time":...,
-                                           "EError":...,"NError":...,"UError":...,
-                                           "quality":...}}, ...]}
+  full      *.full.geojson.jsonl — one GeoJSON Feature per sample:
+              {"type":"Feature",
+               "geometry":{"type":"Point","coordinates":[E,N,U]},
+               "properties":{"coordinateType":"ENU","SNCL":"...","time":...,
+                             "EError":...,"NError":...,"UError":...,
+                             "quality":...,"sampleRate":1}}
 
 Station selection: use -i/--input (station list) or --all for all indexed stations.
 Date range: specify exactly two of --start-time, --stop-time, --duration; the
@@ -369,10 +394,7 @@ Examples:
         "--all", action="store_true",
         help="Process all stations found in the data directory.  Mutually exclusive with -i.",
     )
-    gj_p.add_argument(
-        "--data-dir", metavar="PATH",
-        help="Arrow data root (default: ./data/arrow).",
-    )
+    _add_data_dir_args(gj_p)
     gj_p.add_argument(
         "--start-time", metavar="YYYY-MM-DD",
         help="Start date, inclusive.",
@@ -457,10 +479,7 @@ Examples:
         "--all", action="store_true",
         help="Process all stations found in the data directory.  Mutually exclusive with -i.",
     )
-    ms_p.add_argument(
-        "--data-dir", metavar="PATH",
-        help="Arrow data root (default: ./data/arrow).",
-    )
+    _add_data_dir_args(ms_p)
     ms_p.add_argument(
         "--start-time", metavar="YYYY-MM-DD",
         help="Start date, inclusive.",
@@ -540,10 +559,7 @@ Examples:
         "--all", action="store_true",
         help="Process all .arrow files under DATA_DIR (default: ./data/arrow).",
     )
-    ppsd_p.add_argument(
-        "--data-dir", metavar="PATH",
-        help="Arrow data root (default: ./data/arrow).",
-    )
+    _add_data_dir_args(ppsd_p)
     ppsd_p.add_argument(
         "--start", metavar="YYYY-MM-DD",
         help="Only include files on or after this date.",
@@ -614,10 +630,7 @@ Examples:
         "--all", action="store_true",
         help="Replay all stations in the data directory.  Mutually exclusive with -i.",
     )
-    replay_p.add_argument(
-        "--data-dir", metavar="PATH",
-        help="Arrow data root (default: ./data/arrow).",
-    )
+    _add_data_dir_args(replay_p)
     replay_p.add_argument(
         "--start-time", metavar="YYYY-MM-DD",
         help="Start date, inclusive.",
@@ -715,7 +728,7 @@ def _resolve_list_path(name: str) -> "pathlib.Path | None":
     """Find a station-list JSONL file — same search order as es-pos fetch."""
     p = pathlib.Path(name)
     stem = p.stem if p.suffix in (".jsonl", ".json") else p.name
-    sl = _project_root() / "data" / "station-lists"
+    sl = paths.station_lists_dir()
     candidates = [
         p,
         p.parent / (stem + ".jsonl"),
@@ -757,11 +770,7 @@ def _resolve_export_arrow_files(
     stop: dt.date,
 ) -> list[pathlib.Path]:
     """Return sorted Arrow files for the selected stations within [start, stop]."""
-    data_dir = (
-        pathlib.Path(args.data_dir)
-        if getattr(args, "data_dir", None)
-        else _project_root() / "data" / "arrow"
-    )
+    data_dir = paths.arrow_dir()
     if not data_dir.exists():
         sys.exit(f"Data directory not found: {data_dir}")
 
@@ -791,7 +800,8 @@ def _resolve_export_arrow_files(
             continue
         prefix = geosncl + "_"
         for p in sorted(gs_dir.rglob("*.arrow")):
-            if ".completeness" in p.name:
+            # Silently skip sidecar files — they are not position data.
+            if ".completeness" in p.name or "_ppsd" in p.name:
                 continue
             stem = p.stem
             if not stem.startswith(prefix):
@@ -814,17 +824,14 @@ def _cmd_export_ppsd(args: argparse.Namespace) -> None:
     import datetime as dt
     from earthscope_positions.export.ppsd_writer import write_ppsd
 
-    data_dir = (
-        pathlib.Path(args.data_dir) if args.data_dir
-        else _project_root() / "data" / "arrow"
-    )
+    data_dir = paths.arrow_dir()
 
     if args.all:
         if not data_dir.exists():
             sys.exit(f"Data directory not found: {data_dir}")
         arrow_files = sorted(
             p for p in data_dir.rglob("*.arrow")
-            if ".completeness" not in p.name
+            if ".completeness" not in p.name and "_ppsd" not in p.name
         )
     elif getattr(args, "input", None):
         geosncls = _load_geosncls_from_lists(args.input)
@@ -834,7 +841,7 @@ def _cmd_export_ppsd(args: argparse.Namespace) -> None:
             p
             for gs in geosncls
             for p in (data_dir / gs).rglob("*.arrow")
-            if ".completeness" not in p.name
+            if ".completeness" not in p.name and "_ppsd" not in p.name
         )
     else:
         arrow_files = [pathlib.Path(f) for f in args.files]
@@ -847,7 +854,7 @@ def _cmd_export_ppsd(args: argparse.Namespace) -> None:
 
     output = (
         pathlib.Path(args.output) if args.output
-        else _project_root() / "data" / "plots" / "ppsd"
+        else paths.plots_dir() / "ppsd"
     )
 
     by_center = getattr(args, "by_center", False)
@@ -998,23 +1005,20 @@ def _cmd_export_miniseed(args: argparse.Namespace) -> None:
 
 def _cmd_webserver(args: argparse.Namespace) -> None:
     import uvicorn
-    from earthscope_positions.webserver.webserver import app, set_data_dir
+    from earthscope_positions.webserver.webserver import app, set_public_base
 
-    if args.data_dir:
-        set_data_dir(pathlib.Path(args.data_dir))
-
-    print(f"Starting GNSS Positions server → http://{args.host}:{args.port}")
+    set_public_base(args.hostname, args.port)
+    print(
+        f"Starting GNSS Positions server → http://{args.hostname}:{args.port}"
+        f"  (binding {args.host}:{args.port})"
+    )
     uvicorn.run(app, host=args.host, port=args.port)
 
 
 def _cmd_process_completeness(args: argparse.Namespace) -> None:
     from earthscope_positions.process.completeness import generate_all
 
-    data_dir = (
-        pathlib.Path(args.data_dir)
-        if args.data_dir
-        else _project_root() / "data" / "arrow"
-    )
+    data_dir = paths.arrow_dir()
 
     if not data_dir.exists():
         sys.exit(f"Data directory not found: {data_dir}")
@@ -1054,10 +1058,7 @@ def _cmd_process_ppsd(args: argparse.Namespace) -> None:
         cache_path_for, compute_ppsd_cache, load_ppsd_cache,
     )
 
-    data_dir = (
-        pathlib.Path(args.data_dir) if getattr(args, "data_dir", None)
-        else _project_root() / "data" / "arrow"
-    )
+    data_dir = paths.arrow_dir()
     if not data_dir.exists():
         sys.exit(f"Data directory not found: {data_dir}")
 
@@ -1153,11 +1154,7 @@ def _cmd_replay(args: argparse.Namespace) -> None:
     )
 
     start, stop = _resolve_export_date_range(args)
-    data_dir = (
-        pathlib.Path(args.data_dir)
-        if getattr(args, "data_dir", None)
-        else _project_root() / "data" / "arrow"
-    )
+    data_dir = paths.arrow_dir()
     if not data_dir.exists():
         sys.exit(f"Data directory not found: {data_dir}")
 
@@ -1208,6 +1205,11 @@ def main() -> None:
     # parse_known_args so we can forward all remaining tokens (including --help)
     # to the delegated module's parser, which gives correct per-command help.
     args, remaining = ap.parse_known_args()
+
+    # Apply --data-directory / --arrow-data-directory for groups handled in this
+    # module (process/export/replay/webserver).  The stations/fetch/test groups
+    # re-parse and apply the same flags in their own main().
+    _apply_data_dir_args(args)
 
     group = args.group
 

@@ -2,163 +2,68 @@
 station_list - discover and manage GNSS PPP position stream station lists.
 
 CLI subcommands:
-  get datasource  search /discover/datasource/stream
-  get radial      search /refpos/search/radial
+  get datasource  search /discover/datasource/stream (earthscope-sdk)
+  get radial      search /discover/gnss/radial (direct REST — no SDK method)
   filter          merge and filter existing station list files
 """
 
 import argparse
 import pathlib
-import subprocess
 import sys
-from typing import Optional
+from typing import Optional, get_args
 
 import orjson
 
-from earthscope_sdk.config.models import Tokens
-from earthscope_client.api.discover_api import DiscoverApi
-from earthscope_client.api_client import ApiClient
-from earthscope_client.configuration import Configuration
-from earthscope_client.exceptions import ApiException
-from earthscope_client.models.facility import Facility
-from earthscope_client.models.reference_position_tier import ReferencePositionTier
-from earthscope_client.models.stream_software import StreamSoftware
-from earthscope_client.models.stream_type import StreamType
-
-# stream_info.py uses StreamType/Facility/StreamSoftware as forward references but
-# never imports them, so pydantic can't resolve the model without help.
-import earthscope_client.models.stream_info as _stream_info_mod
-from earthscope_client.models.stream_info import StreamInfo
-from earthscope_client.models.response_radial_search_streams_refpos_search_radial_get import (
-    ResponseRadialSearchStreamsRefposSearchRadialGet,
+from earthscope_positions import paths
+from earthscope_sdk import EarthScopeClient
+from earthscope_sdk.client.discovery.models import (
+    ProcessingFacility,
+    StreamSoftware,
+    StreamType,
 )
-_stream_info_mod.StreamType = StreamType  # type: ignore[attr-defined]
-_stream_info_mod.Facility = Facility  # type: ignore[attr-defined]
-_stream_info_mod.StreamSoftware = StreamSoftware  # type: ignore[attr-defined]
-StreamInfo.model_rebuild()
-ResponseRadialSearchStreamsRefposSearchRadialGet.model_rebuild()
 
+# Base host for the one endpoint the SDK doesn't cover (radial search).
+_API_HOST = "https://api.earthscope.org"
 
-_TOKENS_PATH = pathlib.Path.home() / ".earthscope" / "default" / "tokens.json"
+# The SDK discovery calls auto-paginate up to `limit`; use a high cap for "all".
+_MAX_RESULTS = 1_000_000
 
 
 def _project_root() -> pathlib.Path:
-    """Walk up from CWD to find the project root (directory containing pyproject.toml)."""
-    for p in [pathlib.Path.cwd(), *pathlib.Path.cwd().parents]:
-        if (p / "pyproject.toml").exists():
-            return p
-    return pathlib.Path.cwd()
-_PAGE_SIZE = 100
-# Refresh if less than this many seconds remain
-_REFRESH_MARGIN = 60
+    return paths.project_root()
 
 
 # ---------------------------------------------------------------------------
-# Auth helpers
+# EarthScope SDK client (handles auth + token refresh internally)
 # ---------------------------------------------------------------------------
 
-def _read_tokens() -> Tokens:
-    try:
-        raw = _TOKENS_PATH.read_bytes()
-    except FileNotFoundError:
-        sys.exit(
-            f"No credentials found at {_TOKENS_PATH}.\n"
-            "Please authenticate first:  es user login"
-        )
-    return Tokens.model_validate_json(raw)
+_client: "EarthScopeClient | None" = None
 
 
-def _ensure_token() -> str:
-    """Return a valid Bearer access token, refreshing via earthscope-cli if needed."""
-    tokens = _read_tokens()
-
-    try:
-        body = tokens.access_token_body
-    except ValueError:
-        body = None
-
-    if body is not None and body.ttl.total_seconds() > _REFRESH_MARGIN:
-        return tokens.access_token.get_secret_value()  # type: ignore[union-attr]
-
-    print("Access token expired or near expiry; refreshing...", file=sys.stderr)
-    result = subprocess.run(
-        ["es", "user", "refresh-access-token"],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        sys.exit(
-            f"Token refresh failed:\n{result.stderr.strip()}\n\n"
-            "Please re-authenticate:  es user login"
-        )
-
-    # Re-read from disk after refresh
-    tokens = _read_tokens()
-    try:
-        body = tokens.access_token_body
-    except ValueError:
-        body = None
-
-    if body is None or tokens.access_token is None:
-        sys.exit(
-            "Unable to obtain a valid access token after refresh.\n"
-            "Please re-authenticate:  es user login"
-        )
-
-    remaining = int(body.ttl.total_seconds())
-    print(f"Token refreshed; valid for {remaining}s.", file=sys.stderr)
-    return tokens.access_token.get_secret_value()
+def _discover():
+    """Return the SDK discovery service, creating the shared client on first use."""
+    global _client
+    if _client is None:
+        _client = EarthScopeClient()
+    return _client.discover
 
 
 # ---------------------------------------------------------------------------
 # API error handling
 # ---------------------------------------------------------------------------
 
-def _api_error(exc: ApiException) -> None:
-    """Print a clean API error message and exit."""
-    messages = []
-
-    # Prefer the deserialized data (HTTPValidationError for 422s has a .detail list)
-    detail = getattr(getattr(exc, "data", None), "detail", None)
-    if detail:
-        for err in detail:
-            msg = getattr(err, "msg", None)
-            if msg:
-                inp = getattr(err, "input", None)
-                line = f"  {msg}"
-                if inp is not None:
-                    line += f" (got: {inp!r})"
-                messages.append(line)
-
-    # Fall back to parsing the raw JSON body
-    if not messages and exc.body:
-        try:
-            import json as _json
-            body = _json.loads(exc.body)
-            for item in body.get("detail", []):
-                if isinstance(item, dict) and "msg" in item:
-                    line = f"  {item['msg']}"
-                    if "input" in item:
-                        line += f" (got: {item['input']!r})"
-                    messages.append(line)
-        except Exception:
-            pass
-
-    print(f"API error {exc.status} {exc.reason or ''}:", file=sys.stderr)
-    for msg in messages:
-        print(msg, file=sys.stderr)
-    if not messages and exc.body:
-        print(f"  {exc.body[:500]}", file=sys.stderr)
+def _api_error(exc: Exception) -> None:
+    """Print a clean API error message and exit (CLI use)."""
+    resp = getattr(exc, "response", None)
+    status = getattr(resp, "status_code", None)
+    body = getattr(resp, "text", None)
+    if status is not None:
+        print(f"API error {status}:", file=sys.stderr)
+        if body:
+            print(f"  {body[:500]}", file=sys.stderr)
+    else:
+        print(f"API error: {exc}", file=sys.stderr)
     sys.exit(1)
-
-
-# ---------------------------------------------------------------------------
-# API client factory
-# ---------------------------------------------------------------------------
-
-def _make_api(token: str) -> DiscoverApi:
-    conf = Configuration(access_token=token)
-    return DiscoverApi(api_client=ApiClient(configuration=conf))
 
 
 # ---------------------------------------------------------------------------
@@ -166,11 +71,13 @@ def _make_api(token: str) -> DiscoverApi:
 # ---------------------------------------------------------------------------
 
 def _record(edid: str, geosncl: Optional[str], facility, software) -> dict:
+    """Build a station-list record.  facility/software are plain strings now
+    (the SDK returns them as strings rather than enums)."""
     return {
         "geosncl": geosncl,
         "edid": edid,
-        "facility": facility.value if facility is not None else None,
-        "software": software.value if software is not None else None,
+        "facility": facility,
+        "software": software,
     }
 
 
@@ -212,53 +119,112 @@ def _validate_station_names(names: list[str]) -> None:
 # ---------------------------------------------------------------------------
 
 def _get_datasource(args) -> list[dict]:
-    """Paginate through /discover/datasource/stream with stream_type=gnss_ppp."""
-    token = _ensure_token()
-    api = _make_api(token)
-
+    """List /discover/datasource/stream with stream_type=gnss_ppp (auto-paginated)."""
     if args.station_name:
         _validate_station_names(args.station_name)
 
-    facility = Facility(args.facility) if args.facility else None
-    software = StreamSoftware(args.software) if args.software else None
-
-    records: list[dict] = []
-    offset = 0
-
     try:
-        while True:
-            resp = api.find_stream_datasources(
-                stream_type=StreamType.GNSS_PPP,
-                facility=facility,
-                software=software,
-                label=args.label or None,
-                station_name=args.station_name or None,
-                network_name=args.network_name or None,
-                limit=_PAGE_SIZE,
-                offset=offset,
-            )
-
-            page = resp.actual_instance
-            if page is None or not hasattr(page, "items"):
-                break
-
-            for stream in page.items:
-                geosncl = stream.names.geosncl if stream.names else None
-                records.append(_record(stream.edid, geosncl, stream.facility, stream.software))
-
-            print(
-                f"  page offset={offset}: {len(page.items)} records (total so far: {len(records)})",
-                file=sys.stderr,
-            )
-
-            if not page.has_next:
-                break
-            offset += _PAGE_SIZE
-
-    except ApiException as exc:
+        streams = _discover().list_stream_datasources(
+            stream_type=StreamType.GNSS_PPP,
+            facility=args.facility or None,
+            software=args.software or None,
+            label=args.label or None,
+            station_name=args.station_name or None,
+            network_name=args.network_name or None,
+            limit=_MAX_RESULTS,
+        )
+    except Exception as exc:
         _api_error(exc)
 
+    records = [
+        _record(s.edid, s.names.get("GEOSNCL"), s.facility, s.software)
+        for s in streams
+    ]
+    print(f"  {len(records)} stream(s) found", file=sys.stderr)
     return records
+
+
+# ---------------------------------------------------------------------------
+# Programmatic helpers (used by the webserver Station Builder page)
+# ---------------------------------------------------------------------------
+
+def list_networks(namespaces: tuple[str, ...] = ("RTDB", "SHAKE")) -> list[str]:
+    """Return sorted, fully-qualified network names in the given namespaces.
+
+    Lists /discover/datasource/network and keeps networks that have a name in one
+    of *namespaces* (e.g. ``"SHAKE:NOTA"``, ``"RTDB:PBO"``).  ``names`` is a dict
+    keyed by namespace (``{"SHAKE": "NOTA", ...}``).
+
+    Raises on API failure (callers decide how to surface it).
+    """
+    nets = _discover().list_network_datasources(limit=_MAX_RESULTS)
+    names: set[str] = set()
+    for net in nets:
+        nm = getattr(net, "names", None) or {}
+        for ns in namespaces:
+            val = nm.get(ns)
+            if val:
+                names.add(f"{ns}:{val}")
+    return sorted(names)
+
+
+def network_geosncls(network_name: str) -> list[str]:
+    """Return geosncls of all gnss_ppp streams in *network_name*.
+
+    Lists /discover/datasource/stream filtered by stream_type=gnss_ppp and the
+    given network; the network filter already scopes results to that network's
+    streams.
+
+    Raises on API failure.
+    """
+    streams = _discover().list_stream_datasources(
+        stream_type=StreamType.GNSS_PPP,
+        network_name=network_name,
+        limit=_MAX_RESULTS,
+    )
+    out = {gs for s in streams if (gs := s.names.get("GEOSNCL"))}
+    return sorted(out)
+
+
+def network_records(network_name: str) -> list[dict]:
+    """Return full station-list records (edid + geosncl + facility + software)
+    for all gnss_ppp streams in *network_name*.  Deduplicated by edid/geosncl.
+
+    Raises on API failure.
+    """
+    streams = _discover().list_stream_datasources(
+        stream_type=StreamType.GNSS_PPP,
+        network_name=network_name,
+        limit=_MAX_RESULTS,
+    )
+    seen: set[str] = set()
+    records: list[dict] = []
+    for s in streams:
+        gs = s.names.get("GEOSNCL")
+        key = s.edid or gs or ""
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        records.append(_record(s.edid, gs, s.facility, s.software))
+    return records
+
+
+def _sanitize_list_name(name: str) -> str:
+    """Turn an arbitrary network name into a lowercase, dash-separated list name.
+
+    e.g. ``"SHAKE:ORGN"`` -> ``"shake-orgn"``.
+    """
+    import re
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "network"
+
+
+def save_network_list(network_name: str, list_name: Optional[str] = None) -> tuple[str, list[dict]]:
+    """Fetch every gnss_ppp stream in *network_name* and save it as a station
+    list (full records, so it stays fetchable).  Returns (list_name, records)."""
+    records = network_records(network_name)
+    name = _sanitize_list_name(list_name or network_name)
+    _write(records, _resolve_output(name))
+    return name, records
 
 
 # ---------------------------------------------------------------------------
@@ -266,40 +232,63 @@ def _get_datasource(args) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def _get_radial(args) -> list[dict]:
-    """Search /refpos/search/radial with tier=stream, stream_type=gnss_ppp."""
-    token = _ensure_token()
-    api = _make_api(token)
+    """Radial search (tier=stream, stream_type=gnss_ppp).
 
-    facility = Facility(args.facility) if args.facility else None
-    software = StreamSoftware(args.software) if args.software else None
+    NOTE: the earthscope-sdk has no radial/refpos search method, so this calls
+    the REST endpoint directly, authenticating with the same bearer token the
+    fetch path uses (managed by earthscope-cli / earthscope-sdk credentials).
+    """
+    import requests
+    from earthscope_positions.fetch.positions_fetch import _ensure_token
 
+    params: dict = {
+        "latitude": args.latitude,
+        "longitude": args.longitude,
+        "distance": args.distance,
+        "tier": "stream",
+        "stream_type": "gnss_ppp",
+        "with_information": True,
+    }
+    if args.network_name:
+        params["network"] = args.network_name
+    if args.facility:
+        params["facility"] = args.facility
+
+    url = f"{_API_HOST}/beta/discover/gnss/radial"
     try:
-        resp = api.find_gnss_stations_radial(
-            latitude=args.latitude,
-            longitude=args.longitude,
-            distance=args.distance,
-            tier=ReferencePositionTier.STREAM,
-            network=args.network_name or None,
-            stream_type=StreamType.GNSS_PPP,
-            facility=facility,
-            with_information=True,
+        resp = requests.get(
+            url,
+            params=params,
+            headers={
+                "accept": "application/json",
+                "authorization": f"Bearer {_ensure_token()}",
+            },
+            timeout=120,
         )
-    except ApiException as exc:
-        _api_error(exc)
+    except Exception as exc:
+        sys.exit(f"Radial search request failed: {exc}")
 
-    items = resp.actual_instance
+    if resp.status_code != 200:
+        print(f"API error {resp.status_code}:", file=sys.stderr)
+        print(f"  {resp.text[:500]}", file=sys.stderr)
+        sys.exit(1)
+
+    data = resp.json()
+    items = data.get("items", data) if isinstance(data, dict) else data
     if not items:
         return []
 
+    software = args.software or None
     records = []
     for info in items:
         if isinstance(info, str):
             records.append(_record(info, None, None, None))
-        else:
-            if software is not None and info.software != software:
-                continue
-            records.append(_record(info.edid, info.geosncl, info.facility, info.software))
-
+            continue
+        sw = info.get("software")
+        if software is not None and sw != software:
+            continue
+        records.append(_record(info.get("edid"), info.get("geosncl"),
+                               info.get("facility"), sw))
     return records
 
 
@@ -309,7 +298,7 @@ def _get_radial(args) -> list[dict]:
 
 def _resolve_input(name: str) -> pathlib.Path:
     """Find an input file, checking data/station-lists/ and adding .jsonl if needed."""
-    sl = _project_root() / "data" / "station-lists"
+    sl = paths.station_lists_dir()
     p = pathlib.Path(name)
     stem = p.stem if p.suffix in (".jsonl", ".json") else p.name
     candidates = [
@@ -395,7 +384,7 @@ def _resolve_output(name: str) -> pathlib.Path:
     stem = p.stem if p.suffix in (".jsonl", ".json") else p.name
     p = pathlib.Path(stem + ".jsonl")
     if p.parent == pathlib.Path("."):
-        p = _project_root() / "data" / "station-lists" / p.name
+        p = paths.station_lists_dir() / p.name
     return p
 
 
@@ -418,8 +407,8 @@ def _write(records: list[dict], output: Optional[pathlib.Path]) -> None:
 # Argument parser
 # ---------------------------------------------------------------------------
 
-_FACILITY_CHOICES = [f.value for f in Facility]
-_SOFTWARE_CHOICES = [s.value for s in StreamSoftware]
+_FACILITY_CHOICES = list(get_args(ProcessingFacility))
+_SOFTWARE_CHOICES = list(get_args(StreamSoftware))
 
 _VALID_STATION_PREFIXES = ("4CHARID:", "IGS:", "PNUM:")
 
@@ -438,6 +427,19 @@ _NETWORK_CHOICES = [
     "SHAKE:UNKN",
     "RTDB:REALTIME",
 ]
+
+
+def _add_data_dir_arg(p: argparse.ArgumentParser) -> None:
+    """Add the standard --data-directory flag (station lists live under <base>/station-lists)."""
+    p.add_argument(
+        "--data-directory",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Base data directory (default: $ES_POS_DATA_DIRECTORY or ./data).  "
+            "Station lists are read from / written to <PATH>/station-lists."
+        ),
+    )
 
 
 def _build_parser(prog=None) -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
@@ -656,6 +658,9 @@ def _build_parser(prog=None) -> tuple[argparse.ArgumentParser, argparse.Argument
         ),
     )
 
+    for _p in (ds_p, rad_p, filt_p):
+        _add_data_dir_arg(_p)
+
     return ap, get_p
 
 
@@ -670,6 +675,8 @@ def main() -> None:
     if not args.command:
         ap.print_help()
         sys.exit(0)
+
+    paths.set_base_dir(getattr(args, "data_directory", None))
 
     if args.command == "get":
         if not getattr(args, "source", None):

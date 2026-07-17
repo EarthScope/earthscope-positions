@@ -11,9 +11,9 @@ different way:
     ``mock_positions_api`` fixture.
 
 2.  Station discovery (``earthscope_positions.stations.station_list``) goes
-    through the generated ``earthscope_client`` SDK (urllib3 under the hood).
-    Rather than hand-craft SDK response models, we swap the API-client factory
-    for a fake — see the ``fake_discover_api`` fixture.
+    through the ``earthscope-sdk`` discovery service.  Rather than construct a
+    real ``EarthScopeClient`` (which needs auth), we swap ``_discover()`` for a
+    fake — see the ``fake_discover_api`` fixture.
 
 Both surfaces also need an auth token; ``fake_token`` neutralises the real
 credential/VPN lookup so no test ever shells out to ``es user login``.
@@ -28,10 +28,21 @@ import pyarrow as pa
 import pyarrow.ipc as ipc
 import pytest
 
-from earthscope_client.models.facility import Facility
-from earthscope_client.models.stream_software import StreamSoftware
+from earthscope_positions import paths
 from earthscope_positions.fetch import positions_fetch
 from earthscope_positions.stations import station_list
+
+
+@pytest.fixture(autouse=True)
+def _reset_data_dir(monkeypatch):
+    """Keep the data-directory resolution hermetic: no leaked env var or
+    override from the developer's shell or a prior test."""
+    monkeypatch.delenv(paths.ENV_VAR, raising=False)
+    paths.set_base_dir(None)
+    paths.set_arrow_dir(None)
+    yield
+    paths.set_base_dir(None)
+    paths.set_arrow_dir(None)
 
 
 # ---------------------------------------------------------------------------
@@ -63,9 +74,14 @@ def project_tree(tmp_path, monkeypatch):
 
 @pytest.fixture
 def fake_token(monkeypatch):
-    """Make ``_ensure_token()`` return a dummy token in both API modules."""
+    """Make ``_ensure_token()`` return a dummy token.
+
+    Only ``positions_fetch`` owns a token helper now; station discovery goes
+    through the SDK client (faked separately), and the radial search imports
+    ``positions_fetch._ensure_token`` at call time — so patching it here covers
+    both the fetch path and radial search.
+    """
     monkeypatch.setattr(positions_fetch, "_ensure_token", lambda: "test-token")
-    monkeypatch.setattr(station_list, "_ensure_token", lambda: "test-token")
     return "test-token"
 
 
@@ -161,95 +177,65 @@ def mock_positions_api():
 
 
 # ---------------------------------------------------------------------------
-# Spoof #2 — the station-discovery SDK, via a fake DiscoverApi.
+# Spoof #2 — the earthscope-sdk discovery service, via a fake.
 # ---------------------------------------------------------------------------
 
 
-def _stream_datasource_page(records, *, has_next=False):
-    """Build a fake ``find_stream_datasources`` response.
+def _fake_stream(rec):
+    """A fake earthscope-sdk StreamDatasource.
 
-    Mirrors only the attributes the caller touches:
-    ``resp.actual_instance.items[*].{edid, names.geosncl, facility, software}``
-    and ``resp.actual_instance.has_next``.  ``facility``/``software`` are real
-    ``Facility``/``StreamSoftware`` enums, matching the SDK.
+    Mirrors the attributes station_list touches: ``.edid``, ``.names`` (a dict
+    with a ``"GEOSNCL"`` key), and ``.facility`` / ``.software`` (plain strings).
     """
-    items = []
-    for rec in records:
-        fac = rec.get("facility")
-        sw = rec.get("software")
-        items.append(
-            SimpleNamespace(
-                edid=rec["edid"],
-                names=SimpleNamespace(geosncl=rec.get("geosncl")),
-                facility=Facility(fac) if fac is not None else None,
-                software=StreamSoftware(sw) if sw is not None else None,
-            )
-        )
-    page = SimpleNamespace(items=items, has_next=has_next)
-    return SimpleNamespace(actual_instance=page)
+    return SimpleNamespace(
+        edid=rec["edid"],
+        names={"GEOSNCL": rec.get("geosncl")},
+        facility=rec.get("facility"),
+        software=rec.get("software"),
+    )
 
 
-def _radial_response(records):
-    """Build a fake ``find_gnss_stations_radial`` response.
-
-    ``resp.actual_instance`` is a list; each element exposes ``edid``,
-    ``geosncl``, ``facility``, ``software`` as real SDK enums.
-    """
-    items = []
-    for rec in records:
-        fac = rec.get("facility")
-        sw = rec.get("software")
-        items.append(
-            SimpleNamespace(
-                edid=rec["edid"],
-                geosncl=rec.get("geosncl"),
-                facility=Facility(fac) if fac is not None else None,
-                software=StreamSoftware(sw) if sw is not None else None,
-            )
-        )
-    return SimpleNamespace(actual_instance=items)
+def _fake_network(rec):
+    """A fake earthscope-sdk NetworkDatasource — ``.names`` is a namespace dict,
+    e.g. ``{"SHAKE": "NOTA"}``."""
+    return SimpleNamespace(edid=rec.get("edid", ""), names=rec.get("names", {}))
 
 
-class FakeDiscoverApi:
-    """Stand-in for ``earthscope_client.api.discover_api.DiscoverApi``.
+class FakeDiscovery:
+    """Stand-in for ``EarthScopeClient().discover`` (the SDK discovery service).
 
     Configure the replies before calling the code under test::
 
-        fake.datasource_pages = [page1, page2]   # returned in order
-        fake.radial_records = [...]
+        fake.stream_records  = [{"edid", "geosncl", "facility", "software"}, ...]
+        fake.network_records = [{"names": {"SHAKE": "NOTA"}}, ...]
 
-    Records are plain dicts: ``{"edid", "geosncl", "facility", "software"}``.
+    The SDK auto-paginates and returns a flat list, so these fakes return the
+    full list in one call.  Recorded kwargs are on ``.stream_calls`` /
+    ``.network_calls``.
     """
 
     def __init__(self):
-        self.datasource_pages: list = []
-        self.radial_records: list = []
-        self.datasource_calls: list = []
-        self.radial_calls: list = []
-        self._page_idx = 0
+        self.stream_records: list = []
+        self.network_records: list = []
+        self.stream_calls: list = []
+        self.network_calls: list = []
 
-    # -- mirrors DiscoverApi.find_stream_datasources -----------------------
-    def find_stream_datasources(self, **kwargs):
-        self.datasource_calls.append(kwargs)
-        if self._page_idx >= len(self.datasource_pages):
-            return _stream_datasource_page([], has_next=False)
-        records, has_next = self.datasource_pages[self._page_idx]
-        self._page_idx += 1
-        return _stream_datasource_page(records, has_next=has_next)
+    def list_stream_datasources(self, **kwargs):
+        self.stream_calls.append(kwargs)
+        return [_fake_stream(r) for r in self.stream_records]
 
-    # -- mirrors DiscoverApi.find_gnss_stations_radial ---------------------
-    def find_gnss_stations_radial(self, **kwargs):
-        self.radial_calls.append(kwargs)
-        return _radial_response(self.radial_records)
+    def list_network_datasources(self, **kwargs):
+        self.network_calls.append(kwargs)
+        return [_fake_network(r) for r in self.network_records]
 
 
 @pytest.fixture
 def fake_discover_api(monkeypatch):
-    """Replace ``station_list._make_api`` with a configurable fake.
+    """Replace ``station_list._discover()`` with a configurable fake.
 
-    Returns the ``FakeDiscoverApi`` instance so the test can set up replies
-    and later inspect the recorded call kwargs.
+    Returns the ``FakeDiscovery`` instance so the test can set up replies and
+    later inspect the recorded call kwargs.
     """
-    fake = FakeDiscoverApi()
-    monkeypatch.setattr(station_list, "_make_api", lambda token: fake)
+    fake = FakeDiscovery()
+    monkeypatch.setattr(station_list, "_discover", lambda: fake)
     return fake

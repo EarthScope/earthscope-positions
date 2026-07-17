@@ -5,6 +5,10 @@ import axios from 'axios';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import { useListDelete } from '../composables/useListDelete';
+import {
+  PROC_CENTERS, PROC_CENTER_DEFS, STREAM_TYPES, SOL_TYPE_LABELS,
+  DEFAULT_CENTER_CODES, DEFAULT_STREAM_TYPE_CODES,
+} from '../constants/streamTypes';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -16,26 +20,6 @@ interface StationData {
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
-
-const PROC_CENTERS: Record<string, string> = {
-  PB: 'EarthScope',
-  PW: 'CWU',
-  NC: 'USGS Menlo Park',
-  BK: 'UCB',
-  CI: 'USGS Pasadena',
-};
-
-const SOL_TYPE_LABELS: Record<string, string> = {
-  '00': 'CWU Fast',
-  '10': 'PIVOT Fast',
-  '12': 'PIVOT Complete',
-  '13': 'PIVOT Fast+Compl',
-  '20': 'RTNet Fast',
-  '30': 'Septa Fast',
-  '40': 'RTX Fast',
-  '50': 'Network Fast',
-  '60': 'JPL Fast',
-};
 
 const COLOR_UNSELECTED = '#9E9E9E';
 const COLOR_SELECTED   = '#1565C0';
@@ -63,8 +47,8 @@ const rectMode   = ref(false);
 const shiftHeld  = ref(false);
 
 // Filters (all = no filtering)
-const filterCenters   = ref<string[]>(Object.keys(PROC_CENTERS));
-const filterSolTypes  = ref<string[]>(Object.keys(SOL_TYPE_LABELS));
+const filterCenters   = ref<string[]>([...DEFAULT_CENTER_CODES]);
+const filterSolTypes  = ref<string[]>([...DEFAULT_STREAM_TYPE_CODES]);
 
 // Saved lists
 const listOptions    = ref<string[]>([]);
@@ -244,6 +228,35 @@ function selectNone() {
   activeStation.value = null;
 }
 
+// Number of selected stations that currently have no enabled (matching) stream.
+const unmatchedCount = computed(() => {
+  let n = 0;
+  for (const site of selectedStations.value) {
+    const station = stationMap.get(site);
+    if (!station || !station.streams.some(gs => enabledStreams.value.has(gs))) n++;
+  }
+  return n;
+});
+
+// Deselect every station that has no enabled stream (e.g. after filtering to a
+// stream type that most stations don't carry — the orange "no matching streams"
+// markers).
+function pruneUnmatched() {
+  const ss = new Set<string>();
+  for (const site of selectedStations.value) {
+    const station = stationMap.get(site);
+    if (station && station.streams.some(gs => enabledStreams.value.has(gs))) {
+      ss.add(site);
+    }
+  }
+  if (ss.size === selectedStations.value.size) return;
+  selectedStations.value = ss;
+  computeEnabledStreams();
+  pushHistory(ss);
+  updateAllMarkers();
+  activeStation.value = null;
+}
+
 function selectInBounds(bounds: L.LatLngBounds) {
   let ss = unionMode.value
     ? new Set(selectedStations.value)
@@ -278,7 +291,32 @@ function applyFilters() {
   updateAllMarkers();
 }
 
-const { confirmDeleteList } = useListDelete(loadListOptions);
+function _onListRenamed(oldName: string, newName: string) {
+  const i = selectedLists.value.indexOf(oldName);
+  if (i >= 0) {
+    const copy = [...selectedLists.value];
+    copy[i] = newName;
+    selectedLists.value = copy;   // triggers reload via the selectedLists watch
+  }
+  refreshStationData();
+}
+
+const { confirmDeleteList, promptRenameList } = useListDelete(loadListOptions, _onListRenamed);
+
+// Dialogs opened from inside the "Load lists" dropdown must be deferred a tick,
+// otherwise the select closing its menu on the same click dismisses them.
+function renameListAction(name: string) { setTimeout(() => promptRenameList(name), 0); }
+function deleteListAction(name: string) { setTimeout(() => confirmDeleteList(name), 0); }
+
+// Re-pull the station-builder dataset (union of all lists + downloaded) and
+// merge any newly-known stations (with coords) into the map so freshly-saved
+// lists render their markers.
+async function refreshStationData() {
+  try {
+    const r = await axios.get('/api/station-builder/data');
+    mergeStations(r.data.stations ?? []);
+  } catch { /* ignore */ }
+}
 
 // ── Load / Save ───────────────────────────────────────────────────────────────
 
@@ -468,6 +506,7 @@ onMounted(async () => {
   const [stationsRes] = await Promise.allSettled([
     axios.get('/api/station-builder/data'),
     loadListOptions(),
+    loadNetworks(),
   ]);
 
   if (stationsRes.status === 'fulfilled') {
@@ -497,7 +536,7 @@ interface SaLogEntry { text: string; isError: boolean; isDone: boolean }
 const saLog     = ref<SaLogEntry[]>([]);
 const saRunning = ref(false);
 
-async function _streamSaEndpoint(url: string) {
+async function _streamSaEndpoint(url: string, onSuccess?: () => Promise<void> | void) {
   saLog.value = [];
   saRunning.value = true;
   try {
@@ -519,7 +558,10 @@ async function _streamSaEndpoint(url: string) {
           const evt = JSON.parse(line.slice(5).trim());
           if (evt.type === 'done') {
             saLog.value.push({ text: evt.msg ?? 'Done.', isError: evt.code !== 0, isDone: true });
-            if (evt.code === 0) await loadListOptions();
+            if (evt.code === 0) {
+              await loadListOptions();
+              if (onSuccess) await onSuccess();
+            }
           } else {
             saLog.value.push({ text: evt.msg ?? '', isError: evt.type === 'error', isDone: false });
           }
@@ -539,6 +581,131 @@ function fetchShakealertDatasource() {
 
 function updateActiveFromNcedc() {
   _streamSaEndpoint('/api/station-lists/update-active-from-ncedc');
+}
+
+// ── All-streams list ────────────────────────────────────────────────────────
+// Paginated datasource query (stream_type=gnss_ppp only) → AllStreams.jsonl,
+// then make it the active list in Load Lists.
+function fetchAllStreams() {
+  _streamSaEndpoint('/api/station-lists/all-streams', async () => {
+    await refreshStationData();
+    selectedLists.value = ['all-streams'];
+  });
+}
+
+// ── Edit list (raw JSONL) ─────────────────────────────────────────────────────
+
+const editOpen     = ref(false);
+const editOrigName = ref('');
+const editName     = ref('');
+const editContent  = ref('');
+const editSaving   = ref(false);
+const editError    = ref('');
+
+const editLineCount = computed(() =>
+  editContent.value ? editContent.value.split('\n').filter(l => l.trim()).length : 0,
+);
+
+async function openEditList(name: string) {
+  editError.value = '';
+  editSaving.value = false;
+  try {
+    const r = await axios.get(`/api/station-lists/${encodeURIComponent(name)}/raw`);
+    editOrigName.value = name;
+    editName.value = name;
+    editContent.value = r.data.content ?? '';
+    editOpen.value = true;
+  } catch (e: unknown) {
+    const err = e as { response?: { data?: { error?: string } } };
+    $q.notify({ type: 'negative', message: err?.response?.data?.error ?? 'Could not open list' });
+  }
+}
+
+async function doSaveEdit(targetName: string) {
+  const name = String(targetName).trim();
+  if (!name) { editError.value = 'Name is required.'; return; }
+  editSaving.value = true;
+  editError.value = '';
+  try {
+    await axios.post(`/api/station-lists/${encodeURIComponent(name)}/raw`, { content: editContent.value });
+    $q.notify({ type: 'positive', message: `Saved ${name}.jsonl` });
+    await loadListOptions();
+    await refreshStationData();     // reflect edits/new list on the map
+    editOpen.value = false;
+    // If the saved list is currently loaded, refresh it onto the map.
+    if (selectedLists.value.includes(name)) loadFromSelectedLists(selectedLists.value);
+  } catch (e: unknown) {
+    const err = e as { response?: { data?: { error?: string } } };
+    editError.value = err?.response?.data?.error ?? 'Save failed.';
+  } finally {
+    editSaving.value = false;
+  }
+}
+
+// ── Network selection ───────────────────────────────────────────────────────
+
+const networkOptions  = ref<string[]>([]);
+const selectedNetwork = ref<string | null>(null);
+const networkLoading  = ref(false);
+const networkMsg      = ref('');
+
+async function loadNetworks() {
+  try {
+    const r = await axios.get('/api/station-builder/networks');
+    networkOptions.value = r.data.networks ?? [];
+  } catch {
+    networkOptions.value = [];
+  }
+}
+
+// Merge server-provided stations (with coords) into the map so freshly-loaded
+// streams — e.g. from Load Network — actually render, even if they aren't in
+// any saved list yet.
+function mergeStations(
+  list: { site: string; lat: number | null; lon: number | null; streams: string[] }[],
+) {
+  for (const s of list) {
+    const site = s.site.toUpperCase();
+    const existing = stationMap.get(site);
+    if (existing) {
+      if (s.streams?.length) {
+        existing.streams = [...new Set([...existing.streams, ...s.streams])].sort();
+      }
+      if ((existing.lat === null || existing.lon === null) && s.lat !== null && s.lon !== null) {
+        existing.lat = s.lat;
+        existing.lon = s.lon;
+        if (map && !markers.has(site)) addMarker(existing);
+      }
+    } else {
+      const data: StationData = { site, lat: s.lat, lon: s.lon, streams: [...(s.streams ?? [])] };
+      stations.value.push(data);
+      stationMap.set(site, data);
+      if (map && data.lat !== null && data.lon !== null) addMarker(data);
+    }
+  }
+}
+
+// Fetch all gnss_ppp streams in the chosen network, save them as a new list,
+// and make that list the active selection.
+async function loadNetwork() {
+  if (!selectedNetwork.value || networkLoading.value) return;
+  networkLoading.value = true;
+  networkMsg.value = 'Loading…';
+  try {
+    const r = await axios.post('/api/station-builder/load-network', null, {
+      params: { network: selectedNetwork.value },
+    });
+    const name = r.data.name as string;
+    await loadListOptions();       // include the newly-saved list
+    await refreshStationData();    // merge new stations so markers render
+    selectedLists.value = [name];  // becomes the active list (loads onto the map)
+    networkMsg.value = `Saved & loaded "${name}" (${r.data.count} streams)`;
+  } catch (e: unknown) {
+    const err = e as { response?: { data?: { error?: string } } };
+    networkMsg.value = err?.response?.data?.error ?? String(e);
+  } finally {
+    networkLoading.value = false;
+  }
 }
 </script>
 
@@ -563,14 +730,26 @@ function updateActiveFromNcedc() {
             <q-item-section>
               <q-item-label>{{ scope.opt }}</q-item-label>
             </q-item-section>
-            <q-menu context-menu>
-              <q-list dense style="min-width:140px">
-                <q-item clickable v-close-popup @click.stop="confirmDeleteList(scope.opt)">
-                  <q-item-section avatar><q-icon name="delete" color="negative" size="18px" /></q-item-section>
-                  <q-item-section>Delete</q-item-section>
-                </q-item>
-              </q-list>
-            </q-menu>
+            <!-- Inline per-list actions (reliable inside the select dropdown) -->
+            <q-item-section side>
+              <div class="row items-center no-wrap">
+                <q-btn flat dense round icon="drive_file_rename_outline" size="sm" color="grey-8"
+                       @click.stop.prevent="renameListAction(scope.opt)"
+                       @mousedown.stop.prevent>
+                  <q-tooltip>Rename</q-tooltip>
+                </q-btn>
+                <q-btn flat dense round icon="edit_note" size="sm" color="grey-8"
+                       @click.stop.prevent="openEditList(scope.opt)"
+                       @mousedown.stop.prevent>
+                  <q-tooltip>Edit JSONL</q-tooltip>
+                </q-btn>
+                <q-btn flat dense round icon="delete" size="sm" color="negative"
+                       @click.stop.prevent="deleteListAction(scope.opt)"
+                       @mousedown.stop.prevent>
+                  <q-tooltip>Delete</q-tooltip>
+                </q-btn>
+              </div>
+            </q-item-section>
           </q-item>
         </template>
       </q-select>
@@ -579,6 +758,16 @@ function updateActiveFromNcedc() {
 
       <q-btn flat dense size="sm" label="All"  color="primary" @click="selectAll" />
       <q-btn flat dense size="sm" label="None" color="grey-7"  @click="selectNone" />
+      <q-btn
+        flat dense size="sm"
+        :label="unmatchedCount ? `Prune ${unmatchedCount}` : 'Prune'"
+        color="deep-orange"
+        icon="filter_alt_off"
+        :disable="unmatchedCount === 0"
+        @click="pruneUnmatched"
+      >
+        <q-tooltip>Deselect stations with no matching (enabled) stream</q-tooltip>
+      </q-btn>
 
       <q-separator vertical class="q-mx-xs" />
 
@@ -618,45 +807,34 @@ function updateActiveFromNcedc() {
                      style="width:224px; border-right:1px solid #ddd; background:#fafafa">
         <div class="q-pa-sm">
 
-          <div class="text-caption text-grey-6 q-mb-sm" style="line-height:1.3">
-            Filters apply to selected stations' streams.
-            Click <strong>Apply</strong> to update counts.
-          </div>
-
-          <!-- Processing Center -->
-          <div class="text-overline text-grey-7 q-mt-xs q-mb-xs">Processing Center</div>
-          <div class="column q-gutter-none q-mb-sm">
-            <q-checkbox
-              v-for="[k, v] in Object.entries(PROC_CENTERS)" :key="k"
-              v-model="filterCenters" :val="k" dense size="sm"
-              :label="`${k} – ${v}`"
-            />
-          </div>
-
-          <!-- Stream Type (PPP solution + solution type combined) -->
-          <div class="text-overline text-grey-7 q-mb-xs">Stream Type</div>
-          <div class="column q-gutter-none q-mb-sm">
-            <q-checkbox
-              v-for="[k, v] in Object.entries(SOL_TYPE_LABELS)" :key="k"
-              v-model="filterSolTypes" :val="k" dense size="xs"
-              :label="`${k}: ${v}`"
-            />
-          </div>
-
-          <!-- Apply -->
-          <q-btn class="full-width q-mb-sm" size="sm" color="primary" unelevated
-                 label="Apply Filters" @click="applyFilters" />
+          <!-- All available streams (paginated gnss_ppp datasource query) -->
+          <q-btn class="full-width" size="sm" color="indigo" unelevated
+                 icon="cloud_download"
+                 label="All Streams → List"
+                 :disable="saRunning"
+                 @click="fetchAllStreams">
+            <q-tooltip>Query every gnss_ppp stream, save all-streams.jsonl, and load it</q-tooltip>
+          </q-btn>
 
           <q-separator class="q-my-sm" />
 
-          <!-- Save section -->
-          <div class="text-overline text-grey-7 q-mb-xs">Save List</div>
-          <q-input v-model="listName" label="List name" dense outlined
-                   class="q-mb-sm" clearable />
-          <q-btn class="full-width" size="sm" color="positive" unelevated
-                 label="Save"
-                 :disable="!listName.trim() || streamCount === 0"
-                 @click="saveList" />
+          <!-- Network selection -->
+          <div class="text-overline text-grey-7 q-mb-xs">Load Network</div>
+          <q-select
+            v-model="selectedNetwork"
+            :options="networkOptions"
+            label="Network"
+            dense outlined clearable
+            class="q-mb-sm"
+            :loading="!networkOptions.length"
+          />
+          <q-btn class="full-width" size="sm" color="primary" unelevated
+                 icon="hub"
+                 label="Load Network"
+                 :disable="!selectedNetwork || networkLoading"
+                 :loading="networkLoading"
+                 @click="loadNetwork" />
+          <div v-if="networkMsg" class="text-caption text-grey-7 q-mt-xs">{{ networkMsg }}</div>
 
           <q-separator class="q-my-sm" />
 
@@ -678,6 +856,43 @@ function updateActiveFromNcedc() {
               :class="e.isError ? 'text-negative' : e.isDone ? 'text-positive text-weight-medium' : 'text-grey-8'"
             >{{ e.text }}</div>
           </div>
+
+          <q-separator class="q-my-sm" />
+
+          <!-- Filtering (map display + manual selection) -->
+          <div class="text-overline text-grey-7 q-mb-xs">Filtering</div>
+
+          <div class="text-overline text-grey-6 q-mt-xs q-mb-xs" style="font-size:0.65rem">Processing Center</div>
+          <div class="column q-gutter-none q-mb-sm">
+            <q-checkbox
+              v-for="c in PROC_CENTER_DEFS" :key="c.code"
+              v-model="filterCenters" :val="c.code" dense size="sm"
+              :label="`${c.code} – ${c.label}`"
+            />
+          </div>
+
+          <div class="text-overline text-grey-6 q-mb-xs" style="font-size:0.65rem">Stream Type</div>
+          <div class="column q-gutter-none q-mb-sm">
+            <q-checkbox
+              v-for="st in STREAM_TYPES" :key="st.code"
+              v-model="filterSolTypes" :val="st.code" dense size="xs"
+              :label="`${st.code}: ${st.label}`"
+            />
+          </div>
+
+          <q-btn class="full-width q-mb-sm" size="sm" color="primary" unelevated
+                 label="Apply Filters" @click="applyFilters" />
+
+          <q-separator class="q-my-sm" />
+
+          <!-- Save current selection as a list -->
+          <div class="text-overline text-grey-7 q-mb-xs">Save List</div>
+          <q-input v-model="listName" label="List name" dense outlined
+                   class="q-mb-sm" clearable />
+          <q-btn class="full-width" size="sm" color="positive" unelevated
+                 label="Save"
+                 :disable="!listName.trim() || streamCount === 0"
+                 @click="saveList" />
 
           <q-separator class="q-my-sm" />
 
@@ -776,6 +991,60 @@ function updateActiveFromNcedc() {
 
       </div>
     </div>
+
+    <!-- ── Edit list JSONL (full-screen) ─────────────────────────────────────── -->
+    <q-dialog v-model="editOpen" maximized>
+      <q-card class="column no-wrap">
+        <q-card-section class="row items-center q-py-sm bg-primary text-white">
+          <q-icon name="edit_note" class="q-mr-sm" />
+          <div class="text-subtitle1">Edit station list</div>
+          <q-space />
+          <q-input
+            v-model="editName"
+            dense outlined dark
+            label="List name"
+            style="width: 280px"
+            :suffix="'.jsonl'"
+          />
+          <q-btn flat round dense icon="close" class="q-ml-sm" v-close-popup :disable="editSaving" />
+        </q-card-section>
+
+        <q-banner v-if="editError" dense class="bg-red-1 text-negative">
+          {{ editError }}
+        </q-banner>
+
+        <q-card-section class="col q-pa-none" style="min-height:0">
+          <q-input
+            v-model="editContent"
+            type="textarea"
+            outlined
+            class="edit-jsonl fit"
+            input-class="edit-jsonl-input"
+            :disable="editSaving"
+          />
+        </q-card-section>
+
+        <q-separator />
+        <q-card-actions align="right" class="q-pa-md">
+          <div class="text-caption text-grey-6 q-mr-auto">
+            {{ editLineCount }} line(s) ·
+            <template v-if="editName.trim() && editName.trim() !== editOrigName">
+              saving as <b>{{ editName.trim() }}.jsonl</b>
+            </template>
+            <template v-else>
+              editing <b>{{ editOrigName }}.jsonl</b>
+            </template>
+          </div>
+          <q-btn flat no-caps label="Cancel" v-close-popup :disable="editSaving" />
+          <q-btn
+            no-caps unelevated color="primary" label="Save"
+            :loading="editSaving"
+            :disable="!editName.trim()"
+            @click="doSaveEdit(editName.trim())"
+          />
+        </q-card-actions>
+      </q-card>
+    </q-dialog>
   </q-page>
 </template>
 
@@ -787,6 +1056,26 @@ function updateActiveFromNcedc() {
   border: 1px solid #fff;
   box-shadow: 0 0 0 1px #aaa;
   flex-shrink: 0;
+}
+.filter-note {
+  font-size: 0.72rem;
+  line-height: 1.3;
+  padding: 6px 8px;
+  min-height: unset;
+}
+.edit-jsonl {
+  height: 100%;
+}
+.edit-jsonl :deep(.q-field__control),
+.edit-jsonl :deep(.q-field__control-container) {
+  height: 100%;
+}
+.edit-jsonl :deep(.edit-jsonl-input) {
+  height: 100% !important;
+  font-family: monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  resize: none;
 }
 .sa-log {
   font-family: monospace;

@@ -235,7 +235,12 @@
                 <q-icon name="insert_drive_file" color="positive" size="18px" />
               </q-item-section>
               <q-item-section>
-                <q-item-label class="text-caption">{{ f.label }}</q-item-label>
+                <q-item-label class="text-caption">
+                  <router-link
+                    :to="{ path: '/plots', query: { path: f.path } }"
+                    class="plot-link"
+                  >{{ f.label }}</router-link>
+                </q-item-label>
                 <q-item-label caption class="mono">{{ f.path }}</q-item-label>
               </q-item-section>
             </q-item>
@@ -252,6 +257,10 @@ import { ref, computed, onMounted, watch, nextTick } from "vue";
 import { usePpsdJob } from "../composables/usePpsdJob";
 import { useSharedControls } from "../composables/useSharedControls";
 import { useListDelete } from "../composables/useListDelete";
+import {
+  solTypeLabel, sortSolTypes, defaultSelectedCenters, defaultSelectedStreamTypes,
+  SOL_TYPE_LABELS, PROC_CENTERS,
+} from "../constants/streamTypes";
 import type { PpsdMode } from "../types";
 
 const { selectedLists, startDate, endDate, dateRange } = useSharedControls();
@@ -261,19 +270,6 @@ const {
   progressCurrent, progressTotal, completedFiles,
   getCancel, setCancel, clearCancel,
 } = usePpsdJob();
-
-// ── Label helpers ──────────────────────────────────────────────────────────
-
-const SOL_LABELS: Record<string, string> = {
-  "0": "CWU", "1": "PIVOT", "2": "RTNet", "3": "Septa", "4": "RTX", "5": "Net", "6": "JPL",
-};
-const TYPE_LABELS: Record<string, string> = {
-  "0": "Fast", "1": "RTK", "2": "Compl", "3": "F+C",
-};
-
-function solTypeLabel(code: string): string {
-  return `${SOL_LABELS[code[0]] ?? code[0]} ${TYPE_LABELS[code[1]] ?? (code[1] ?? "")}`.trim();
-}
 
 // ── State ──────────────────────────────────────────────────────────────────
 
@@ -304,10 +300,10 @@ async function fetchFilterOptions() {
     if (!res.ok) return;
     const data = await res.json();
     availableCenters.value  = data.centers  ?? [];
-    availableSolTypes.value = data.sol_types ?? [];
-    // All selected by default
-    filterCenters.value  = [...availableCenters.value];
-    filterSolTypes.value = [...availableSolTypes.value];
+    availableSolTypes.value = sortSolTypes(data.sol_types ?? []);
+    // Selected per the default-selected flags in constants/streamTypes.ts
+    filterCenters.value  = defaultSelectedCenters(availableCenters.value);
+    filterSolTypes.value = defaultSelectedStreamTypes(availableSolTypes.value);
   } catch { /* ignore */ }
 }
 
@@ -389,6 +385,9 @@ async function runPpsd(mode: PpsdMode) {
     params.set("sol_types", filterSolTypes.value.join(","));
   if (filterCenters.value.length < availableCenters.value.length)
     params.set("centers", filterCenters.value.join(","));
+  // Pass the stream-type / center enumeration labels so output filenames use them.
+  params.set("sol_labels", JSON.stringify(SOL_TYPE_LABELS));
+  params.set("center_labels", JSON.stringify(PROC_CENTERS));
 
   const controller = new AbortController();
   setCancel(() => controller.abort());
@@ -465,5 +464,13 @@ async function runPpsd(mode: PpsdMode) {
 .mono {
   font-family: monospace;
   font-size: 0.75rem;
+}
+.plot-link {
+  color: var(--q-primary);
+  text-decoration: none;
+  cursor: pointer;
+}
+.plot-link:hover {
+  text-decoration: underline;
 }
 </style>

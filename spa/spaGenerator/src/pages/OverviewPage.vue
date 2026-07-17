@@ -62,6 +62,19 @@ const pages = [
     ],
   },
   {
+    route: "/fetch-data",
+    label: "Fetch Data",
+    icon: "cloud_download",
+    color: "cyan",
+    description:
+      "Download GNSS position data for your station lists — a guided, three-step walkthrough (choose lists → date range & filters → fetch) with a live progress bar and log.",
+    tips: [
+      "Only missing (station, day) pairs are downloaded; existing or previously-attempted data is skipped.",
+      "Optionally narrow by processing center or stream type before fetching.",
+      "Only one fetch runs at a time — you can switch tabs and it keeps going.",
+    ],
+  },
+  {
     route: "/completeness",
     label: "Completeness & Latency",
     icon: "grid_on",
@@ -109,6 +122,19 @@ const pages = [
     tips: [
       "Click a folder caret to expand it — children are loaded on first open.",
       "Click an image name to display it in the viewer panel.",
+    ],
+  },
+  {
+    route: "/export",
+    label: "Export",
+    icon: "sync_alt",
+    color: "brown",
+    description:
+      "Convert downloaded Arrow position data into MiniSEED or GeoJSON files. Edit the output path-spec (directory structure & filenames) and regenerate on demand.",
+    tips: [
+      "Choose MiniSEED or GeoJSON (compact / full / both) and a station list + date range.",
+      "Edit the path-spec TOML in the editor, Save spec, then Convert to remake files.",
+      "Enable overwrite to regenerate files that already exist under the new layout.",
     ],
   },
   {

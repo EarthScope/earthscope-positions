@@ -51,8 +51,8 @@
                 dense
                 outlined
                 class="col"
-                mask="####-##-##T##:##"
-                placeholder="YYYY-MM-DDTHH:MM"
+                mask="####-##-##T##:##:##"
+                placeholder="YYYY-MM-DDTHH:MM:SS"
                 :disable="isActive"
               />
               <q-input
@@ -61,8 +61,8 @@
                 dense
                 outlined
                 class="col"
-                mask="####-##-##T##:##"
-                placeholder="YYYY-MM-DDTHH:MM"
+                mask="####-##-##T##:##:##"
+                placeholder="YYYY-MM-DDTHH:MM:SS"
                 :disable="isActive"
               />
               <q-btn flat dense round icon="date_range" size="sm" class="self-center" :disable="isActive">
@@ -131,6 +131,37 @@
                 dense
                 :disable="isActive"
               />
+            </div>
+            <div class="row items-center">
+              <q-toggle
+                v-model="selectByArrival"
+                label="Select by arrival time"
+                dense
+                :disable="isActive || !applyLatency"
+              />
+              <q-icon name="help_outline" size="16px" color="grey-6" class="q-ml-xs">
+                <q-tooltip max-width="320px">
+                  Windows the replay by <b>arrival</b> time (data time + latency) instead of
+                  data time. Reads ~30&nbsp;s before the start so late records that would have
+                  arrived inside the window are included, and drops records that would have
+                  arrived after the stop. Requires “Apply latency”.
+                </q-tooltip>
+              </q-icon>
+            </div>
+            <q-select
+              v-model="outputFormat"
+              :options="OUTPUT_FORMAT_OPTIONS"
+              label="Message format"
+              dense
+              outlined
+              emit-value
+              map-options
+              :disable="isActive"
+            />
+            <div class="text-caption text-grey-6">
+              {{ outputFormat === 'geojson'
+                 ? 'One GeoJSON Feature per sample.'
+                 : 'Compact one-line record per sample.' }}
             </div>
 
             <q-separator class="q-my-xs" />
@@ -211,7 +242,7 @@
                   <div class="text-caption text-grey-6">Total messages</div>
                 </div>
                 <div>
-                  <div class="text-h5">{{ replayState.files?.length ?? 0 }}</div>
+                  <div class="text-h5">{{ replayState.files_count ?? replayState.files?.length ?? 0 }}</div>
                   <div class="text-caption text-grey-6">Arrow files</div>
                 </div>
                 <div v-if="replayState.config">
@@ -325,6 +356,10 @@
                   <div class="text-h5">{{ sendRate }}/s</div>
                   <div class="text-caption text-grey-6">Send rate</div>
                 </div>
+                <div v-if="replayState.startup_delay_ms != null">
+                  <div class="text-h5">{{ replayState.startup_delay_ms }} ms</div>
+                  <div class="text-caption text-grey-6">Startup delay (Go→write)</div>
+                </div>
               </div>
 
               <!-- Data time row -->
@@ -405,6 +440,9 @@
                   <div class="text-subtitle1 text-weight-medium">Replay Complete</div>
                   <div class="text-caption text-grey-6">
                     {{ fmtNum(replayState.sent) }} messages sent in {{ fmtElapsed(replayState.elapsed_ms) }}
+                    <span v-if="replayState.startup_delay_ms != null">
+                      · startup delay {{ replayState.startup_delay_ms }} ms
+                    </span>
                   </div>
                 </div>
               </div>
@@ -425,6 +463,12 @@
                   <div class="text-subtitle1 text-weight-medium">Replay Canceled</div>
                   <div class="text-caption text-grey-6">
                     {{ fmtNum(replayState.sent) }} messages sent before cancel
+                    <span v-if="replayState.startup_delay_ms != null">
+                      · startup delay {{ replayState.startup_delay_ms }} ms
+                    </span>
+                    <span v-if="replayState.cancel_delay_ms != null">
+                      · stop took {{ replayState.cancel_delay_ms }} ms
+                    </span>
                   </div>
                 </div>
               </div>
@@ -452,6 +496,69 @@
             </q-card-actions>
           </q-card>
         </template>
+
+        <!-- ── Delivery check (read-back consumer) ─────────────────────────── -->
+        <q-card
+          v-if="replayState.consumer_read !== undefined &&
+                ['running','starting','done','canceled','error'].includes(replayStatus)"
+          flat bordered class="q-mb-md"
+          :class="deliveryClass"
+        >
+          <q-card-section class="q-pb-xs row items-center">
+            <div class="text-subtitle2 text-weight-medium">Delivery check</div>
+            <q-space />
+            <q-icon :name="deliveryIcon" :color="deliveryColor" size="20px" />
+          </q-card-section>
+          <q-separator />
+          <q-card-section>
+            <div class="row q-gutter-md">
+              <div>
+                <div class="text-h6">{{ fmtNum(replayState.sent) }}</div>
+                <div class="text-caption text-grey-6">Written</div>
+              </div>
+              <div>
+                <div class="text-h6">{{ fmtNum(replayState.consumer_read) }}</div>
+                <div class="text-caption text-grey-6">Read back</div>
+              </div>
+              <div>
+                <div class="text-h6" :class="matchedClass">
+                  {{ fmtNum(replayState.consumer_matched) }} / {{ fmtNum(replayState.sent) }}
+                </div>
+                <div class="text-caption text-grey-6">Matched</div>
+              </div>
+              <div>
+                <div class="text-h6">{{ meanRt }}</div>
+                <div class="text-caption text-grey-6">Mean round-trip</div>
+              </div>
+            </div>
+            <div
+              v-if="replayState.consumer_message"
+              class="q-mt-sm text-caption"
+              :class="deliveryColor === 'negative' ? 'text-negative' : 'text-orange-9'"
+            >{{ replayState.consumer_message }}</div>
+          </q-card-section>
+        </q-card>
+
+        <!-- ── Live status log (visible across preload/replay/terminal states) ── -->
+        <q-card v-if="replayState.log?.length" flat bordered class="q-mb-md">
+          <q-card-section class="q-pb-xs row items-center">
+            <div class="text-subtitle2 text-weight-medium">Status log</div>
+            <q-space />
+            <q-btn flat dense round icon="content_copy" size="sm" @click="copyLog">
+              <q-tooltip>Copy log</q-tooltip>
+            </q-btn>
+          </q-card-section>
+          <q-separator />
+          <q-card-section class="q-pt-sm">
+            <div ref="logEl" class="replay-log q-pa-sm rounded-borders">
+              <div
+                v-for="(l, i) in replayState.log"
+                :key="i"
+                :style="{ color: logColor(l.level) }"
+              ><span class="log-ts">{{ fmtLogTs(l.ts) }}</span> {{ l.msg }}</div>
+            </div>
+          </q-card-section>
+        </q-card>
 
       </div>
     </div>
@@ -529,30 +636,22 @@ import {
   replayCancel,
   replayReset,
   openFetchMissingStream,
+  getServerConfig,
 } from "../api";
 import type { ReplayState, FetchEvent } from "../types";
 import { useListDelete } from "../composables/useListDelete";
+import {
+  PROC_CENTERS, STREAM_TYPE_CODES, solTypeLabel, sortSolTypes,
+  defaultSelectedCenters, defaultSelectedStreamTypes,
+} from "../constants/streamTypes";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const ALL_CENTERS   = ["PB", "PW", "NC", "BK", "CI"];
-const ALL_SOL_TYPES = ["00", "10", "12", "13", "20", "30", "40", "60"];
+const ALL_CENTERS   = Object.keys(PROC_CENTERS);
+const ALL_SOL_TYPES = [...STREAM_TYPE_CODES];
 
 const DEFAULT_BOOTSTRAP = "localhost:9092";
 const DEFAULT_TOPIC     = "protected.gnss.positions.shakealert.geojson.compact";
-
-// ─── Label helpers ────────────────────────────────────────────────────────────
-
-const SOL_LABELS: Record<string, string> = {
-  "0": "CWU", "1": "PIVOT", "2": "RTNet", "3": "Septa", "4": "RTX", "5": "Net", "6": "JPL",
-};
-const TYPE_LABELS: Record<string, string> = {
-  "0": "Fast", "1": "RTK", "2": "Compl", "3": "F+C",
-};
-
-function solTypeLabel(code: string): string {
-  return `${SOL_LABELS[code[0]] ?? code[0]} ${TYPE_LABELS[code[1]] ?? (code[1] ?? "")}`.trim();
-}
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
@@ -571,6 +670,12 @@ const filterSolTypes    = ref<string[]>([]);
 
 const timeScale    = ref(1.0);
 const applyLatency = ref(true);
+const selectByArrival = ref(false);
+const outputFormat = ref<"compact" | "geojson">("compact");
+const OUTPUT_FORMAT_OPTIONS = [
+  { label: "Compact GeoJSON", value: "compact" },
+  { label: "GeoJSON (Feature per sample)", value: "geojson" },
+];
 const bootstrapServer = ref(DEFAULT_BOOTSTRAP);
 const topic        = ref(DEFAULT_TOPIC);
 
@@ -580,7 +685,14 @@ const replayStatus = computed(() => replayState.value.status);
 // Chart
 const chartCanvas  = ref<HTMLCanvasElement | null>(null);
 let   chart: ChartType | null = null;
-const chartPoints  = ref<{ x: number; y: number }[]>([]); // x=elapsed_s, y=sent
+let   chartIniting = false;
+// IMPORTANT: chart data is a PLAIN, non-reactive array.  Passing a Vue reactive
+// array/ref to Chart.js makes Chart.js write internal metadata (`_meta`, parsed
+// values, …) onto reactive objects, which retriggers Vue's reactivity on every
+// frame — a feedback loop that pegs the main thread and freezes the whole page
+// (the "something fundamentally blocking the webpage" symptom).  Keep it raw.
+let   chartData: { x: number; y: number }[] = []; // x=elapsed_s, y=sent
+const sendRate  = ref<string | null>(null);
 
 // Fetch dialog
 const fetchOpen    = ref(false);
@@ -590,8 +702,14 @@ const fetchWorkers = ref(10);
 const fetchLog     = ref<FetchEvent[]>([]);
 const fetchLogEl   = ref<HTMLElement | null>(null);
 
-// Polling
-let pollTimer: ReturnType<typeof setInterval> | null = null;
+// Status-log panel
+const logEl        = ref<HTMLElement | null>(null);
+
+// Polling — a self-rescheduling setTimeout chain (not setInterval) so requests
+// never overlap and a hung request can't silently pile up and stall the UI.
+let pollTimer: ReturnType<typeof setTimeout> | null = null;
+let pollAbort: AbortController | null = null;
+let pollStopped = true;
 
 // ─── Computed ─────────────────────────────────────────────────────────────────
 
@@ -604,8 +722,8 @@ const isRunning = computed(() =>
 
 const canPreload = computed(() =>
   selectedLists.value.length > 0
-  && startDate.value.length === 16   // YYYY-MM-DDTHH:MM
-  && stopDate.value.length === 16
+  && startDate.value.length >= 16   // YYYY-MM-DDTHH:MM (16) or …:SS (19)
+  && stopDate.value.length >= 16
 );
 
 const progressFraction = computed(() => {
@@ -619,18 +737,49 @@ const progressPct = computed(() => {
   return `${(progressFraction.value * 100).toFixed(1)}%  (${fmtNum(replayState.value.sent ?? 0)} / ${fmtNum(replayState.value.total_messages)})`;
 });
 
-const sendRate = computed<string | null>(() => {
-  if (chartPoints.value.length < 2) return null;
-  const last  = chartPoints.value[chartPoints.value.length - 1];
-  const prev  = chartPoints.value[Math.max(0, chartPoints.value.length - 6)];
-  const dt    = last.x - prev.x;
-  const ds    = last.y - prev.y;
-  if (dt <= 0) return null;
-  return fmtNum(Math.round(ds / dt));
+// Recompute the recent send rate from the raw (non-reactive) chart data and
+// publish it via a ref (called from applyStatus, not a computed, because
+// chartData is intentionally non-reactive).
+function computeSendRate() {
+  if (chartData.length < 2) { sendRate.value = null; return; }
+  const last = chartData[chartData.length - 1];
+  const prev = chartData[Math.max(0, chartData.length - 6)];
+  const dt = last.x - prev.x;
+  const ds = last.y - prev.y;
+  sendRate.value = dt > 0 ? fmtNum(Math.round(ds / dt)) : null;
+}
+
+// ── Delivery check (read-back consumer) ──────────────────────────────────────
+const deliveryColor = computed(() => {
+  const s = replayState.value.consumer_status;
+  return s === "error" ? "negative" : s === "warn" ? "warning" : "positive";
+});
+const deliveryIcon = computed(() => {
+  const s = replayState.value.consumer_status;
+  return s === "error" ? "error" : s === "warn" ? "warning" : "check_circle";
+});
+const deliveryClass = computed(() => {
+  const s = replayState.value.consumer_status;
+  return s === "error" ? "bg-red-1" : s === "warn" ? "bg-orange-1" : "";
+});
+const matchedClass = computed(() => {
+  const written = replayState.value.sent ?? 0;
+  const matched = replayState.value.consumer_matched ?? 0;
+  if (!written) return "";
+  return matched >= written ? "text-positive" : "text-orange-9";
+});
+const meanRt = computed(() => {
+  const rt = replayState.value.consumer_mean_rt_ms;
+  return typeof rt === "number" ? `${rt.toFixed(1)} ms` : "—";
 });
 
+// Server-provided base URL (from `--hostname`), used for the callback curl
+// commands so they work when the server runs on a remote machine.  Falls back
+// to the browser's origin.
+const serverBase = ref("");
 const origin = computed(() =>
-  typeof window !== "undefined" ? window.location.origin : "http://localhost:8000"
+  serverBase.value
+  || (typeof window !== "undefined" ? window.location.origin : "http://localhost:8000")
 );
 const curlGo = computed(() =>
   `curl -X POST ${origin.value}/api/replay/start`
@@ -673,17 +822,49 @@ function toggleItem(list: string[], item: string): void {
   else list.push(item);
 }
 
-function onRangeSelect(val: { from: string; to: string } | null) {
-  if (!val?.from || !val?.to) return;
-  // Preserve existing time component if already entered; otherwise default to T00:00/T23:59
-  const existStart = startDate.value.slice(11) || "00:00";
-  const existStop  = stopDate.value.slice(11)  || "23:59";
-  startDate.value = val.from + "T" + existStart;
-  stopDate.value  = val.to   + "T" + existStop;
+function onRangeSelect(val: { from: string; to: string } | string | null) {
+  if (!val) return;
+  // Quasar's range q-date emits a plain string for a single-day pick and a
+  // {from, to} object for a multi-day range. Support both so the same day can be
+  // selected once (from === to).
+  const from = typeof val === "string" ? val : val.from;
+  const to   = typeof val === "string" ? val : val.to;
+  if (!from || !to) return;
+  // Preserve existing time component if already entered; otherwise default to
+  // 00:00:00 → 23:59:59 (seconds precision).
+  const existStart = startDate.value.slice(11) || "00:00:00";
+  const existStop  = stopDate.value.slice(11)  || "23:59:59";
+  startDate.value = from + "T" + existStart;
+  stopDate.value  = to   + "T" + existStop;
 }
 
 async function copy(text: string) {
   try { await navigator.clipboard.writeText(text); } catch { /* ignore */ }
+}
+
+// ─── Status log ─────────────────────────────────────────────────────────────
+
+function logColor(level: string): string {
+  if (level === "error") return "#ef9a9a";
+  if (level === "warn")  return "#ffcc80";
+  return "#e0e0e0";
+}
+
+function fmtLogTs(ms: number): string {
+  return new Date(ms).toISOString().slice(11, 19); // HH:MM:SS
+}
+
+function scrollLogToBottom() {
+  nextTick(() => {
+    if (logEl.value) logEl.value.scrollTop = logEl.value.scrollHeight;
+  });
+}
+
+async function copyLog() {
+  const lines = (replayState.value.log ?? [])
+    .map((l) => `${fmtLogTs(l.ts)} ${l.msg}`)
+    .join("\n");
+  await copy(lines);
 }
 
 // ─── Station lists ────────────────────────────────────────────────────────────
@@ -709,121 +890,169 @@ async function fetchFilterOptions() {
     if (!res.ok) {
       availableCenters.value  = ALL_CENTERS;
       availableSolTypes.value = ALL_SOL_TYPES;
-      filterCenters.value     = [...ALL_CENTERS];
-      filterSolTypes.value    = [...ALL_SOL_TYPES];
+      filterCenters.value     = defaultSelectedCenters(ALL_CENTERS);
+      filterSolTypes.value    = defaultSelectedStreamTypes(ALL_SOL_TYPES);
       return;
     }
     const data = await res.json();
     availableCenters.value  = data.centers?.length  ? data.centers  : ALL_CENTERS;
-    availableSolTypes.value = data.sol_types?.length ? data.sol_types : ALL_SOL_TYPES;
-    filterCenters.value  = [...availableCenters.value];
-    filterSolTypes.value = [...availableSolTypes.value];
+    availableSolTypes.value = sortSolTypes(data.sol_types?.length ? data.sol_types : ALL_SOL_TYPES);
+    filterCenters.value  = defaultSelectedCenters(availableCenters.value);
+    filterSolTypes.value = defaultSelectedStreamTypes(availableSolTypes.value);
   } catch {
     availableCenters.value  = ALL_CENTERS;
     availableSolTypes.value = ALL_SOL_TYPES;
-    filterCenters.value     = [...ALL_CENTERS];
-    filterSolTypes.value    = [...ALL_SOL_TYPES];
+    filterCenters.value     = defaultSelectedCenters(ALL_CENTERS);
+    filterSolTypes.value    = defaultSelectedStreamTypes(ALL_SOL_TYPES);
   }
 }
 
 // ─── Polling ──────────────────────────────────────────────────────────────────
 
+const ACTIVE_STATES = ["preloading", "preloaded", "running", "starting"];
+
 function startPolling() {
-  if (pollTimer !== null) return;
-  pollTimer = setInterval(poll, 1000);
+  if (!pollStopped) return;
+  pollStopped = false;
+  scheduleNextPoll(0);
 }
 
 function stopPolling() {
+  pollStopped = true;
   if (pollTimer !== null) {
-    clearInterval(pollTimer);
+    clearTimeout(pollTimer);
     pollTimer = null;
+  }
+  if (pollAbort) {
+    pollAbort.abort();
+    pollAbort = null;
   }
 }
 
-async function poll() {
-  try {
-    const s = await getReplayStatus();
-    const prev = replayState.value.status;
-    replayState.value = s;
+function scheduleNextPoll(delayMs: number) {
+  if (pollStopped) return;
+  pollTimer = setTimeout(runPoll, delayMs);
+}
 
-    if (s.status === "running" || s.status === "starting") {
-      const sent    = s.sent ?? 0;
-      const elapsed = s.elapsed_ms ?? 0;
-      chartPoints.value.push({ x: elapsed / 1000, y: sent });
+/** Fetch status with a hard timeout so a stalled request can never hang the
+ *  poll loop (that was the cause of the "updates once then freezes" symptom). */
+async function fetchStatusWithTimeout(ms: number): Promise<ReplayState> {
+  pollAbort = new AbortController();
+  const t = setTimeout(() => pollAbort?.abort(), ms);
+  try {
+    const r = await fetch("/api/replay/status", {
+      signal: pollAbort.signal,
+      headers: { "Cache-Control": "no-cache" },
+    });
+    return (await r.json()) as ReplayState;
+  } finally {
+    clearTimeout(t);
+    pollAbort = null;
+  }
+}
+
+/** Apply a status payload to reactive state.  Chart updates are isolated so a
+ *  chart error (e.g. a failed chart.js chunk import) can never break polling. */
+function applyStatus(s: ReplayState) {
+  const prevLogLen = replayState.value.log?.length ?? 0;
+  replayState.value = s;
+  if ((s.log?.length ?? 0) !== prevLogLen) scrollLogToBottom();
+
+  if (s.status === "running" || s.status === "starting") {
+    try {
+      chartData.push({ x: (s.elapsed_ms ?? 0) / 1000, y: s.sent ?? 0 });
+      computeSendRate();
       updateChart();
       // Chart may not exist yet if the replay was started externally via curl.
-      if (!chart) {
-        await nextTick();
-        initChart();
-      }
-    }
+      if (!chart) nextTick().then(initChart).catch(() => { /* ignore */ });
+    } catch { /* never let chart errors stop the poll loop */ }
+  }
+}
 
-    // Keep polling while preloaded so we detect an external curl-start.
-    if (!["preloading", "preloaded", "running", "starting"].includes(s.status)) {
-      stopPolling();
-    }
-  } catch { /* swallow network errors */ }
+async function runPoll() {
+  if (pollStopped) return;
+  let keepGoing = true;
+  try {
+    const s = await fetchStatusWithTimeout(5000);
+    applyStatus(s);
+    keepGoing = ACTIVE_STATES.includes(s.status);
+  } catch {
+    // Network error / timeout / abort — keep polling; a transient blip must not
+    // permanently stall the live display.
+    keepGoing = true;
+  } finally {
+    if (keepGoing && !pollStopped) scheduleNextPoll(1000);
+    else stopPolling();
+  }
 }
 
 // ─── Chart.js ────────────────────────────────────────────────────────────────
 
 async function initChart() {
-  if (!chartCanvas.value) return;
-  if (chart) { chart.destroy(); chart = null; }
+  // Guard re-entrancy: initChart is triggered from both the canvas watcher and
+  // the poll loop, which could otherwise `new Chart()` the same canvas twice.
+  if (!chartCanvas.value || chartIniting) return;
+  chartIniting = true;
+  try {
+    if (chart) { chart.destroy(); chart = null; }
 
-  const { Chart, LineController, LineElement, PointElement, LinearScale, Title, Tooltip } =
-    await import("chart.js");
+    const { Chart, LineController, LineElement, PointElement, LinearScale, Title, Tooltip } =
+      await import("chart.js");
 
-  // Component may have unmounted while the dynamic import was in flight.
-  if (!chartCanvas.value) return;
+    // Component may have unmounted while the dynamic import was in flight.
+    if (!chartCanvas.value) return;
 
-  Chart.register(LineController, LineElement, PointElement, LinearScale, Title, Tooltip);
+    Chart.register(LineController, LineElement, PointElement, LinearScale, Title, Tooltip);
 
-  chart = new Chart(chartCanvas.value, {
-    type: "line",
-    data: {
-      datasets: [{
-        label: "Messages sent",
-        data: chartPoints.value,
-        borderColor: "#21ba45",
-        backgroundColor: "rgba(33,186,69,0.08)",
-        borderWidth: 1.5,
-        pointRadius: 0,
-        tension: 0.3,
-        fill: true,
-      }],
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      animation: false,
-      plugins: { legend: { display: false } },
-      scales: {
-        x: {
-          type: "linear",
-          title: { display: true, text: "Elapsed (s)", font: { size: 10 } },
-          ticks: { maxTicksLimit: 8 },
-        },
-        y: {
-          type: "linear",
-          title: { display: true, text: "Sent", font: { size: 10 } },
-          ticks: { maxTicksLimit: 6 },
+    chart = new Chart(chartCanvas.value, {
+      type: "line",
+      data: {
+        datasets: [{
+          label: "Messages sent",
+          data: chartData,
+          borderColor: "#21ba45",
+          backgroundColor: "rgba(33,186,69,0.08)",
+          borderWidth: 1.5,
+          pointRadius: 0,
+          tension: 0.3,
+          fill: true,
+        }],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: false,
+        plugins: { legend: { display: false } },
+        scales: {
+          x: {
+            type: "linear",
+            title: { display: true, text: "Elapsed (s)", font: { size: 10 } },
+            ticks: { maxTicksLimit: 8 },
+          },
+          y: {
+            type: "linear",
+            title: { display: true, text: "Sent", font: { size: 10 } },
+            ticks: { maxTicksLimit: 6 },
+          },
         },
       },
-    },
-  }) as ChartType;
+    }) as ChartType;
+  } finally {
+    chartIniting = false;
+  }
 }
 
 function updateChart() {
   if (!chart) return;
-  (chart.data.datasets[0] as any).data = chartPoints.value;
+  (chart.data.datasets[0] as any).data = chartData;
   chart.update("none");
 }
 
 // ─── Replay actions ───────────────────────────────────────────────────────────
 
 async function doPreload() {
-  chartPoints.value = [];
+  chartData = [];
+  sendRate.value = null;
   replayState.value = { status: "preloading" };
   startPolling();
   try {
@@ -838,6 +1067,8 @@ async function doPreload() {
                           ? filterSolTypes.value : [],
       time_scale:       timeScale.value,
       apply_latency:    applyLatency.value,
+      select_by_arrival: applyLatency.value && selectByArrival.value,
+      output_format:    outputFormat.value,
       bootstrap_server: bootstrapServer.value,
       topic:            topic.value,
     });
@@ -849,15 +1080,19 @@ async function doPreload() {
 }
 
 async function doGo() {
-  chartPoints.value = [];
+  chartData = [];
+  sendRate.value = null;
+  // Start the replay (returns immediately; schedule is anchored to this call),
+  // then poll for live status.
   try {
     await replayStart();
-    startPolling();
-    await nextTick();
-    initChart();
   } catch (e: any) {
     replayState.value = { ...replayState.value, status: "error", error: e?.response?.data?.error ?? String(e) };
+    return;
   }
+  startPolling();
+  await nextTick();
+  initChart();
 }
 
 async function doCancel() {
@@ -872,7 +1107,8 @@ async function doCancel() {
 async function doReset() {
   stopPolling();
   if (chart) { chart.destroy(); chart = null; }
-  chartPoints.value = [];
+  chartData = [];
+  sendRate.value = null;
   try { await replayReset(); } catch { /* ignore */ }
   replayState.value = { status: "idle" };
 }
@@ -920,6 +1156,10 @@ function startFetch() {
 onMounted(async () => {
   await loadListOptions();
   await fetchFilterOptions();
+  try {
+    const cfg = await getServerConfig();
+    if (cfg.base_url) serverBase.value = cfg.base_url;
+  } catch { /* fall back to window.location.origin */ }
   // Sync with any in-progress server state (e.g. user navigated away and back)
   try {
     const s = await getReplayStatus();
@@ -937,6 +1177,8 @@ onMounted(async () => {
       topic.value           = s.config.topic;
       timeScale.value       = s.config.time_scale;
       applyLatency.value    = s.config.apply_latency;
+      selectByArrival.value = s.config.select_by_arrival ?? false;
+      outputFormat.value    = s.config.output_format ?? "compact";
       startDate.value       = s.config.start_time;
       stopDate.value        = s.config.stop_time;
       selectedLists.value   = s.config.station_lists ?? [];
@@ -985,5 +1227,19 @@ watch(selectedLists, () => {
 }
 code {
   font-family: monospace;
+}
+.replay-log {
+  background: #1a1a2e;
+  font-family: monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  max-height: 260px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.replay-log .log-ts {
+  color: #6c7a89;
+  margin-right: 6px;
 }
 </style>

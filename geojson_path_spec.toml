@@ -21,32 +21,30 @@
 #
 # ── Coordinate encoding ───────────────────────────────────────────────────────
 #
-# Both formats use ENU (East, North, Up) order.
+# Both formats use ENU (East, North, Up) order and are written as JSONL
+# (newline-delimited JSON) — one JSON object per line.
 #
-# Compact format (newline-delimited JSON, one line per sample):
+# Compact format (*.compact.geojson.jsonl, one compact record per line):
 #   {"time":1782954370000,"Q":1809041,"type":"ENU","SNCL":"P143.NC.LY_.20",
 #    "coor":[-0.026,-0.029,0.02],"err":[0.03,0.043,0.079],"rate":1}
 #
-# Full GeoJSON format (one FeatureCollection per station-day):
-#   {"type":"FeatureCollection",
-#    "properties":{"sampleRate":1,"SNCL":"P143.NC.LY_.20"},
-#    "features":[
-#      {"type":"Feature",
-#       "geometry":{"type":"Point","coordinates":[-0.026,-0.029,0.02]},
-#       "properties":{"coordinateType":"ENU","time":1782954370000,
-#                     "EError":0.03,"NError":0.043,"UError":0.079,
-#                     "quality":1809041}}, ...]}
+# Full GeoJSON format (*.full.geojson.jsonl, one GeoJSON Feature per line):
+#   {"type":"Feature",
+#    "geometry":{"type":"Point","coordinates":[-0.026,-0.029,0.02]},
+#    "properties":{"coordinateType":"ENU","SNCL":"P143.NC.LY_.20",
+#                  "time":1782954370000,"EError":0.03,"NError":0.043,
+#                  "UError":0.079,"quality":1809041,"sampleRate":1}}
 #
 # ── Per-format settings ───────────────────────────────────────────────────────
 
 [compact]
-# Newline-delimited JSON — one record per sample.
+# Newline-delimited JSON — one compact record per sample.
 # Files can be streamed/appended easily.
 
 root      = "data/geojson/compact"
 directory = "{year}/{network}/{station}"
 filename  = "{geosncl}.{year}.{julday}"
-extension = ".jsonl"
+extension = ".compact.geojson.jsonl"
 
 [compact.options]
 # Round position and error values to this many decimal places.
@@ -55,18 +53,15 @@ extension = ".jsonl"
 
 
 [full]
-# Standard GeoJSON FeatureCollection — one file per station-day.
-# All samples for the day are features inside a single FeatureCollection.
+# GeoJSON as JSONL — one GeoJSON Feature per line, one file per station-day.
+# Each Feature carries SNCL and sampleRate in its properties.
 
 root      = "data/geojson/full"
 directory = "{year}/{network}/{station}"
 filename  = "{geosncl}.{year}.{julday}"
-extension = ".geojson"
+extension = ".full.geojson.jsonl"
 
 [full.options]
-# Output compact single-line JSON (false = pretty-printed, larger files).
-compact_json = true
-
 # Round position and error values to this many decimal places.
 # null = full precision.  6 = sub-millimetre (0.000001 m).
 round_decimals = 6

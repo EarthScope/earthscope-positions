@@ -56,6 +56,18 @@ export interface FetchEvent {
   type: "log" | "error" | "done";
   msg?: string;
   code?: number;
+  current?: number;   // day-level progress (0-based → total)
+  total?: number;
+}
+
+export interface FetchMissingBody {
+  lists?: string[];
+  geosncls?: string[];
+  filter_centers?: string[];
+  filter_sol_types?: string[];
+  start: string;
+  end: string;
+  workers?: number;
 }
 
 // ─── Station list ─────────────────────────────────────────────────────────────
@@ -90,6 +102,8 @@ export interface ReplayConfig {
   topic: string;
   time_scale: number;
   apply_latency: boolean;
+  select_by_arrival?: boolean;
+  output_format?: "compact" | "geojson";
   start_data_ms: number;
   start_time: string;
   stop_time: string;
@@ -98,11 +112,19 @@ export interface ReplayConfig {
   start_replay_wall_ms?: number;
 }
 
+export interface ReplayLogLine {
+  ts: number;      // epoch milliseconds
+  level: "info" | "warn" | "error";
+  msg: string;
+}
+
 export interface ReplayState {
   status: ReplayStatus;
   job_id?: string;
+  log?: ReplayLogLine[];
   config?: ReplayConfig;
   files?: [string, string][];
+  files_count?: number;
   missing_stations?: string[];
   total_messages?: number;
   total_geosncls?: number;
@@ -115,6 +137,20 @@ export interface ReplayState {
   replay_elapsed_s?: number;
   replay_remaining_s?: number;
   error?: string;
+  // Delivery-check consumer (reads back the topic we write to)
+  consumer_read?: number;
+  consumer_matched?: number;
+  consumer_unmatched?: number;
+  consumer_mean_rt_ms?: number | null;
+  consumer_status?: "ok" | "warn" | "error";
+  consumer_message?: string | null;
+  // Start / cancel timing (for synchronization)
+  start_requested_ms?: number;
+  first_write_ms?: number | null;
+  startup_delay_ms?: number | null;
+  cancel_requested_ms?: number;
+  stopped_ms?: number;
+  cancel_delay_ms?: number | null;
 }
 
 // ─── PPSD ─────────────────────────────────────────────────────────────────────
@@ -149,6 +185,8 @@ export interface ReplayPreloadBody {
   filter_sol_types: string[];
   time_scale: number;
   apply_latency: boolean;
+  select_by_arrival: boolean;
+  output_format: "compact" | "geojson";
   bootstrap_server: string;
   topic: string;
 }

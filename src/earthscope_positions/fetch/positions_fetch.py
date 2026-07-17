@@ -27,6 +27,8 @@ import pyarrow.ipc as ipc
 import requests
 from earthscope_sdk.config.models import Tokens
 
+from earthscope_positions import paths
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -43,7 +45,7 @@ _NO_DATA_FILE = "no_data.jsonl"
 _NO_DATA_FILE_LEGACY = "no_data.json"
 _LOCK_FILE = ".lock"
 _TS_FMT = "%Y%m%dT%H%M%SZ"  # compact UTC timestamp for filenames
-_ERROR_LOG = "data/positions_errors.jsonl"  # relative to project root
+_ERROR_LOG_NAME = "positions_errors.jsonl"  # under the base data directory
 _MAX_RETRIES = 2          # 5xx tasks are re-queued up to this many times
 _DEFAULT_WORKERS = 20
 
@@ -51,15 +53,11 @@ _UTC = dt.timezone.utc
 
 
 def _project_root() -> pathlib.Path:
-    """Walk up from CWD to find the project root (directory containing pyproject.toml)."""
-    for p in [pathlib.Path.cwd(), *pathlib.Path.cwd().parents]:
-        if (p / "pyproject.toml").exists():
-            return p
-    return pathlib.Path.cwd()
+    return paths.project_root()
 
 
 def _data_root() -> pathlib.Path:
-    return _project_root() / "data" / "arrow"
+    return paths.arrow_dir()
 
 # ---------------------------------------------------------------------------
 # Auth (mirrors station_list.py)
@@ -318,7 +316,7 @@ def _log_error(geosncl: str, date_str: str, resp: "requests.Response") -> None:
         "status": resp.status_code,
         "body": body,
     }
-    log_path = _project_root() / _ERROR_LOG
+    log_path = paths.base_dir() / _ERROR_LOG_NAME
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with _error_log_lock:
         with log_path.open("ab") as f:
@@ -614,7 +612,7 @@ def _parse_jsonl_line(raw_line: bytes) -> dict | None:
 def _load_station_list(path_str: str) -> list[dict]:
     p = pathlib.Path(path_str)
     stem = p.stem if p.suffix in (".jsonl", ".json") else p.name
-    sl = _project_root() / "data" / "station-lists"
+    sl = paths.station_lists_dir()
     candidates = [
         p,
         p.parent / (stem + ".jsonl"),
@@ -713,7 +711,7 @@ def _retry_result_matches(result: str, pattern: str) -> bool:
 def _build_edid_map(data_dir: pathlib.Path) -> dict[str, str]:
     """Scan all station-list JSONL files and return {geosncl: edid}."""
     mapping: dict[str, str] = {}
-    sl_dir = _project_root() / "data" / "station-lists"
+    sl_dir = paths.station_lists_dir()
     search_dirs = [sl_dir, data_dir.parent / "station-lists"]
     for directory in dict.fromkeys(search_dirs):
         if not directory.exists():
@@ -735,11 +733,7 @@ def _build_edid_map(data_dir: pathlib.Path) -> dict[str, str]:
 
 def _cmd_retry(args) -> None:
     """Retry all no_data.jsonl entries whose result matches --result."""
-    data_dir = (
-        pathlib.Path(args.data_dir)
-        if getattr(args, "data_dir", None)
-        else _project_root() / "data" / "arrow"
-    )
+    data_dir = paths.arrow_dir()
     if not data_dir.exists():
         sys.exit(f"Data directory not found: {data_dir}")
 
@@ -863,6 +857,31 @@ def _cmd_concat(args) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _add_data_dir_args(p: argparse.ArgumentParser) -> None:
+    """Add the standard --data-directory / --arrow-data-directory flags."""
+    p.add_argument(
+        "--data-directory",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Base data directory (default: $ES_POS_DATA_DIRECTORY or ./data).  "
+            "Arrow files live under <PATH>/arrow, station lists under "
+            "<PATH>/station-lists."
+        ),
+    )
+    p.add_argument(
+        "--arrow-data-directory",
+        metavar="PATH",
+        default=None,
+        help="Override just the Arrow data root (supersedes --data-directory/arrow).",
+    )
+
+
+def _apply_data_dir_args(args: argparse.Namespace) -> None:
+    paths.set_base_dir(getattr(args, "data_directory", None))
+    paths.set_arrow_dir(getattr(args, "arrow_data_directory", None))
+
+
 def _build_parser(prog=None) -> tuple[argparse.ArgumentParser, ...]:
     ap = argparse.ArgumentParser(
         prog=prog,
@@ -945,6 +964,7 @@ Examples:
         metavar="N",
         help=f"Number of parallel downloads (default: {_DEFAULT_WORKERS}).",
     )
+    _add_data_dir_args(get_p)
 
     # --- concat ---
     concat_p = sub.add_parser(
@@ -992,12 +1012,6 @@ Examples:
 """,
     )
     retry_p.add_argument(
-        "--data-dir",
-        metavar="PATH",
-        default=None,
-        help="Root of the Arrow data tree to scan (default: ./data/arrow).",
-    )
-    retry_p.add_argument(
         "--result",
         metavar="PATTERN",
         default="error-*",
@@ -1015,6 +1029,7 @@ Examples:
         action="store_true",
         help="Print matching entries without downloading.",
     )
+    _add_data_dir_args(retry_p)
 
     return ap, get_p, concat_p
 
@@ -1025,6 +1040,7 @@ def main() -> None:
     if not args.command:
         ap.print_help()
         sys.exit(0)
+    _apply_data_dir_args(args)
     if args.command == "get":
         _cmd_get(args)
     elif args.command == "concat":

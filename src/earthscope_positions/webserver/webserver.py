@@ -52,13 +52,14 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from earthscope_positions import paths
+
 _UTC = dt.timezone.utc
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-_data_dir_override: pathlib.Path | None = None
 SCAN_INTERVAL_S = 60  # seconds between background index refreshes
 
 _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="completeness-gen")
@@ -70,22 +71,44 @@ _ppsd_pool = ThreadPoolExecutor(
 # Loaded at startup for the station builder map endpoint
 _station_builder_coords = None  # earthscope_positions.coordinates.Coordinates | None
 
+# Network names (RTDB:* / SHAKE:*) discovered at startup for the Station Builder
+# "Load Network" dropdown.  Populated by a best-effort background query.
+_networks_cache: list[str] = []
+_networks_loaded: bool = False
+
 
 def set_data_dir(path: pathlib.Path) -> None:
-    global _data_dir_override
-    _data_dir_override = path
+    """Backward-compatible shim: override just the Arrow data root."""
+    paths.set_arrow_dir(path)
+
+
+# Externally-reachable base URL, used for callback URLs shown in the UI (e.g.
+# the Replay curl commands).  Set from `es-pos webserver --hostname/--port`.
+_public_hostname: str = "localhost"
+_public_port: int = 8000
+
+
+def set_public_base(hostname: str, port: int) -> None:
+    global _public_hostname, _public_port
+    _public_hostname = hostname or "localhost"
+    _public_port = int(port)
+
+
+def _public_base_url() -> str:
+    return f"http://{_public_hostname}:{_public_port}"
 
 
 def _project_root() -> pathlib.Path:
+    # Code-relative root (for locating the built SPA), independent of the data dir.
     return pathlib.Path(__file__).parent.parent.parent.parent
 
 
 def _data_dir() -> pathlib.Path:
-    return _data_dir_override or (_project_root() / "data" / "arrow")
+    return paths.arrow_dir()
 
 
 def _station_lists_dir() -> pathlib.Path:
-    return _project_root() / "data" / "station-lists"
+    return paths.station_lists_dir()
 
 
 def _spa_dir() -> pathlib.Path:
@@ -565,6 +588,24 @@ async def _startup() -> None:
     except Exception as exc:
         print(f"  coords   : not found ({exc})", file=sys.stderr)
 
+    # Best-effort background discovery of RTDB:* / SHAKE:* networks for the
+    # Station Builder "Load Network" dropdown (needs API auth / VPN).
+    asyncio.create_task(_load_networks_bg())
+
+
+async def _load_networks_bg() -> None:
+    global _networks_cache, _networks_loaded
+    loop = asyncio.get_event_loop()
+    try:
+        from earthscope_positions.stations.station_list import list_networks
+        nets = await loop.run_in_executor(None, list_networks)
+        _networks_cache = nets
+        print(f"  networks : {len(nets)} (RTDB:*/SHAKE:*)", file=sys.stderr)
+    except Exception as exc:
+        print(f"  networks : lookup failed ({exc})", file=sys.stderr)
+    finally:
+        _networks_loaded = True
+
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
@@ -580,6 +621,19 @@ async def _shutdown() -> None:
             app.mount("/assets", StaticFiles(directory=spa / "assets"), name="assets")
     else:
         print("  spa      : not built (run: cd spa/spaGenerator && npm run build)", file=sys.stderr)
+
+
+# ── /api/config ──────────────────────────────────────────────────────────────
+
+@app.get("/api/config")
+async def api_config() -> dict:
+    """Client-facing server config, incl. the externally-reachable base URL used
+    for callback commands (e.g. Replay curl snippets)."""
+    return {
+        "base_url": _public_base_url(),
+        "hostname": _public_hostname,
+        "port": _public_port,
+    }
 
 
 # ── /api/status ──────────────────────────────────────────────────────────────
@@ -670,10 +724,10 @@ async def api_shakealert_datasource() -> StreamingResponse:
             sys.executable, "-m", "earthscope_positions.es_pos",
             "stations", "get", "datasource",
             "--network-name", "SHAKE:ShakeAlert",
-            "-o", "ShakeAlert",
+            "-o", "shake-alert",
         ]
         yield _sse({"type": "log", "msg":
-            "es-pos stations get datasource --network-name SHAKE:ShakeAlert -o ShakeAlert"})
+            "es-pos stations get datasource --network-name SHAKE:ShakeAlert -o shake-alert"})
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -687,7 +741,7 @@ async def api_shakealert_datasource() -> StreamingResponse:
         await proc.wait()
         if proc.returncode == 0:
             yield _sse({"type": "done", "code": 0,
-                        "msg": "Saved ShakeAlert.jsonl. Reload station lists to use it."})
+                        "msg": "Saved shake-alert.jsonl. Reload station lists to use it."})
         else:
             yield _sse({"type": "done", "code": proc.returncode,
                         "msg": f"Command exited with code {proc.returncode}"})
@@ -697,6 +751,92 @@ async def api_shakealert_datasource() -> StreamingResponse:
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.get("/api/station-lists/all-streams")
+async def api_all_streams_datasource() -> StreamingResponse:
+    """Run es-pos stations get datasource -o AllStreams (all gnss_ppp streams).
+
+    Paginated datasource query with the only filter being stream_type=gnss_ppp,
+    saved to AllStreams.jsonl.
+    """
+    def _sse(obj: dict) -> str:
+        return f"data: {json.dumps(obj)}\n\n"
+
+    async def generate():
+        cmd = [
+            sys.executable, "-m", "earthscope_positions.es_pos",
+            "stations", "get", "datasource",
+            "-o", "all-streams",
+        ]
+        yield _sse({"type": "log", "msg":
+            "es-pos stations get datasource -o all-streams  (stream_type=gnss_ppp)"})
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=str(_project_root()),
+        )
+        async for raw in proc.stdout:  # type: ignore[union-attr]
+            line = raw.decode(errors="replace").rstrip()
+            if line:
+                yield _sse({"type": "log", "msg": line})
+        await proc.wait()
+        if proc.returncode == 0:
+            yield _sse({"type": "done", "code": 0,
+                        "msg": "Saved all-streams.jsonl. Reload station lists to use it."})
+        else:
+            yield _sse({"type": "done", "code": proc.returncode,
+                        "msg": f"Command exited with code {proc.returncode}"})
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/station-builder/networks")
+async def api_station_builder_networks(refresh: bool = False) -> JSONResponse:
+    """Return the discovered RTDB:* / SHAKE:* network names for the dropdown.
+
+    Populated in the background at startup; pass ?refresh=true to re-query.
+    """
+    global _networks_cache, _networks_loaded
+    if refresh or not _networks_loaded:
+        loop = asyncio.get_event_loop()
+        try:
+            from earthscope_positions.stations.station_list import list_networks
+            _networks_cache = await loop.run_in_executor(None, list_networks)
+            _networks_loaded = True
+        except Exception as exc:
+            return JSONResponse(
+                {"networks": _networks_cache, "loaded": _networks_loaded, "error": str(exc)}
+            )
+    return JSONResponse({"networks": _networks_cache, "loaded": _networks_loaded})
+
+
+@app.post("/api/station-builder/load-network", response_model=None)
+async def api_station_builder_load_network(network: str = Query(...)) -> JSONResponse:
+    """Fetch all gnss_ppp streams in *network* and save them as a station list.
+
+    Returns the saved list name so the caller can make it the active list.
+    """
+    if not network.strip():
+        return JSONResponse({"error": "network is required"}, status_code=400)
+    loop = asyncio.get_event_loop()
+    try:
+        from earthscope_positions.stations.station_list import save_network_list
+        name, records = await loop.run_in_executor(None, save_network_list, network)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    geosncls = [r["geosncl"] for r in records if r.get("geosncl")]
+    return JSONResponse({
+        "network": network,
+        "name": name,
+        "count": len(records),
+        "geosncls": geosncls,
+    })
 
 
 def _fetch_url_sync(url: str) -> bytes:
@@ -783,7 +923,7 @@ async def api_update_active_from_ncedc() -> StreamingResponse:
                     records.append({"geosncl": gs})
             yield _sse({"type": "log", "msg": f"  {found}/{len(geosncls)} matched in existing lists."})
 
-            list_name = f"{center}-Active"
+            list_name = f"{center.lower()}-active"
             d.mkdir(parents=True, exist_ok=True)
             out_path = d / f"{list_name}.jsonl"
             out_path.write_text(
@@ -839,6 +979,83 @@ async def api_delete_station_list(name: str) -> JSONResponse:
             _log.info("[station-lists] deleted %r", name)
             return JSONResponse({"deleted": name})
     return JSONResponse({"error": "Not found"}, status_code=404)
+
+
+def _bad_list_name(n: str) -> bool:
+    return (not n) or ".." in n or "/" in n or "\\" in n
+
+
+class _RenameListBody(BaseModel):
+    new_name: str
+
+
+@app.post("/api/station-lists/{name}/rename", response_model=None)
+async def api_rename_station_list(name: str, body: _RenameListBody) -> JSONResponse:
+    name = name.strip()
+    new = body.new_name.strip()
+    if _bad_list_name(name) or _bad_list_name(new):
+        return JSONResponse({"error": "Invalid list name"}, status_code=400)
+    d = _station_lists_dir()
+    src = None
+    for suffix in (".jsonl", ".json"):
+        p = d / f"{name}{suffix}"
+        if p.exists():
+            src = p
+            break
+    if src is None:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    if new == name:
+        return JSONResponse({"old": name, "name": new})
+    dst = d / f"{new}.jsonl"
+    if dst.exists():
+        return JSONResponse({"error": f"A list named {new!r} already exists"}, status_code=409)
+    src.rename(dst)
+    _log.info("[station-lists] renamed %r -> %r", name, new)
+    return JSONResponse({"old": name, "name": new})
+
+
+@app.get("/api/station-lists/{name}/raw", response_model=None)
+async def api_get_station_list_raw(name: str) -> JSONResponse:
+    """Return the raw JSONL text of a station list (for the editor)."""
+    name = name.strip()
+    if _bad_list_name(name):
+        return JSONResponse({"error": "Invalid list name"}, status_code=400)
+    d = _station_lists_dir()
+    for suffix in (".jsonl", ".json"):
+        p = d / f"{name}{suffix}"
+        if p.exists():
+            return JSONResponse({"name": name, "content": p.read_text(encoding="utf-8")})
+    return JSONResponse({"error": "Not found"}, status_code=404)
+
+
+class _RawListBody(BaseModel):
+    content: str
+
+
+@app.post("/api/station-lists/{name}/raw", response_model=None)
+async def api_save_station_list_raw(name: str, body: _RawListBody) -> JSONResponse:
+    """Save raw JSONL text to a list (used by the editor's Save / Save As).
+
+    Validates that every non-empty line is valid JSON so the file can't be
+    corrupted; writes to ``<name>.jsonl``.
+    """
+    name = name.strip()
+    if _bad_list_name(name):
+        return JSONResponse({"error": "Invalid list name"}, status_code=400)
+    for i, line in enumerate(body.content.splitlines(), start=1):
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            json.loads(s)
+        except Exception as exc:
+            return JSONResponse({"error": f"Invalid JSON on line {i}: {exc}"}, status_code=400)
+    d = _station_lists_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    content = body.content if body.content.endswith("\n") else body.content + "\n"
+    (d / f"{name}.jsonl").write_text(content, encoding="utf-8")
+    _log.info("[station-lists] saved raw %r (%d bytes)", name, len(content))
+    return JSONResponse({"name": name})
 
 
 class _SaveListBody(BaseModel):
@@ -1036,6 +1253,179 @@ def _missing_by_day(
     return result
 
 
+def _sse(obj: dict) -> str:
+    return f"data: {json.dumps(obj)}\n\n"
+
+
+def _apply_stream_filters(
+    geosncls: list[str],
+    centers: list[str],
+    sol_types: list[str],
+) -> list[str]:
+    """Keep geosncls whose center (2nd part) and sol-type (first 2 of 4th part)
+    are in the given lists.  An empty filter list means 'accept all'."""
+    if not centers and not sol_types:
+        return geosncls
+    fc, fs = set(centers), set(sol_types)
+    out: list[str] = []
+    for gs in geosncls:
+        parts = gs.split(".")
+        if len(parts) < 4:
+            out.append(gs)
+            continue
+        if fc and parts[1] not in fc:
+            continue
+        if fs and parts[3][:2] not in fs:
+            continue
+        out.append(gs)
+    return out
+
+
+def _geosncl_edid_map() -> dict[str, str]:
+    """Map geosncl -> edid across every station-list file.
+
+    The positions API is queried by EDID (``stream_id``), so the fetch subprocess
+    needs each stream's edid — not just its geosncl — or every request comes back
+    empty ("no-data").
+    """
+    d = _station_lists_dir()
+    mapping: dict[str, str] = {}
+    if not d.exists():
+        return mapping
+    for path in sorted(d.iterdir()):
+        if path.suffix not in (".jsonl", ".json"):
+            continue
+        try:
+            for rec in _read_station_list_file(path):
+                gs = rec.get("geosncl") or rec.get("edid", "")
+                eid = rec.get("edid") or rec.get("geosncl", "")
+                if gs and eid:
+                    mapping.setdefault(gs, eid)
+        except Exception:
+            pass
+    return mapping
+
+
+async def _fetch_missing_events(
+    requested: list[str],
+    start_date: dt.date,
+    end_date: dt.date,
+    workers: int,
+    edid_map: dict[str, str] | None = None,
+):
+    """Shared SSE generator: fetch every missing (geosncl, day) pair for
+    *requested* over [start_date, end_date].  Yields ``data: {...}`` strings.
+
+    *edid_map* maps geosncl -> edid so the fetch subprocess can query the API by
+    EDID; a missing entry falls back to the geosncl string.
+    """
+    import tempfile
+
+    edid_map = edid_map or {}
+
+    # Compute exact (geosncl, day) pairs that need fetching
+    by_day = _missing_by_day(requested, start_date, end_date)
+    total_pairs = sum(len(v) for v in by_day.values())
+    unique_gs = len({g for gs in by_day.values() for g in gs})
+    already_done = len(requested) - unique_gs
+
+    if not by_day:
+        yield _sse({"type": "log", "current": 0, "total": 0, "msg":
+            f"{len(requested)} station(s) — all data already present or previously attempted."})
+        yield _sse({"type": "done", "code": 0, "current": 0, "total": 0})
+        return
+
+    sorted_days = sorted(by_day.keys())
+
+    yield _sse({"type": "log", "current": 0, "total": len(sorted_days), "msg":
+        f"{len(requested)} station(s): {already_done} complete, "
+        f"{unique_gs} stream(s) × {len(by_day)} day(s) = {total_pairs} pair(s) to fetch"})
+
+    tf_path: str | None = None
+    proc: asyncio.subprocess.Process | None = None
+    errors = 0
+
+    try:
+        for i, day in enumerate(sorted_days):
+            day_gs = sorted(by_day[day])
+            day_str = day.isoformat()
+            next_str = (day + dt.timedelta(days=1)).isoformat()
+
+            yield _sse({"type": "log", "current": i + 1, "total": len(sorted_days), "msg":
+                f"[{i + 1}/{len(sorted_days)}] {day_str} — {len(day_gs)} stream(s)"})
+
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as tf:
+                for g in day_gs:
+                    tf.write(json.dumps({"geosncl": g, "edid": edid_map.get(g, g)}) + "\n")
+                tf_path = tf.name
+
+            cmd = [
+                sys.executable, "-m", "earthscope_positions.fetch.positions_fetch",
+                "get", "-i", tf_path,
+                "--start", day_str, "--end", next_str,
+                "--workers", str(workers),
+            ]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                cwd=str(_project_root()),
+            )
+            async for raw in proc.stdout:  # type: ignore[union-attr]
+                line = raw.decode(errors="replace").rstrip()
+                if line:
+                    yield _sse({"type": "log", "msg": line})
+            await proc.wait()
+            ret = proc.returncode
+            proc = None
+
+            pathlib.Path(tf_path).unlink(missing_ok=True)
+            tf_path = None
+
+            if ret != 0:
+                errors += 1
+                yield _sse({"type": "error", "msg": f"Fetch for {day_str} exited with code {ret}"})
+
+    except asyncio.CancelledError:
+        if proc and proc.returncode is None:
+            proc.terminate()
+        asyncio.create_task(_refresh_index())
+        yield _sse({"type": "done", "code": 1, "msg": "Canceled."})
+        return
+    except Exception as exc:
+        asyncio.create_task(_refresh_index())
+        yield _sse({"type": "error", "msg": str(exc)})
+        yield _sse({"type": "done", "code": 1})
+        return
+    finally:
+        if tf_path:
+            pathlib.Path(tf_path).unlink(missing_ok=True)
+
+    # Refresh the in-memory index so downstream pages immediately see new files
+    yield _sse({"type": "log", "msg": "Updating file index…"})
+    await _refresh_index()
+    code = 0 if errors == 0 else 1
+    yield _sse({"type": "done", "code": code,
+                "current": len(sorted_days), "total": len(sorted_days),
+                "msg": "Completed. File index updated." if code == 0
+                       else f"Completed with {errors} day(s) having fetch errors."})
+
+
+def _resolve_list_geosncls(name: str) -> list[str]:
+    """Return geosncls for a saved list name (empty if not found/unreadable)."""
+    sl_dir = _station_lists_dir()
+    list_path = sl_dir / f"{name}.jsonl"
+    if not list_path.exists():
+        list_path = sl_dir / f"{name}.json"
+    if not list_path.exists():
+        return []
+    try:
+        records = _read_station_list_file(list_path)
+        return [g for rec in records if (g := (rec.get("geosncl") or rec.get("edid", "")))]
+    except Exception:
+        return []
+
+
 @app.get("/api/fetch-missing")
 async def api_fetch_missing(
     list: str = Query("all"),
@@ -1044,12 +1434,7 @@ async def api_fetch_missing(
     workers: int = Query(10, ge=1, le=50),
     geosncls: str = Query(""),  # comma-separated; overrides list when provided
 ) -> StreamingResponse:
-    def _sse(obj: dict) -> str:
-        return f"data: {json.dumps(obj)}\n\n"
-
     async def generate():
-        import tempfile
-
         try:
             start_date = dt.date.fromisoformat(start)
             end_date = dt.date.fromisoformat(end)
@@ -1058,7 +1443,6 @@ async def api_fetch_missing(
             yield _sse({"type": "done", "code": 1})
             return
 
-        # Resolve the requested geosncl set
         if geosncls.strip():
             requested = [g.strip() for g in geosncls.split(",") if g.strip()]
         elif list == "all":
@@ -1066,107 +1450,175 @@ async def api_fetch_missing(
             yield _sse({"type": "done", "code": 1})
             return
         else:
-            sl_dir = _station_lists_dir()
-            list_path = sl_dir / f"{list}.jsonl"
-            if not list_path.exists():
-                list_path = sl_dir / f"{list}.json"
-            if not list_path.exists():
-                yield _sse({"type": "error", "msg": f"Station list not found: {list}.jsonl"})
-                yield _sse({"type": "done", "code": 1})
-                return
-            try:
-                records = _read_station_list_file(list_path)
-                requested = [rec.get("geosncl") or rec.get("edid", "") for rec in records]
-                requested = [g for g in requested if g]
-            except Exception as exc:
-                yield _sse({"type": "error", "msg": str(exc)})
+            requested = _resolve_list_geosncls(list)
+            if not requested:
+                yield _sse({"type": "error", "msg": f"Station list not found or empty: {list}"})
                 yield _sse({"type": "done", "code": 1})
                 return
 
-        # Compute exact (geosncl, day) pairs that need fetching
-        by_day = _missing_by_day(requested, start_date, end_date)
-        total_pairs = sum(len(v) for v in by_day.values())
-        unique_gs = len({g for gs in by_day.values() for g in gs})
-        already_done = len(requested) - unique_gs
+        async for chunk in _fetch_missing_events(
+            requested, start_date, end_date, workers, _geosncl_edid_map()
+        ):
+            yield chunk
 
-        if not by_day:
-            yield _sse({"type": "log", "msg":
-                f"{len(requested)} station(s) — all data already present or previously attempted."})
-            yield _sse({"type": "done", "code": 0})
-            return
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
-        yield _sse({"type": "log", "msg":
-            f"{len(requested)} station(s): {already_done} complete, "
-            f"{unique_gs} stream(s) × {len(by_day)} day(s) = {total_pairs} pair(s) to fetch"})
 
-        sorted_days = sorted(by_day.keys())
-        tf_path: str | None = None
-        proc: asyncio.subprocess.Process | None = None
-        errors = 0
+class _FetchMissingBody(BaseModel):
+    lists: list[str] = []
+    geosncls: list[str] = []
+    filter_centers: list[str] = []
+    filter_sol_types: list[str] = []
+    start: str
+    end: str
+    workers: int = 10
 
+
+@app.post("/api/fetch-missing")
+async def api_fetch_missing_post(body: _FetchMissingBody) -> StreamingResponse:
+    """POST variant of fetch-missing that resolves station lists + stream filters
+    server-side (avoids huge query strings for large selections)."""
+    async def generate():
         try:
-            for i, day in enumerate(sorted_days):
-                day_gs = sorted(by_day[day])
-                day_str = day.isoformat()
-                next_str = (day + dt.timedelta(days=1)).isoformat()
-
-                yield _sse({"type": "log", "msg":
-                    f"[{i + 1}/{len(sorted_days)}] {day_str} — {len(day_gs)} stream(s)"})
-
-                with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as tf:
-                    for g in day_gs:
-                        tf.write(json.dumps({"geosncl": g}) + "\n")
-                    tf_path = tf.name
-
-                cmd = [
-                    sys.executable, "-m", "earthscope_positions.fetch.positions_fetch",
-                    "get", "-i", tf_path,
-                    "--start", day_str, "--end", next_str,
-                    "--workers", str(workers),
-                ]
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
-                    cwd=str(_project_root()),
-                )
-                async for raw in proc.stdout:  # type: ignore[union-attr]
-                    line = raw.decode(errors="replace").rstrip()
-                    if line:
-                        yield _sse({"type": "log", "msg": line})
-                await proc.wait()
-                ret = proc.returncode
-                proc = None
-
-                pathlib.Path(tf_path).unlink(missing_ok=True)
-                tf_path = None
-
-                if ret != 0:
-                    errors += 1
-                    yield _sse({"type": "error", "msg": f"Fetch for {day_str} exited with code {ret}"})
-
-        except asyncio.CancelledError:
-            if proc and proc.returncode is None:
-                proc.terminate()
-            asyncio.create_task(_refresh_index())
-            yield _sse({"type": "done", "code": 1, "msg": "Canceled."})
-            return
-        except Exception as exc:
-            asyncio.create_task(_refresh_index())
-            yield _sse({"type": "error", "msg": str(exc)})
+            start_date = dt.date.fromisoformat(body.start)
+            end_date = dt.date.fromisoformat(body.end)
+        except ValueError:
+            yield _sse({"type": "error", "msg": "Invalid date format. Use YYYY-MM-DD."})
             yield _sse({"type": "done", "code": 1})
             return
-        finally:
-            if tf_path:
-                pathlib.Path(tf_path).unlink(missing_ok=True)
 
-        # Refresh the in-memory index so the completeness page immediately sees new files
-        yield _sse({"type": "log", "msg": "Updating file index…"})
-        await _refresh_index()
-        code = 0 if errors == 0 else 1
+        workers = max(1, min(50, body.workers))
+        requested_set: set[str] = {g for g in body.geosncls if g}
+        for name in body.lists:
+            requested_set.update(_resolve_list_geosncls(name))
+        requested = _apply_stream_filters(
+            sorted(requested_set), body.filter_centers, body.filter_sol_types
+        )
+        if not requested:
+            yield _sse({"type": "error", "msg": "No stations selected."})
+            yield _sse({"type": "done", "code": 1})
+            return
+
+        async for chunk in _fetch_missing_events(
+            requested, start_date, end_date, workers, _geosncl_edid_map()
+        ):
+            yield chunk
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ── Export / convert (Arrow → MiniSEED / GeoJSON) ──────────────────────────────
+
+_EXPORT_SPEC_FILES = {
+    "miniseed": "miniseed_path_spec.toml",
+    "geojson":  "geojson_path_spec.toml",
+}
+
+
+def _export_spec_path(fmt: str) -> pathlib.Path | None:
+    name = _EXPORT_SPEC_FILES.get(fmt)
+    return (_project_root() / name) if name else None
+
+
+@app.get("/api/export/spec")
+async def api_export_get_spec(format: str = Query(...)) -> JSONResponse:
+    """Return the editable path-spec TOML for the given export format."""
+    path = _export_spec_path(format)
+    if path is None:
+        return JSONResponse({"error": "Invalid format"}, status_code=400)
+    content = path.read_text(encoding="utf-8") if path.exists() else ""
+    return JSONResponse({"format": format, "path": str(path.name), "content": content})
+
+
+class _ExportSpecBody(BaseModel):
+    format: str
+    content: str
+
+
+@app.put("/api/export/spec", response_model=None)
+async def api_export_put_spec(body: _ExportSpecBody) -> JSONResponse:
+    """Save the edited path-spec TOML (controls the output directory structure)."""
+    path = _export_spec_path(body.format)
+    if path is None:
+        return JSONResponse({"error": "Invalid format"}, status_code=400)
+    # Validate it parses as TOML before overwriting.
+    try:
+        import tomllib
+        tomllib.loads(body.content)
+    except Exception as exc:
+        return JSONResponse({"error": f"Invalid TOML: {exc}"}, status_code=400)
+    path.write_text(body.content, encoding="utf-8")
+    _log.info("[export] saved %s (%d bytes)", path.name, len(body.content))
+    return JSONResponse({"ok": True, "path": path.name})
+
+
+@app.get("/api/export/run")
+async def api_export_run(
+    format: str = Query(...),                 # "miniseed" | "geojson"
+    lists: list[str] = Query([]),
+    start: str = Query(...),
+    end: str = Query(...),
+    gj_format: str = Query("both"),           # geojson only: compact | full | both
+    force: bool = Query(False),
+) -> StreamingResponse:
+    """Run es-pos export <format> for the selected lists/date range, streaming logs."""
+    async def generate():
+        if format not in _EXPORT_SPEC_FILES:
+            yield _sse({"type": "error", "msg": f"Invalid format: {format}"})
+            yield _sse({"type": "done", "code": 1})
+            return
+        try:
+            dt.date.fromisoformat(start)
+            dt.date.fromisoformat(end)
+        except ValueError:
+            yield _sse({"type": "error", "msg": "Invalid date format. Use YYYY-MM-DD."})
+            yield _sse({"type": "done", "code": 1})
+            return
+        sel = [l for l in lists if l and l != "all"]
+        if not sel:
+            yield _sse({"type": "error", "msg": "Select at least one station list."})
+            yield _sse({"type": "done", "code": 1})
+            return
+
+        cmd = [sys.executable, "-m", "earthscope_positions.es_pos", "export", format]
+        for l in sel:
+            cmd += ["-i", l]
+        cmd += ["--start-time", start, "--stop-time", end,
+                "--data-directory", str(paths.base_dir())]
+        if format == "geojson":
+            cmd += ["--format", gj_format]
+        if force:
+            cmd += ["--force"]
+
+        yield _sse({"type": "log", "msg": "es-pos " + " ".join(cmd[3:])})
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=str(_project_root()),
+        )
+        try:
+            async for raw in proc.stdout:  # type: ignore[union-attr]
+                line = raw.decode(errors="replace").rstrip()
+                if line:
+                    yield _sse({"type": "log", "msg": line})
+            await proc.wait()
+        except asyncio.CancelledError:
+            if proc.returncode is None:
+                proc.terminate()
+            yield _sse({"type": "done", "code": 1, "msg": "Canceled."})
+            return
+        code = proc.returncode or 0
         yield _sse({"type": "done", "code": code,
-                    "msg": "Completed. File index updated." if code == 0
-                           else f"Completed with {errors} day(s) having fetch errors."})
+                    "msg": "Done." if code == 0 else f"Export exited with code {code}"})
 
     return StreamingResponse(
         generate(),
@@ -1178,7 +1630,7 @@ async def api_fetch_missing(
 # ── Plots file browser API ───────────────────────────────────────────────────
 
 def _plots_root() -> pathlib.Path:
-    return _project_root() / "data" / "plots"
+    return paths.plots_dir()
 
 
 def _safe_plots_path(rel: str) -> pathlib.Path | None:
@@ -1191,6 +1643,39 @@ def _safe_plots_path(rel: str) -> pathlib.Path | None:
     if not str(candidate).startswith(str(root)):
         return None
     return candidate
+
+
+class _SavePlotBody(BaseModel):
+    filename: str
+    data_url: str  # "data:image/png;base64,...."
+
+
+@app.post("/api/plots/save")
+async def api_plots_save(body: _SavePlotBody) -> JSONResponse:
+    """Save a client-rendered PNG under data/plots/positions/ (shows in File Plots)."""
+    import base64
+
+    name = pathlib.Path(body.filename).name  # strip any directory components
+    if not name:
+        return JSONResponse({"error": "Invalid filename"}, status_code=400)
+    if not name.lower().endswith(".png"):
+        name += ".png"
+
+    payload = body.data_url
+    if "," in payload:
+        payload = payload.split(",", 1)[1]
+    try:
+        raw = base64.b64decode(payload)
+    except Exception:
+        return JSONResponse({"error": "Invalid image data"}, status_code=400)
+
+    out_dir = _plots_root() / "positions"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / name
+    out_path.write_bytes(raw)
+    rel = out_path.relative_to(_plots_root())
+    _log.info("[plots] saved positions plot %s (%d bytes)", rel, len(raw))
+    return JSONResponse({"path": str(rel), "name": name})
 
 
 @app.get("/api/plots/list")
@@ -1229,16 +1714,11 @@ async def api_plots_img(path: str) -> FileResponse | JSONResponse:
 
 # ── /api/station-builder ─────────────────────────────────────────────────────
 
-@app.get("/api/station-builder/data")
-async def api_station_builder_data() -> JSONResponse:
-    """All indexed stations with coordinates and available geosncl streams.
+def _stations_payload(geosncls) -> list[dict]:
+    """Group geosncls by station FCID and attach coordinates (from coordinates.csv).
 
-    Returns:
-        {"stations": [{"site": "P143", "lat": 38.76, "lon": -119.76, "streams": [...]}]}
+    Returns [{"site": "P143", "lat": 38.76, "lon": -119.76, "streams": [...]}].
     """
-    geosncls = _indexed_geosncls()
-
-    # Group by 4-char station FCID (first dot-segment of the geosncl)
     by_station: dict[str, list[str]] = {}
     for gs in geosncls:
         parts = gs.split(".")
@@ -1257,8 +1737,22 @@ async def api_station_builder_data() -> JSONResponse:
             "lon": coord.longitude if coord else None,
             "streams": sorted(by_station[site]),
         })
+    return stations
 
-    return JSONResponse({"stations": stations})
+
+@app.get("/api/station-builder/data")
+async def api_station_builder_data() -> JSONResponse:
+    """All known stations with coordinates and available geosncl streams.
+
+    Streams are the union of every station-list file (data/station-lists/) and
+    everything already downloaded (the Arrow file index), so the map shows all
+    unique station/streams — not just the ones that happen to have data on disk.
+
+    Returns:
+        {"stations": [{"site": "P143", "lat": 38.76, "lon": -119.76, "streams": [...]}]}
+    """
+    geosncls = sorted(set(_all_list_geosncls()) | set(_indexed_geosncls()))
+    return JSONResponse({"stations": _stations_payload(geosncls)})
 
 
 # ── /api/replay ──────────────────────────────────────────────────────────────
@@ -1275,12 +1769,14 @@ class _ReplayPreloadBody(BaseModel):
     filter_sol_types: list[str] = []
     time_scale: float = 1.0
     apply_latency: bool = True
+    select_by_arrival: bool = False
+    output_format: str = "compact"   # "compact" | "geojson"
     bootstrap_server: str = "localhost:9092"
     topic: str = "protected.gnss.positions.shakealert.geojson.compact"
 
 
 def _replay_data_dir() -> pathlib.Path:
-    return _data_dir_override or (_project_root() / "data" / "arrow")
+    return paths.arrow_dir()
 
 
 def _parse_replay_dt(s: str) -> dt.datetime:
@@ -1329,7 +1825,13 @@ async def api_replay_preload(body: _ReplayPreloadBody) -> JSONResponse:
         "topic":            body.topic,
         "time_scale":       body.time_scale,
         "apply_latency":    body.apply_latency,
+        "select_by_arrival": body.select_by_arrival,
+        "output_format":    "geojson" if body.output_format == "geojson" else "compact",
         "start_data_ms":    start_data_ms,
+        # Intra-day data-time window (epoch ms) so a 2-minute selection replays
+        # only those 2 minutes, not the whole day's file.
+        "window_start_ms":  int(start_dt.timestamp() * 1000),
+        "window_stop_ms":   int(stop_dt.timestamp() * 1000),
         "start_time":       body.start_time,
         "stop_time":        body.stop_time,
         "station_lists":    body.station_lists,
@@ -1344,23 +1846,36 @@ async def api_replay_preload(body: _ReplayPreloadBody) -> JSONResponse:
 
 @app.get("/api/replay/status")
 async def api_replay_status() -> JSONResponse:
-    return JSONResponse(_replay_mod.get_state())
+    # Drop the (potentially large) file list from the polled payload — the UI
+    # only needs the count — so status stays lean at ~1 Hz polling.
+    st = _replay_mod.get_state()
+    files = st.get("files")
+    if isinstance(files, list):
+        st["files_count"] = len(files)
+        st.pop("files", None)
+    return JSONResponse(st)
 
 
 @app.post("/api/replay/start", response_model=None)
 async def api_replay_start() -> JSONResponse:
-    """Start the currently-preloaded replay (no job_id required — for external curl triggers)."""
+    """Start the currently-preloaded replay (no job_id required — for external curl triggers).
+
+    Returns immediately: the replay's schedule is anchored to this request time,
+    so the data timeline is synchronized to when the curl call was made.  The
+    measured start→first-write delay is reported via /api/replay/status
+    (startup_delay_ms) rather than by blocking here.
+    """
     state = _replay_mod.get_state()
     status = state.get("status")
-    if status == "running" or status == "starting":
-        return JSONResponse({"status": "running", "job_id": state.get("job_id")})
-    ok = _replay_mod.start_preloaded()
-    if not ok:
-        return JSONResponse(
-            {"error": f"No preloaded replay ready (status={status!r})"},
-            status_code=409,
-        )
-    return JSONResponse({"status": "running"})
+    if status not in ("running", "starting"):
+        ok = _replay_mod.start_preloaded()
+        if not ok:
+            return JSONResponse(
+                {"error": f"No preloaded replay ready (status={status!r})"},
+                status_code=409,
+            )
+    s = _replay_mod.get_state()
+    return JSONResponse({"status": "running", "start_requested_ms": s.get("start_requested_ms")})
 
 
 @app.post("/api/replay/{job_id}/go", response_model=None)
@@ -1371,7 +1886,9 @@ async def api_replay_go(job_id: str) -> JSONResponse:
         if state.get("status") == "preloaded" and state.get("job_id") != job_id:
             return JSONResponse({"error": "Job ID mismatch"}, status_code=403)
         return JSONResponse({"error": f"Cannot start: status={state.get('status')}"}, status_code=409)
-    return JSONResponse({"status": "running"})
+    loop = asyncio.get_event_loop()
+    timing = await loop.run_in_executor(None, _replay_mod.wait_first_write, 30.0)
+    return JSONResponse({"status": "running", **timing})
 
 
 @app.post("/api/replay/cancel", response_model=None)
@@ -1379,7 +1896,13 @@ async def api_replay_cancel() -> JSONResponse:
     ok = _replay_mod.cancel_replay()
     if not ok:
         return JSONResponse({"error": "Nothing to cancel"}, status_code=409)
-    return JSONResponse({"status": "canceling"})
+    s = _replay_mod.get_state()
+    return JSONResponse({
+        "status": "canceling",
+        "sent": s.get("sent", 0),
+        "cancel_requested_ms": s.get("cancel_requested_ms"),
+        "startup_delay_ms": s.get("startup_delay_ms"),
+    })
 
 
 @app.post("/api/replay/reset", response_model=None)
@@ -1473,6 +1996,44 @@ def _ppsd_group_label(key: str, mode: str) -> str:
     return key  # by-stream
 
 
+def _ppsd_slugify(s: str) -> str:
+    """Filesystem-safe plot name: lowercase, dashes, no underscores/parens."""
+    s = s.lower().replace("(", "").replace(")", "")
+    s = re.sub(r"[^a-z0-9]+", "-", s)
+    return s.strip("-") or "plot"
+
+
+def _ppsd_label_and_slug(
+    key: str,
+    mode: str,
+    sol_labels: dict[str, str],
+    center_labels: dict[str, str],
+) -> tuple[str, str]:
+    """Return (title, filename-slug) for a PPSD group.
+
+    Uses the caller-supplied stream-type enumeration labels (from the SPA's
+    constants) for the solution type, so filenames track the enum names.
+    """
+    def sol(st: str) -> str:
+        return sol_labels.get(st) or _sol_type_label(st)
+
+    def ctr(c: str) -> str:
+        return center_labels.get(c) or _CENTER_LABELS.get(c, c)
+
+    if mode == "all":
+        label = "All Stations"
+    elif mode == "by-center":
+        label = f"{key} {ctr(key)}"
+    elif mode == "by-solution":
+        label = sol(key)                       # e.g. "Onboard Sept"
+    elif mode == "by-center-solution":
+        c, st = key.split("\x00", 1)
+        label = f"{c} {sol(st)}"
+    else:
+        label = key                            # by-stream: geosncl
+    return label, _ppsd_slugify(label)
+
+
 @app.get("/api/ppsd/run")
 async def api_ppsd_run(
     lists: list[str] = Query([]),
@@ -1481,9 +2042,20 @@ async def api_ppsd_run(
     mode: str = Query("by-stream"),
     centers: str = Query(""),    # comma-sep filter; empty = all
     sol_types: str = Query(""),  # comma-sep combined 2-char codes; empty = all
+    sol_labels: str = Query(""),     # JSON {code: label} from the SPA enumeration
+    center_labels: str = Query(""),  # JSON {code: label}
 ) -> StreamingResponse:
     def _sse(obj: dict) -> str:
         return f"data: {json.dumps(obj)}\n\n"
+
+    try:
+        sol_label_map = json.loads(sol_labels) if sol_labels else {}
+    except Exception:
+        sol_label_map = {}
+    try:
+        center_label_map = json.loads(center_labels) if center_labels else {}
+    except Exception:
+        center_label_map = {}
 
     async def generate():
         if not lists:
@@ -1565,11 +2137,11 @@ async def api_ppsd_run(
             f"{n_groups} group(s), {len(all_files)} file(s)  ({start} → {end})"})
 
         loop = asyncio.get_event_loop()
-        run_dir = _project_root() / "data" / "plots" / "ppsd" / f"{start}_{end}"
+        run_dir = paths.plots_dir() / "ppsd" / f"{start}_{end}"
         written_total = 0
 
         for i, (key, files) in enumerate(groups):
-            label = _ppsd_group_label(key, mode)
+            label, slug = _ppsd_label_and_slug(key, mode, sol_label_map, center_label_map)
             title_prefix = "" if mode == "by-stream" else "Combined"
 
             yield _sse({"type": "progress",
@@ -1591,19 +2163,21 @@ async def api_ppsd_run(
                 n_loaded += 1
                 yield _sse({"type": "log", "msg": f"\tLoaded {n_loaded} / {n_files}."})
 
-            def _render(files=files, label=label, title_prefix=title_prefix):
+            def _render(files=files, label=label, slug=slug, title_prefix=title_prefix):
                 from earthscope_positions.export import ppsd_writer as pw
                 return pw.write_ppsd_from_caches(
                     files, run_dir,
-                    label=label, title_prefix=title_prefix,
+                    label=label, slug=slug, title_prefix=title_prefix,
                 )
 
             try:
                 p: pathlib.Path | None = await loop.run_in_executor(_executor, _render)
                 if p:
                     written_total += 1
+                    # Path relative to the plots root, so the File Plots tab can
+                    # open it directly (?path=...).
                     try:
-                        rel = str(p.relative_to(_project_root()))
+                        rel = str(p.relative_to(_plots_root()))
                     except ValueError:
                         rel = str(p)
                     yield _sse({"type": "file", "path": rel, "label": label,
@@ -1635,6 +2209,18 @@ async def serve_spa(full_path: str) -> FileResponse | JSONResponse:
     candidate = spa / full_path
     if candidate.exists() and candidate.is_file():
         return FileResponse(candidate)
+
+    # A request for a static asset (has a file extension, e.g. a hashed JS/CSS
+    # chunk) that doesn't exist must 404 — NOT fall back to index.html.  After a
+    # rebuild deletes old hashed chunks, an already-open tab requests them; if we
+    # returned index.html the browser would try to run HTML as a JS module and
+    # navigation would silently fail.  A clean 404 lets the client detect the
+    # stale-build condition and reload.  SPA routes are extensionless, so this
+    # only affects asset-like paths.
+    last_segment = full_path.rsplit("/", 1)[-1]
+    if full_path.startswith("assets/") or "." in last_segment:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+
     index = spa / "index.html"
     if index.exists():
         return FileResponse(index)

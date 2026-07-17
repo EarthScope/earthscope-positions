@@ -1,6 +1,16 @@
 import { useQuasar } from "quasar";
 
-export function useListDelete(refresh: () => Promise<void> | void) {
+/**
+ * Station-list actions (delete + rename) with confirm/prompt dialogs.
+ *
+ * @param refresh    called after a successful delete/rename to reload the list options
+ * @param onRenamed  optional: (oldName, newName) so callers can update any
+ *                   currently-selected list references
+ */
+export function useListDelete(
+  refresh: () => Promise<void> | void,
+  onRenamed?: (oldName: string, newName: string) => void,
+) {
   const $q = useQuasar();
 
   function confirmDeleteList(name: string) {
@@ -29,5 +39,40 @@ export function useListDelete(refresh: () => Promise<void> | void) {
     });
   }
 
-  return { confirmDeleteList };
+  function promptRenameList(name: string) {
+    if (!name || name === "all") return;
+    $q.dialog({
+      title: "Rename list",
+      message: `New name for "${name}":`,
+      prompt: { model: name, type: "text", isValid: (v: string) => !!v.trim() },
+      cancel: { flat: true, label: "Cancel" },
+      ok: { flat: true, label: "Rename", color: "primary" },
+      persistent: true,
+    }).onOk(async (raw: string) => {
+      const newName = String(raw).trim();
+      if (!newName || newName === name) return;
+      try {
+        const resp = await fetch(
+          `/api/station-lists/${encodeURIComponent(name)}/rename`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ new_name: newName }),
+          },
+        );
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+          $q.notify({ type: "negative", message: data.error ?? "Rename failed" });
+          return;
+        }
+        $q.notify({ type: "positive", message: `Renamed to "${data.name ?? newName}"` });
+        await refresh();
+        onRenamed?.(name, data.name ?? newName);
+      } catch {
+        $q.notify({ type: "negative", message: "Rename failed" });
+      }
+    });
+  }
+
+  return { confirmDeleteList, promptRenameList };
 }

@@ -1,22 +1,19 @@
 """
 GeoJSON writer for GNSS position Arrow files.
 
-Two output formats:
+Both formats are written as JSONL (newline-delimited JSON) — one JSON object
+per line — so files stream/append easily and stay uniform.
 
-  compact  Newline-delimited JSON (NDJSON) — one record per sample:
+  compact  One compact record per sample  (*.compact.geojson.jsonl):
              {"time":...,"Q":...,"type":"ENU","SNCL":"...","coor":[E,N,U],
               "err":[Eerr,Nerr,Uerr],"rate":1}
 
-  full     GeoJSON FeatureCollection — all samples for the day as features:
-             {"type":"FeatureCollection",
-              "properties":{"sampleRate":1,"SNCL":"..."},
-              "features":[
-                {"type":"Feature",
-                 "geometry":{"type":"Point","coordinates":[E,N,U]},
-                 "properties":{"coordinateType":"ENU","time":...,
-                               "EError":...,"NError":...,"UError":...,
-                               "quality":...}},
-                ...]}
+  full     One GeoJSON Feature per sample  (*.full.geojson.jsonl):
+             {"type":"Feature",
+              "geometry":{"type":"Point","coordinates":[E,N,U]},
+              "properties":{"coordinateType":"ENU","SNCL":"...","time":...,
+                            "EError":...,"NError":...,"UError":...,
+                            "quality":...,"sampleRate":1}}
 
 Output paths are controlled by geojson_path_spec.toml.
 """
@@ -63,7 +60,7 @@ _SPEC_DEFAULTS: dict = {
         "root":      "data/geojson/compact",
         "directory": "{year}/{network}/{station}",
         "filename":  "{geosncl}.{year}.{julday}",
-        "extension": ".jsonl",
+        "extension": ".compact.geojson.jsonl",
         "options": {
             "round_decimals": None,   # None = full precision; set to e.g. 6 for cleaner output
         },
@@ -72,9 +69,8 @@ _SPEC_DEFAULTS: dict = {
         "root":      "data/geojson/full",
         "directory": "{year}/{network}/{station}",
         "filename":  "{geosncl}.{year}.{julday}",
-        "extension": ".geojson",
+        "extension": ".full.geojson.jsonl",
         "options": {
-            "compact_json":    True,
             "round_decimals":  6,
         },
     },
@@ -245,9 +241,11 @@ def write_arrow_to_full_geojson(
     verbose: bool = True,
 ) -> pathlib.Path | None:
     """
-    Write a GeoJSON FeatureCollection — one file per station-day.
-    Samples with null east/north/up are skipped (Point must have coordinates).
-    Returns the output path, or None if no valid samples.
+    Write full GeoJSON as JSONL — one GeoJSON Feature per line, one file per
+    station-day.  Each Feature carries SNCL and sampleRate in its properties (no
+    enclosing FeatureCollection).  Samples with null east/north/up are skipped
+    (a Point must have coordinates).  Returns the output path, or None if no
+    valid samples.
     """
     import pyarrow.ipc as ipc
 
@@ -279,32 +277,19 @@ def write_arrow_to_full_geojson(
             return v
         return round(v, rd)
 
-    features = []
+    # First pass: collect valid samples so the per-feature sampleRate can be
+    # computed before we write.
+    rows: list[tuple] = []
     valid_times: list[int] = []
-
     for t, e, n, u, se, sn, su, q in zip(
         times, east, north, up, sigEE, sigNN, sigUU, q_col
     ):
         if t is None or e is None or n is None or u is None:
             continue
         valid_times.append(t)
-        features.append({
-            "type": "Feature",
-            "geometry": {
-                "type": "Point",
-                "coordinates": [_r(e), _r(n), _r(u)],
-            },
-            "properties": {
-                "coordinateType": "ENU",
-                "time":           t,
-                "EError":         _r(se),
-                "NError":         _r(sn),
-                "UError":         _r(su),
-                "quality":        q,
-            },
-        })
+        rows.append((t, e, n, u, se, sn, su, q))
 
-    if not features:
+    if not rows:
         if verbose:
             print(f"  [skip] {arrow_path.name} -- no valid (non-null) samples",
                   file=sys.stderr)
@@ -312,32 +297,41 @@ def write_arrow_to_full_geojson(
 
     rate = _sample_rate_hz(valid_times)
 
-    collection = {
-        "type": "FeatureCollection",
-        "properties": {
-            "sampleRate": rate,
-            "SNCL":       geosncl,
-        },
-        "features": features,
-    }
-
     pvars = _path_vars(geosncl, station, network, location, chan_base, valid_times[0])
     section = spec["full"]
     out = _out_path(section, pvars)
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    json_opts = orjson.OPT_SERIALIZE_NUMPY
-    if not opts.get("compact_json", True):
-        json_opts |= orjson.OPT_INDENT_2
-
-    out.write_bytes(orjson.dumps(collection, option=json_opts))
+    n_written = 0
+    with out.open("wb") as fh:
+        for t, e, n, u, se, sn, su, q in rows:
+            feature = {
+                "type": "Feature",
+                "geometry": {
+                    "type": "Point",
+                    "coordinates": [_r(e), _r(n), _r(u)],
+                },
+                "properties": {
+                    "coordinateType": "ENU",
+                    "SNCL":           geosncl,
+                    "time":           t,
+                    "EError":         _r(se),
+                    "NError":         _r(sn),
+                    "UError":         _r(su),
+                    "quality":        q,
+                    "sampleRate":     rate,
+                },
+            }
+            fh.write(orjson.dumps(feature, option=orjson.OPT_SERIALIZE_NUMPY))
+            fh.write(b"\n")
+            n_written += 1
 
     if verbose:
         try:
             display = out.relative_to(pathlib.Path.cwd())
         except ValueError:
             display = out
-        print(f"  full     {display}  ({len(features):,} features, {out.stat().st_size:,} B)")
+        print(f"  full     {display}  ({n_written:,} features, {out.stat().st_size:,} B)")
 
     return out
 

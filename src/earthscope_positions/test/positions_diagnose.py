@@ -38,6 +38,7 @@ import orjson
 import pyarrow.ipc
 import requests
 
+from earthscope_positions import paths
 from earthscope_positions.fetch.positions_fetch import (
     _ensure_token,
     _load_station_list,
@@ -506,6 +507,16 @@ Examples:
         metavar="FILE",
         help="Output JSONL path (default: data/positions_diagnose/diagnose_TIMESTAMP.jsonl).",
     )
+    ap.add_argument(
+        "--data-directory",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Base data directory (default: $ES_POS_DATA_DIRECTORY or ./data).  "
+            "Station lists are read from <PATH>/station-lists; output goes to "
+            "<PATH>/positions_diagnose."
+        ),
+    )
     return ap
 
 
@@ -549,10 +560,10 @@ def _dispatch(args: argparse.Namespace) -> None:
     if args.output:
         output_path = pathlib.Path(args.output)
         if output_path.parent == pathlib.Path("."):
-            output_path = _project_root() / "data" / "positions_diagnose" / output_path.name
+            output_path = paths.positions_diagnose_dir() / output_path.name
     else:
         ts = dt.datetime.now(_UTC).strftime("%Y%m%dT%H%M%SZ")
-        output_path = _project_root() / "data" / "positions_diagnose" / f"diagnose_{ts}.jsonl"
+        output_path = paths.positions_diagnose_dir() / f"diagnose_{ts}.jsonl"
 
     worker_counts = _logspace_workers(args.max_workers)
     n_phases = len(worker_counts) * 2
@@ -579,6 +590,7 @@ def _dispatch(args: argparse.Namespace) -> None:
 def main() -> None:
     ap = _build_parser()
     args = ap.parse_args()
+    paths.set_base_dir(getattr(args, "data_directory", None))
     _dispatch(args)
 
 

@@ -92,8 +92,11 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, nextTick } from "vue";
+import { ref, computed, onMounted, onUnmounted, nextTick, watch } from "vue";
+import { useRoute } from "vue-router";
 import axios from "axios";
+
+const route = useRoute();
 
 interface Entry {
   name: string;
@@ -176,6 +179,28 @@ function handleClick(node: TreeNode) {
 function onImageLoad() { imageLoading.value = false; imageOk.value = true; }
 function onImageError() { imageLoading.value = false; imageOk.value = false; }
 
+// ── Deep-link: open a specific plot (e.g. from the PPSD tab) ──────────────────
+// `path` is relative to the plots root, e.g. "ppsd/2026-01-01_2026-01-31/ppsd-x.png".
+async function openPath(path: string) {
+  if (!path) return;
+  const parts = path.split("/");
+  let nodes = tree.value;
+  let prefix = "";
+  for (let i = 0; i < parts.length - 1; i++) {
+    prefix = prefix ? `${prefix}/${parts[i]}` : parts[i];
+    const dir = nodes.find((n) => n.path === prefix && n.type === "dir");
+    if (!dir) break;
+    expanded.value.add(dir.path);
+    await fetchChildren(dir);
+    nodes = dir.children ?? [];
+  }
+  selectedPath.value = path;
+  imageLoading.value = true;
+  imageOk.value = false;
+  await nextTick();
+  document.querySelector(`[data-plot-path="${path}"]`)?.scrollIntoView({ block: "nearest" });
+}
+
 // ── Keyboard navigation ───────────────────────────────────────────────────────
 
 const flatFiles = computed(() => flatTree.value.filter(({ node }) => node.type === "file"));
@@ -210,6 +235,13 @@ onMounted(async () => {
   } finally {
     rootLoading.value = false;
   }
+  const q = route.query.path;
+  if (typeof q === "string" && q) await openPath(q);
+});
+
+// Handle navigation to /plots?path=... while the page is already alive.
+watch(() => route.query.path, (q) => {
+  if (typeof q === "string" && q && q !== selectedPath.value) openPath(q);
 });
 
 onUnmounted(() => {
