@@ -1,1 +1,0 @@
-import{r as t}from"./index-DS3D9uzf.js";const e=t("all"),s=t([]),n=t(""),o=t(""),a=t(""),c=t(null),r=t(7),d=t("7d");function i(){return{selectedList:e,selectedLists:s,searchText:n,startDate:o,endDate:a,dateRange:c,rangeDays:r,activeWindow:d}}export{i as u};
