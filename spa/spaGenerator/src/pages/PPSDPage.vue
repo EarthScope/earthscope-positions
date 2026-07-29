@@ -11,11 +11,11 @@
           <q-separator />
           <q-card-section class="q-gutter-sm">
 
-            <!-- Station lists -->
+            <!-- Stream lists -->
             <q-select
               v-model="selectedLists"
               :options="listOptions"
-              label="Station list(s)"
+              label="Stream list(s)"
               multiple
               use-chips
               dense
@@ -210,7 +210,7 @@
           <q-separator />
           <q-card-section class="log-section" ref="logEl">
             <div v-if="!logs.length" class="text-grey-5 text-caption">
-              Select station list(s) and a date range, then click an action button.
+              Select stream list(s) and a date range, then click an action button.
             </div>
             <div
               v-for="(entry, i) in logs"
@@ -262,6 +262,7 @@ import {
   SOL_TYPE_LABELS, PROC_CENTERS,
 } from "../constants/streamTypes";
 import type { PpsdMode } from "../types";
+import { createRangeSelectHandler } from "../utils/dateRangePicker";
 
 const { selectedLists, startDate, endDate, dateRange } = useSharedControls();
 const {
@@ -296,7 +297,7 @@ async function fetchFilterOptions() {
   try {
     const params = new URLSearchParams();
     for (const l of selectedLists.value) params.append("lists", l);
-    const res = await fetch(`/api/station-lists/filter-options?${params}`);
+    const res = await fetch(`/api/stream-lists/filter-options?${params}`);
     if (!res.ok) return;
     const data = await res.json();
     availableCenters.value  = data.centers  ?? [];
@@ -311,7 +312,7 @@ async function fetchFilterOptions() {
 
 async function loadAvailableLists() {
   try {
-    const res = await fetch("/api/station-lists");
+    const res = await fetch("/api/stream-lists");
     const data = await res.json();
     availableLists.value = data.lists ?? [];
   } catch { /* ignore */ }
@@ -336,11 +337,14 @@ function toggleItem(list: string[], item: string): void {
   else list.splice(idx, 1);
 }
 
-function onRangeSelect(val: { from: string; to: string } | null) {
-  if (!val) return;
-  startDate.value = val.from;
-  endDate.value = val.to;
-}
+const onRangeSelect = createRangeSelectHandler(
+  (from, to) => { dateRange.value = { from, to }; },
+  (from, to) => {
+    dateRange.value = { from, to };
+    startDate.value = from;
+    endDate.value = to;
+  },
+);
 
 function clearLog() {
   logs.value = [];

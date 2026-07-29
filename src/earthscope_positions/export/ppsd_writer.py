@@ -429,14 +429,21 @@ def _date_range_label(arrow_files: Sequence[pathlib.Path]) -> str:
 
 def write_ppsd_from_caches(
     files: list[pathlib.Path],
-    run_dir: pathlib.Path,
+    output_root: pathlib.Path,
     *,
     label: str,
+    mode: str,
+    date_range: str,
     slug: str | None = None,
     title_prefix: str = "",
     verbose: bool = False,
 ) -> pathlib.Path | None:
-    """Merge cached PPSD data for *files* and render a PNG into *run_dir*.
+    """Merge cached PPSD data for *files* and render a PNG under *output_root*.
+
+    Output path: ``<output_root>/<mode>/ppsd-<slug>/ppsd-<slug>_<date_range>.png``
+    — grouping by PPSD type (*mode*) first, then by plot identity, so repeated
+    runs for the same station/group accumulate side-by-side instead of
+    scattering across per-run date folders.
 
     Any file whose cache is missing or stale is computed on-the-fly (fallback).
     Returns the written PNG path, or None if no valid data was found.
@@ -472,9 +479,10 @@ def write_ppsd_from_caches(
     fig.suptitle(f"PPSD — {label}", fontsize=11, fontweight="bold")
     plt.tight_layout()
 
-    run_dir.mkdir(parents=True, exist_ok=True)
     safe = slug if slug else re.sub(r"[^\w.+()-]", "_", label)
-    out = run_dir / f"ppsd-{safe}.png"
+    group_dir = output_root / mode / f"ppsd-{safe}"
+    group_dir.mkdir(parents=True, exist_ok=True)
+    out = group_dir / f"ppsd-{safe}_{date_range}.png"
     plt.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
@@ -497,11 +505,16 @@ def write_ppsd(
     separate: bool = True,
     verbose: bool = True,
     group_label: str | None = None,
+    mode: str | None = None,
 ) -> list[pathlib.Path]:
     """Compute and write PPSD plots (legacy direct path, used by CLI).
 
     separate=True (default): one 3-panel PNG per geosncl.
     separate=False: accumulate all files into one combined plot.
+
+    Output path: ``<output_root>/<mode>/ppsd-<name>/ppsd-<name>_<date-range>.png``
+    — *mode* defaults to ``"by-stream"`` (separate), ``"by-center"`` (when
+    *group_label* is given), or ``"all"`` (combined, no group_label).
     """
     cmap = ppsd_colormap()
 
@@ -526,12 +539,11 @@ def write_ppsd(
         return []
 
     date_label = _date_range_label(arrow_files)
-    run_dir = output_root / date_label
-    run_dir.mkdir(parents=True, exist_ok=True)
 
     written: list[pathlib.Path] = []
 
     if separate:
+        effective_mode = mode or "by-stream"
         groups: dict[str, list[pathlib.Path]] = {}
         for p in arrow_files:
             g = _geosncl_from_path(p)
@@ -540,16 +552,19 @@ def write_ppsd(
             groups.setdefault(g, []).append(p)
 
         for geosncl, files in sorted(groups.items()):
-            out = _write_one_ppsd(geosncl, files, run_dir, cmap, verbose=verbose)
+            out = _write_one_ppsd(geosncl, files, output_root, cmap,
+                                  mode=effective_mode, date_range=date_label, verbose=verbose)
             if out:
                 written.append(out)
     else:
+        effective_mode = mode or ("by-center" if group_label else "all")
         if group_label:
             label = group_label
         else:
             geosncls = sorted({g for p in arrow_files if (g := _geosncl_from_path(p)) is not None})
             label = "+".join(geosncls[:3]) + (f"+…({len(geosncls)})" if len(geosncls) > 3 else "")
-        out = _write_one_ppsd(label, list(arrow_files), run_dir, cmap, verbose=verbose,
+        out = _write_one_ppsd(label, list(arrow_files), output_root, cmap,
+                              mode=effective_mode, date_range=date_label, verbose=verbose,
                               title_prefix="Combined")
         if out:
             written.append(out)
@@ -560,9 +575,11 @@ def write_ppsd(
 def _write_one_ppsd(
     label: str,
     files: list[pathlib.Path],
-    run_dir: pathlib.Path,
+    output_root: pathlib.Path,
     cmap,  # type: ignore[type-arg]
     *,
+    mode: str,
+    date_range: str,
     verbose: bool,
     title_prefix: str = "",
 ) -> pathlib.Path | None:
@@ -603,7 +620,9 @@ def _write_one_ppsd(
     plt.tight_layout()
 
     safe = re.sub(r'[^\w.+()-]', '_', label)
-    out = run_dir / f"ppsd-{safe}.png"
+    group_dir = output_root / mode / f"ppsd-{safe}"
+    group_dir.mkdir(parents=True, exist_ok=True)
+    out = group_dir / f"ppsd-{safe}_{date_range}.png"
     plt.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
 

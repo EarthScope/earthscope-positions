@@ -41,11 +41,11 @@
               />
             </template>
 
-            <!-- Station lists -->
+            <!-- Stream lists -->
             <q-select
               v-model="selectedLists"
               :options="listOptions"
-              label="Station list(s)"
+              label="Stream list(s)"
               multiple use-chips dense outlined emit-value map-options
               :disable="running"
               class="q-mt-sm"
@@ -133,7 +133,7 @@
           <q-separator />
           <q-card-section class="log-section" ref="logEl">
             <div v-if="!logs.length" class="text-grey-5 text-caption">
-              Choose a format, station list(s), and date range, then click Convert.
+              Choose a format, stream list(s), and date range, then click Convert.
             </div>
             <div
               v-for="(entry, i) in logs" :key="i"
@@ -151,9 +151,10 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, nextTick } from "vue";
 import { useQuasar } from "quasar";
-import { getStationLists, getExportSpec, saveExportSpec } from "../api";
+import { getStreamLists, getExportSpec, saveExportSpec } from "../api";
 import { useExportJob } from "../composables/useExportJob";
 import type { ExportFormat } from "../composables/useExportJob";
+import { createRangeSelectHandler } from "../utils/dateRangePicker";
 
 const $q = useQuasar();
 
@@ -185,11 +186,14 @@ function specFileFor(f: ExportFormat): string {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────────
-function onRangeSelect(val: { from: string; to: string } | null) {
-  if (!val?.from || !val?.to) return;
-  startDate.value = val.from;
-  endDate.value = val.to;
-}
+const onRangeSelect = createRangeSelectHandler(
+  (from, to) => { dateRange.value = { from, to }; },
+  (from, to) => {
+    dateRange.value = { from, to };
+    startDate.value = from;
+    endDate.value = to;
+  },
+);
 
 async function scrollLog() {
   await nextTick();
@@ -199,7 +203,7 @@ async function scrollLog() {
 
 async function loadListOptions() {
   try {
-    const r = await getStationLists();
+    const r = await getStreamLists();
     listOptions.value = r.lists.map(l => ({ label: l, value: l }));
   } catch { listOptions.value = []; }
 }

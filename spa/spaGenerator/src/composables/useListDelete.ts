@@ -1,7 +1,7 @@
 import { useQuasar } from "quasar";
 
 /**
- * Station-list actions (delete + rename) with confirm/prompt dialogs.
+ * Stream/station-list actions (delete + rename) with confirm/prompt dialogs.
  *
  * @param refresh    called after a successful delete/rename to reload the list options
  * @param onRenamed  optional: (oldName, newName) so callers can update any
@@ -10,6 +10,7 @@ import { useQuasar } from "quasar";
 export function useListDelete(
   refresh: () => Promise<void> | void,
   onRenamed?: (oldName: string, newName: string) => void,
+  basePath: string = "/api/stream-lists",
 ) {
   const $q = useQuasar();
 
@@ -23,7 +24,7 @@ export function useListDelete(
       persistent: true,
     }).onOk(async () => {
       try {
-        const resp = await fetch(`/api/station-lists/${encodeURIComponent(name)}`, {
+        const resp = await fetch(`${basePath}/${encodeURIComponent(name)}`, {
           method: "DELETE",
         });
         if (!resp.ok) {
@@ -53,7 +54,7 @@ export function useListDelete(
       if (!newName || newName === name) return;
       try {
         const resp = await fetch(
-          `/api/station-lists/${encodeURIComponent(name)}/rename`,
+          `${basePath}/${encodeURIComponent(name)}/rename`,
           {
             method: "POST",
             headers: { "Content-Type": "application/json" },

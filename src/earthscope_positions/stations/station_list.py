@@ -1,10 +1,10 @@
 """
-station_list - discover and manage GNSS PPP position stream station lists.
+station_list - discover and manage GNSS PPP position stream lists.
 
 CLI subcommands:
   get datasource  search /discover/datasource/stream (earthscope-sdk)
   get radial      search /discover/gnss/radial (direct REST — no SDK method)
-  filter          merge and filter existing station list files
+  filter          merge and filter existing stream list files
 """
 
 import argparse
@@ -48,6 +48,26 @@ def _discover():
     return _client.discover
 
 
+def close_client() -> None:
+    """Close the shared SDK client, releasing its underlying async httpx client
+    and retry context.
+
+    A short-lived CLI process that skips this leaves the SDK's async
+    ``RetrySettings.retry_context`` generator pending until interpreter shutdown,
+    which (depending on GC timing) prints spurious warnings — "Task was destroyed
+    but it is pending!" and "coroutine method 'aclose' … was never awaited".
+    Closing explicitly while the event loop is still healthy avoids that race.
+    """
+    global _client
+    if _client is not None:
+        try:
+            if not _client.is_closed:
+                _client.close()
+        except Exception:
+            pass
+        _client = None
+
+
 # ---------------------------------------------------------------------------
 # API error handling
 # ---------------------------------------------------------------------------
@@ -71,7 +91,7 @@ def _api_error(exc: Exception) -> None:
 # ---------------------------------------------------------------------------
 
 def _record(edid: str, geosncl: Optional[str], facility, software) -> dict:
-    """Build a station-list record.  facility/software are plain strings now
+    """Build a stream-list record.  facility/software are plain strings now
     (the SDK returns them as strings rather than enums)."""
     return {
         "geosncl": geosncl,
@@ -145,7 +165,7 @@ def _get_datasource(args) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Programmatic helpers (used by the webserver Station Builder page)
+# Programmatic helpers (used by the webserver Station/Stream List Builder pages)
 # ---------------------------------------------------------------------------
 
 def list_networks(namespaces: tuple[str, ...] = ("RTDB", "SHAKE")) -> list[str]:
@@ -187,7 +207,7 @@ def network_geosncls(network_name: str) -> list[str]:
 
 
 def network_records(network_name: str) -> list[dict]:
-    """Return full station-list records (edid + geosncl + facility + software)
+    """Return full stream-list records (edid + geosncl + facility + software)
     for all gnss_ppp streams in *network_name*.  Deduplicated by edid/geosncl.
 
     Raises on API failure.
@@ -225,6 +245,129 @@ def save_network_list(network_name: str, list_name: Optional[str] = None) -> tup
     name = _sanitize_list_name(list_name or network_name)
     _write(records, _resolve_output(name))
     return name, records
+
+
+# ---------------------------------------------------------------------------
+# Station lists (station codes only) + startup preload
+# ---------------------------------------------------------------------------
+
+def _station_of(gs: Optional[str]) -> Optional[str]:
+    """Station code (FCID) from a geosncl, upper-cased (e.g. 'P143')."""
+    if not gs:
+        return None
+    head = gs.split(".")[0].strip().upper()
+    return head or None
+
+
+def network_stations(network_name: str) -> list[str]:
+    """Sorted unique station codes for all gnss_ppp streams in
+    *network_name* (station names only — not the individual streams).
+
+    Raises on API failure.
+    """
+    streams = _discover().list_stream_datasources(
+        stream_type=StreamType.GNSS_PPP,
+        network_name=network_name,
+        limit=_MAX_RESULTS,
+    )
+    stations = {station for s in streams if (station := _station_of(s.names.get("GEOSNCL")))}
+    return sorted(stations)
+
+
+def save_station_list(name: str, stations: list[str]) -> pathlib.Path:
+    """Write a **station** list (``{"station": "P143"}`` per line) under
+    ``<base>/station-lists/<name>.jsonl``.  Returns the written path."""
+    out = paths.station_lists_dir() / f"{_sanitize_list_name(name)}.jsonl"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    norm = sorted({s.strip().upper() for s in stations if s and s.strip()})
+    lines = b"\n".join(orjson.dumps({"station": s}) for s in norm) + b"\n"
+    out.write_bytes(lines)
+    return out
+
+
+def save_stream_list(name: str, records: list[dict]) -> pathlib.Path:
+    """Write a **stream** list (full geosncl records) under
+    ``<base>/stream-lists/<name>.jsonl``.  Returns the written path."""
+    out = _resolve_output(_sanitize_list_name(name))
+    _write(records, out)
+    return out
+
+
+def _records_and_stations(streams) -> tuple[list[dict], list[str]]:
+    """Split an SDK stream iterable into (dedup'd stream records, unique stations)."""
+    seen: set[str] = set()
+    records: list[dict] = []
+    stations: set[str] = set()
+    for s in streams:
+        gs = s.names.get("GEOSNCL")
+        station = _station_of(gs)
+        if station:
+            stations.add(station)
+        key = s.edid or gs or ""
+        if key and key not in seen:
+            seen.add(key)
+            records.append(_record(s.edid, gs, s.facility, s.software))
+    return records, sorted(stations)
+
+
+def preload_default_lists(log=None) -> dict[str, int]:
+    """Create the always-available default lists if any are missing, using at most
+    two API queries:
+
+      stream-lists/all-streams.jsonl     (every gnss_ppp stream)
+      station-lists/all-stations.jsonl   (every station)
+      stream-lists/shake-alert.jsonl     (SHAKE:ShakeAlert streams)
+      station-lists/shake-alert.jsonl    (SHAKE:ShakeAlert stations)
+
+    Returns a summary of what was created ({name: count}).  Raises on API failure.
+    """
+    def _say(msg: str) -> None:
+        if log:
+            log(msg)
+
+    created: dict[str, int] = {}
+    stream_dir = paths.stream_lists_dir()
+    station_dir = paths.station_lists_dir()
+
+    # ── all-streams / all-stations (single full query, only if either missing) ──
+    need_all_stream = not (stream_dir / "all-streams.jsonl").exists()
+    need_all_station = not (station_dir / "all-stations.jsonl").exists()
+    if need_all_stream or need_all_station:
+        _say("Preloading all gnss_ppp streams …")
+        streams = _discover().list_stream_datasources(
+            stream_type=StreamType.GNSS_PPP, limit=_MAX_RESULTS,
+        )
+        records, stations = _records_and_stations(streams)
+        if need_all_stream:
+            save_stream_list("all-streams", records)
+            created["all-streams"] = len(records)
+            _say(f"  all-streams: {len(records)} stream(s)")
+        if need_all_station:
+            save_station_list("all-stations", stations)
+            created["all-stations"] = len(stations)
+            _say(f"  all-stations: {len(stations)} station(s)")
+
+    # ── shake-alert stream + station lists (single network query) ──────────────
+    need_sa_stream = not (stream_dir / "shake-alert.jsonl").exists()
+    need_sa_station = not (station_dir / "shake-alert.jsonl").exists()
+    if need_sa_stream or need_sa_station:
+        _say("Preloading SHAKE:ShakeAlert …")
+        streams = _discover().list_stream_datasources(
+            stream_type=StreamType.GNSS_PPP,
+            network_name="SHAKE:ShakeAlert",
+            limit=_MAX_RESULTS,
+        )
+        records, stations = _records_and_stations(streams)
+        if need_sa_stream:
+            save_stream_list("shake-alert", records)
+            created["shake-alert (streams)"] = len(records)
+            _say(f"  shake-alert streams: {len(records)}")
+        if need_sa_station:
+            save_station_list("shake-alert", stations)
+            created["shake-alert (stations)"] = len(stations)
+            _say(f"  shake-alert stations: {len(stations)}")
+
+    return created
 
 
 # ---------------------------------------------------------------------------
@@ -297,8 +440,8 @@ def _get_radial(args) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def _resolve_input(name: str) -> pathlib.Path:
-    """Find an input file, checking data/station-lists/ and adding .jsonl if needed."""
-    sl = paths.station_lists_dir()
+    """Find an input file, checking data/stream-lists/ and adding .jsonl if needed."""
+    sl = paths.stream_lists_dir()
     p = pathlib.Path(name)
     stem = p.stem if p.suffix in (".jsonl", ".json") else p.name
     candidates = [
@@ -379,12 +522,12 @@ def _do_filter(args) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def _resolve_output(name: str) -> pathlib.Path:
-    """Resolve an output name to a path under <project_root>/data/station-lists/, adding .jsonl if needed."""
+    """Resolve an output name to a path under <project_root>/data/stream-lists/, adding .jsonl if needed."""
     p = pathlib.Path(name)
     stem = p.stem if p.suffix in (".jsonl", ".json") else p.name
     p = pathlib.Path(stem + ".jsonl")
     if p.parent == pathlib.Path("."):
-        p = paths.station_lists_dir() / p.name
+        p = paths.stream_lists_dir() / p.name
     return p
 
 
@@ -394,7 +537,7 @@ def _write(records: list[dict], output: Optional[pathlib.Path]) -> None:
     if output is None:
         sys.stdout.buffer.write(lines)
         print(
-            f"\n{len(records)} records shown above. Add -o <name> to save to data/station-lists/<name>.jsonl",
+            f"\n{len(records)} records shown above. Add -o <name> to save to data/stream-lists/<name>.jsonl",
             file=sys.stderr,
         )
     else:
@@ -430,14 +573,14 @@ _NETWORK_CHOICES = [
 
 
 def _add_data_dir_arg(p: argparse.ArgumentParser) -> None:
-    """Add the standard --data-directory flag (station lists live under <base>/station-lists)."""
+    """Add the standard --data-directory flag (stream lists live under <base>/stream-lists)."""
     p.add_argument(
         "--data-directory",
         metavar="PATH",
         default=None,
         help=(
             "Base data directory (default: $ES_POS_DATA_DIRECTORY or ./data).  "
-            "Station lists are read from / written to <PATH>/station-lists."
+            "Stream lists are read from / written to <PATH>/stream-lists."
         ),
     )
 
@@ -446,10 +589,10 @@ def _build_parser(prog=None) -> tuple[argparse.ArgumentParser, argparse.Argument
     ap = argparse.ArgumentParser(
         prog=prog,
         description=(
-            "Discover and manage GNSS PPP position stream station lists.\n\n"
+            "Discover and manage GNSS PPP position stream lists.\n\n"
             "stream_type=gnss_ppp is always set for API calls.\n"
             "For 'get radial', tier=stream is always set.\n\n"
-            "Station lists can also be built interactively via the Station Builder\n"
+            "Stream lists can also be built interactively via the Stream List Builder\n"
             "tab in the web UI ('es-pos webserver'), which shows all stations on a\n"
             "map and lets you filter by processing center and PPP solution type."
         ),
@@ -460,7 +603,7 @@ def _build_parser(prog=None) -> tuple[argparse.ArgumentParser, argparse.Argument
     # ------------------------------------------------------------------ get
     get_p = sub.add_parser(
         "get",
-        help="Fetch a station list from the EarthScope API",
+        help="Fetch a stream list from the EarthScope API",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     get_sub = get_p.add_subparsers(dest="source")
@@ -481,7 +624,7 @@ def _build_parser(prog=None) -> tuple[argparse.ArgumentParser, argparse.Argument
         "-o", "--output",
         default=None,
         metavar="NAME",
-        help="Output list name; written to ./data/station-lists/<name>.jsonl. Omit to print to screen.",
+        help="Output list name; written to ./data/stream-lists/<name>.jsonl. Omit to print to screen.",
     )
     ds_p.add_argument(
         "--facility",
@@ -535,7 +678,7 @@ def _build_parser(prog=None) -> tuple[argparse.ArgumentParser, argparse.Argument
         "-o", "--output",
         required=True,
         metavar="FILE",
-        help="Output list name or path; written to ./data/station-lists/<name>.jsonl by default",
+        help="Output list name or path; written to ./data/stream-lists/<name>.jsonl by default",
     )
     rad_p.add_argument(
         "--latitude",
@@ -587,9 +730,9 @@ def _build_parser(prog=None) -> tuple[argparse.ArgumentParser, argparse.Argument
     # --------------------------------------------------------------- filter
     filt_p = sub.add_parser(
         "filter",
-        help="Merge and filter existing station list JSONL files",
+        help="Merge and filter existing stream list JSONL files",
         description=(
-            "Load one or more station list files, merge them (deduplicating by edid),\n"
+            "Load one or more stream list files, merge them (deduplicating by edid),\n"
             "apply optional filters, and write the result to a new file."
         ),
         formatter_class=argparse.RawTextHelpFormatter,
@@ -599,13 +742,13 @@ def _build_parser(prog=None) -> tuple[argparse.ArgumentParser, argparse.Argument
         action="append",
         required=True,
         metavar="FILE",
-        help="Input file; repeat for multiple: -i ShakeAlert -i cwu  (data/station-lists/ and .jsonl resolved automatically)",
+        help="Input file; repeat for multiple: -i ShakeAlert -i cwu  (data/stream-lists/ and .jsonl resolved automatically)",
     )
     filt_p.add_argument(
         "-o", "--output",
         default=None,
         metavar="NAME",
-        help="Output list name; written to ./data/station-lists/<name>.jsonl. Omit to print to screen.",
+        help="Output list name; written to ./data/stream-lists/<name>.jsonl. Omit to print to screen.",
     )
     filt_p.add_argument(
         "--facility",
@@ -678,24 +821,29 @@ def main() -> None:
 
     paths.set_base_dir(getattr(args, "data_directory", None))
 
-    if args.command == "get":
-        if not getattr(args, "source", None):
-            get_p.print_help()
-            sys.exit(0)
+    try:
+        if args.command == "get":
+            if not getattr(args, "source", None):
+                get_p.print_help()
+                sys.exit(0)
 
-        output = _resolve_output(args.output) if args.output else None
+            output = _resolve_output(args.output) if args.output else None
 
-        if args.source == "datasource":
-            records = _get_datasource(args)
-        else:
-            records = _get_radial(args)
-        _write(records, output)
+            if args.source == "datasource":
+                records = _get_datasource(args)
+            else:
+                records = _get_radial(args)
+            _write(records, output)
 
-    elif args.command == "filter":
-        output = _resolve_output(args.output) if args.output else None
-        records = _do_filter(args)
-        print(f"After filtering: {len(records)} records.", file=sys.stderr)
-        _write(records, output)
+        elif args.command == "filter":
+            output = _resolve_output(args.output) if args.output else None
+            records = _do_filter(args)
+            print(f"After filtering: {len(records)} records.", file=sys.stderr)
+            _write(records, output)
+    finally:
+        # Release the SDK client so this CLI process exits cleanly (no pending
+        # async retry-context warnings at interpreter shutdown).
+        close_client()
 
 
 if __name__ == "__main__":

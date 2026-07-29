@@ -39,10 +39,8 @@ def _reset_data_dir(monkeypatch):
     override from the developer's shell or a prior test."""
     monkeypatch.delenv(paths.ENV_VAR, raising=False)
     paths.set_base_dir(None)
-    paths.set_arrow_dir(None)
     yield
     paths.set_base_dir(None)
-    paths.set_arrow_dir(None)
 
 
 # ---------------------------------------------------------------------------
@@ -62,7 +60,7 @@ def project_tree(tmp_path, monkeypatch):
     """
     (tmp_path / "pyproject.toml").write_text("[project]\nname = 'test'\n")
     (tmp_path / "data" / "arrow").mkdir(parents=True)
-    (tmp_path / "data" / "station-lists").mkdir(parents=True)
+    (tmp_path / "data" / "stream-lists").mkdir(parents=True)
     monkeypatch.chdir(tmp_path)
     return tmp_path
 

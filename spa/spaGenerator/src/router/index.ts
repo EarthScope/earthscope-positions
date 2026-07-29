@@ -25,8 +25,17 @@ const router = createRouter({
           component: () => import("../pages/PlotsPage.vue"),
         },
         {
+          path: "station-list-builder",
+          component: () => import("../pages/StationListBuilderPage.vue"),
+        },
+        {
+          path: "stream-list-builder",
+          component: () => import("../pages/StreamListBuilderPage.vue"),
+        },
+        {
+          // Backward-compat: old bookmarks → the station list builder.
           path: "station-builder",
-          component: () => import("../pages/StationBuilderPage.vue"),
+          redirect: "/station-list-builder",
         },
         {
           path: "fetch-data",

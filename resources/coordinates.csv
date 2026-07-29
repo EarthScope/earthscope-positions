@@ -1,4 +1,4 @@
-site,latitude,longitude,height,source
+station,latitude,longitude,height,source
 1LSU,30.407424599,-91.1802641795,-6.61861,gage
 1NSU,31.7508004354,-93.0976060235,28.01886,gage
 1ULM,32.5290337232,-92.0759089686,15.93655,gage

@@ -2,7 +2,7 @@
 positions_fetch — download GNSS PPP position data from the EarthScope API.
 
 Sub-commands:
-    get     Download position data for stations in a station list
+    get     Download position data for stations in a stream list
     concat  Concatenate and deduplicate multiple Arrow files
 """
 
@@ -587,7 +587,7 @@ def _run_parallel(
 
 
 # ---------------------------------------------------------------------------
-# Station list loading
+# Stream list loading
 # ---------------------------------------------------------------------------
 
 
@@ -612,7 +612,7 @@ def _parse_jsonl_line(raw_line: bytes) -> dict | None:
 def _load_station_list(path_str: str) -> list[dict]:
     p = pathlib.Path(path_str)
     stem = p.stem if p.suffix in (".jsonl", ".json") else p.name
-    sl = paths.station_lists_dir()
+    sl = paths.stream_lists_dir()
     candidates = [
         p,
         p.parent / (stem + ".jsonl"),
@@ -627,7 +627,7 @@ def _load_station_list(path_str: str) -> list[dict]:
                 return orjson.loads(raw)
             return [r for line in raw.splitlines() if (r := _parse_jsonl_line(line)) is not None]
     tried = ", ".join(str(c) for c in dict.fromkeys(candidates))
-    sys.exit(f"Station list not found. Tried: {tried}")
+    sys.exit(f"Stream list not found. Tried: {tried}")
 
 
 # ---------------------------------------------------------------------------
@@ -660,7 +660,7 @@ def _cmd_get(args) -> None:
                 stations.append(rec)
 
     if not stations:
-        sys.exit("No stations found in the provided station lists.")
+        sys.exit("No stations found in the provided stream lists.")
 
     day_segs = _day_ranges(start, end)
     n_tasks = len(stations) * len(day_segs)
@@ -711,8 +711,8 @@ def _retry_result_matches(result: str, pattern: str) -> bool:
 def _build_edid_map(data_dir: pathlib.Path) -> dict[str, str]:
     """Scan all station-list JSONL files and return {geosncl: edid}."""
     mapping: dict[str, str] = {}
-    sl_dir = paths.station_lists_dir()
-    search_dirs = [sl_dir, data_dir.parent / "station-lists"]
+    sl_dir = paths.stream_lists_dir()
+    search_dirs = [sl_dir, data_dir.parent / "stream-lists"]
     for directory in dict.fromkeys(search_dirs):
         if not directory.exists():
             continue
@@ -858,28 +858,21 @@ def _cmd_concat(args) -> None:
 
 
 def _add_data_dir_args(p: argparse.ArgumentParser) -> None:
-    """Add the standard --data-directory / --arrow-data-directory flags."""
+    """Add the standard --data-directory flag (Arrow root = <base>/arrow)."""
     p.add_argument(
         "--data-directory",
         metavar="PATH",
         default=None,
         help=(
             "Base data directory (default: $ES_POS_DATA_DIRECTORY or ./data).  "
-            "Arrow files live under <PATH>/arrow, station lists under "
-            "<PATH>/station-lists."
+            "Arrow files live under <PATH>/arrow, stream lists under "
+            "<PATH>/stream-lists."
         ),
-    )
-    p.add_argument(
-        "--arrow-data-directory",
-        metavar="PATH",
-        default=None,
-        help="Override just the Arrow data root (supersedes --data-directory/arrow).",
     )
 
 
 def _apply_data_dir_args(args: argparse.Namespace) -> None:
     paths.set_base_dir(getattr(args, "data_directory", None))
-    paths.set_arrow_dir(getattr(args, "arrow_data_directory", None))
 
 
 def _build_parser(prog=None) -> tuple[argparse.ArgumentParser, ...]:
@@ -892,7 +885,7 @@ def _build_parser(prog=None) -> tuple[argparse.ArgumentParser, ...]:
     # --- get ---
     get_p = sub.add_parser(
         "get",
-        help="Download position data for stations from a station list.",
+        help="Download position data for stations from a stream list.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description="""Download GNSS PPP position data and store as Arrow files.
 
@@ -904,7 +897,7 @@ Downloaded data is automatically visible in the Positions tab and
 Completeness & Latency tab of the web UI ('es-pos webserver').
 The web UI also supports on-demand fetching via its built-in Fetch button.
 
-Station list files are built with 'es-pos stations get' or interactively
+Stream list files are built with 'es-pos stations get' or interactively
 via the Station Builder tab in the web UI.
 
 Examples:
@@ -920,9 +913,9 @@ Examples:
         required=True,
         metavar="FILE",
         help=(
-            "Station list JSONL file (from station_list get). May be repeated. "
-            "Resolved in order: as given, with .jsonl, in data/station-lists/, "
-            "in data/station-lists/ with .jsonl."
+            "Stream list JSONL file (from station_list get). May be repeated. "
+            "Resolved in order: as given, with .jsonl, in data/stream-lists/, "
+            "in data/stream-lists/ with .jsonl."
         ),
     )
     get_p.add_argument(

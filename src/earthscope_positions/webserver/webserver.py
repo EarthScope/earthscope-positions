@@ -2,7 +2,7 @@
 FastAPI server for GNSS position data visualization.
 
 Serves:
-  /api/station-lists   list of station_list JSON file names
+  /api/stream-lists   list of station_list JSON file names
   /api/stations        station inventory (with optional list / search filter)
   /api/completeness    heatmap data: completeness + latency per 15-min (or coarser) bin
   /api/status          cache and server status
@@ -77,11 +77,6 @@ _networks_cache: list[str] = []
 _networks_loaded: bool = False
 
 
-def set_data_dir(path: pathlib.Path) -> None:
-    """Backward-compatible shim: override just the Arrow data root."""
-    paths.set_arrow_dir(path)
-
-
 # Externally-reachable base URL, used for callback URLs shown in the UI (e.g.
 # the Replay curl commands).  Set from `es-pos webserver --hostname/--port`.
 _public_hostname: str = "localhost"
@@ -98,6 +93,53 @@ def _public_base_url() -> str:
     return f"http://{_public_hostname}:{_public_port}"
 
 
+def run_startup_preflight() -> None:
+    """Blocking pre-flight run BEFORE the server starts accepting requests.
+
+    1. Verify a valid JWT (the user has logged in at some point) — abort startup
+       if not, since every discovery/fetch call needs it.
+    2. Seed the editable coordinates.csv from bundled resources if absent.
+    3. Preload the always-available default lists (all-streams / all-stations /
+       shake-alert streams+stations) if any are missing.
+
+    JWT failure is fatal (``SystemExit``); a preload/coordinate failure is logged
+    and tolerated so a transient API/VPN hiccup doesn't block the whole server.
+    """
+    # 1) JWT / login check — fatal if missing or unrefreshable.
+    print("Pre-flight: checking EarthScope login …", file=sys.stderr)
+    try:
+        from earthscope_positions.fetch.positions_fetch import _ensure_token
+        _ensure_token()   # raises SystemExit with a clear message if not logged in
+        print("  auth     : OK", file=sys.stderr)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        raise SystemExit(
+            f"Pre-flight auth check failed: {exc}\n"
+            "Log in with:  es user login   then restart the server."
+        )
+
+    # 2) Seed the editable coordinates file (copies resources → data dir if absent).
+    try:
+        from earthscope_positions import coordinates as _coords
+        p = _coords.ensure_data_csv()
+        print(f"  coords   : {p}", file=sys.stderr)
+    except Exception as exc:
+        print(f"  coords   : seed failed ({exc})", file=sys.stderr)
+
+    # 3) Preload default lists (created only if missing).
+    try:
+        from earthscope_positions.stations import station_list as _sl
+        created = _sl.preload_default_lists(log=lambda m: print(f"  {m}", file=sys.stderr))
+        _sl.close_client()
+        if created:
+            print(f"  preload  : created {', '.join(created)}", file=sys.stderr)
+        else:
+            print("  preload  : default lists already present", file=sys.stderr)
+    except Exception as exc:
+        print(f"  preload  : failed ({exc}); continuing without default lists", file=sys.stderr)
+
+
 def _project_root() -> pathlib.Path:
     # Code-relative root (for locating the built SPA), independent of the data dir.
     return pathlib.Path(__file__).parent.parent.parent.parent
@@ -107,8 +149,19 @@ def _data_dir() -> pathlib.Path:
     return paths.arrow_dir()
 
 
+def _stream_lists_dir() -> pathlib.Path:
+    return paths.stream_lists_dir()
+
+
 def _station_lists_dir() -> pathlib.Path:
     return paths.station_lists_dir()
+
+
+def _data_dir_args() -> list[str]:
+    """CLI flag that propagates THIS server's resolved data directory to a child
+    process, so subprocesses honour ``--data-directory`` instead of falling back
+    to the default ``./data`` (the Arrow root is always ``<base>/arrow``)."""
+    return ["--data-directory", str(paths.base_dir())]
 
 
 def _spa_dir() -> pathlib.Path:
@@ -250,15 +303,15 @@ def _indexed_geosncls() -> list[str]:
     return sorted(p.name for p in dd.iterdir() if p.is_dir() and not p.name.startswith("."))
 
 
-def _list_station_list_names() -> list[str]:
-    d = _station_lists_dir()
+def _list_stream_list_names() -> list[str]:
+    d = _stream_lists_dir()
     if not d.exists():
         return []
     return sorted(p.stem for p in d.glob("*.jsonl"))
 
 
-def _read_station_list_file(path: pathlib.Path) -> list[dict]:
-    """Read a station list file in either JSONL or (legacy) JSON array format."""
+def _read_stream_list_file(path: pathlib.Path) -> list[dict]:
+    """Read a stream list file in either JSONL or (legacy) JSON array format."""
     raw = path.read_bytes()
     if path.suffix == ".json":
         return json.loads(raw)
@@ -270,14 +323,14 @@ def _geosncls_for_list(list_name: str) -> list[str]:
     available = set(_indexed_geosncls())
     if list_name == "all":
         return sorted(available)
-    d = _station_lists_dir()
+    d = _stream_lists_dir()
     path = d / f"{list_name}.jsonl"
     if not path.exists():
         path = d / f"{list_name}.json"   # backward compat
         if not path.exists():
             return []
     try:
-        records = _read_station_list_file(path)
+        records = _read_stream_list_file(path)
     except Exception:
         return []
     result: list[str] = []
@@ -670,15 +723,15 @@ async def api_status() -> dict:
     }
 
 
-# ── /api/station-lists ───────────────────────────────────────────────────────
+# ── /api/stream-lists ───────────────────────────────────────────────────────
 
-@app.get("/api/station-lists")
-async def api_station_lists() -> dict:
-    return {"lists": _list_station_list_names()}
+@app.get("/api/stream-lists")
+async def api_stream_lists() -> dict:
+    return {"lists": _list_stream_list_names()}
 
 
-@app.get("/api/station-lists/filter-options")
-async def api_station_lists_filter_options(
+@app.get("/api/stream-lists/filter-options")
+async def api_stream_lists_filter_options(
     lists: list[str] = Query([]),
 ) -> JSONResponse:
     """Return available centers and combined sol_type codes for the given lists.
@@ -712,88 +765,9 @@ async def api_station_lists_filter_options(
 
 _NCEDC_METADATA_URL = "https://ncedc.org/outgoing/gps/ShakeAlert/metadata/"
 
-
-@app.get("/api/station-lists/shakealert-datasource")
-async def api_shakealert_datasource() -> StreamingResponse:
-    """Run es-pos stations get datasource --network-name SHAKE:ShakeAlert -o ShakeAlert."""
-    def _sse(obj: dict) -> str:
-        return f"data: {json.dumps(obj)}\n\n"
-
-    async def generate():
-        cmd = [
-            sys.executable, "-m", "earthscope_positions.es_pos",
-            "stations", "get", "datasource",
-            "--network-name", "SHAKE:ShakeAlert",
-            "-o", "shake-alert",
-        ]
-        yield _sse({"type": "log", "msg":
-            "es-pos stations get datasource --network-name SHAKE:ShakeAlert -o shake-alert"})
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            cwd=str(_project_root()),
-        )
-        async for raw in proc.stdout:  # type: ignore[union-attr]
-            line = raw.decode(errors="replace").rstrip()
-            if line:
-                yield _sse({"type": "log", "msg": line})
-        await proc.wait()
-        if proc.returncode == 0:
-            yield _sse({"type": "done", "code": 0,
-                        "msg": "Saved shake-alert.jsonl. Reload station lists to use it."})
-        else:
-            yield _sse({"type": "done", "code": proc.returncode,
-                        "msg": f"Command exited with code {proc.returncode}"})
-
-    return StreamingResponse(
-        generate(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
-
-
-@app.get("/api/station-lists/all-streams")
-async def api_all_streams_datasource() -> StreamingResponse:
-    """Run es-pos stations get datasource -o AllStreams (all gnss_ppp streams).
-
-    Paginated datasource query with the only filter being stream_type=gnss_ppp,
-    saved to AllStreams.jsonl.
-    """
-    def _sse(obj: dict) -> str:
-        return f"data: {json.dumps(obj)}\n\n"
-
-    async def generate():
-        cmd = [
-            sys.executable, "-m", "earthscope_positions.es_pos",
-            "stations", "get", "datasource",
-            "-o", "all-streams",
-        ]
-        yield _sse({"type": "log", "msg":
-            "es-pos stations get datasource -o all-streams  (stream_type=gnss_ppp)"})
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            cwd=str(_project_root()),
-        )
-        async for raw in proc.stdout:  # type: ignore[union-attr]
-            line = raw.decode(errors="replace").rstrip()
-            if line:
-                yield _sse({"type": "log", "msg": line})
-        await proc.wait()
-        if proc.returncode == 0:
-            yield _sse({"type": "done", "code": 0,
-                        "msg": "Saved all-streams.jsonl. Reload station lists to use it."})
-        else:
-            yield _sse({"type": "done", "code": proc.returncode,
-                        "msg": f"Command exited with code {proc.returncode}"})
-
-    return StreamingResponse(
-        generate(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+# NOTE: the old streaming /api/stream-lists/{shakealert-datasource,all-streams}
+# endpoints were removed — those lists are now preloaded at server startup
+# (run_startup_preflight → station_list.preload_default_lists).
 
 
 @app.get("/api/station-builder/networks")
@@ -845,7 +819,7 @@ def _fetch_url_sync(url: str) -> bytes:
         return r.read()
 
 
-@app.get("/api/station-lists/update-active-from-ncedc")
+@app.get("/api/stream-lists/update-active-from-ncedc")
 async def api_update_active_from_ncedc() -> StreamingResponse:
     """Download chanfile_XX.dat from NCEDC, cross-reference existing lists, write XX-Active.jsonl."""
     def _sse(obj: dict) -> str:
@@ -873,12 +847,12 @@ async def api_update_active_from_ncedc() -> StreamingResponse:
         # Build cross-reference from all existing station-list files
         yield _sse({"type": "log", "msg": "Cross-referencing existing station lists…"})
         all_records: dict[str, dict] = {}
-        d = _station_lists_dir()
+        d = _stream_lists_dir()
         for path in sorted(d.iterdir()):
             if path.suffix not in (".jsonl", ".json"):
                 continue
             try:
-                for rec in _read_station_list_file(path):
+                for rec in _read_stream_list_file(path):
                     gs = rec.get("geosncl") or rec.get("edid", "")
                     if gs and gs not in all_records:
                         all_records[gs] = rec
@@ -943,19 +917,19 @@ async def api_update_active_from_ncedc() -> StreamingResponse:
     )
 
 
-@app.get("/api/station-lists/{name}", response_model=None)
-async def api_get_station_list(name: str) -> JSONResponse:
+@app.get("/api/stream-lists/{name}", response_model=None)
+async def api_get_stream_list(name: str) -> JSONResponse:
     name = name.strip()
     if not name or ".." in name or "/" in name or "\\" in name:
         return JSONResponse({"error": "Invalid list name"}, status_code=400)
-    d = _station_lists_dir()
+    d = _stream_lists_dir()
     path = d / f"{name}.jsonl"
     if not path.exists():
         path = d / f"{name}.json"        # backward compat
         if not path.exists():
             return JSONResponse({"error": "Not found"}, status_code=404)
     try:
-        records = _read_station_list_file(path)
+        records = _read_stream_list_file(path)
         geosncls = [
             rec.get("geosncl") or rec.get("edid", "")
             for rec in records
@@ -966,17 +940,17 @@ async def api_get_station_list(name: str) -> JSONResponse:
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
-@app.delete("/api/station-lists/{name}", response_model=None)
-async def api_delete_station_list(name: str) -> JSONResponse:
+@app.delete("/api/stream-lists/{name}", response_model=None)
+async def api_delete_stream_list(name: str) -> JSONResponse:
     name = name.strip()
     if not name or ".." in name or "/" in name or "\\" in name:
         return JSONResponse({"error": "Invalid list name"}, status_code=400)
-    d = _station_lists_dir()
+    d = _stream_lists_dir()
     for suffix in (".jsonl", ".json"):
         path = d / f"{name}{suffix}"
         if path.exists():
             path.unlink()
-            _log.info("[station-lists] deleted %r", name)
+            _log.info("[stream-lists] deleted %r", name)
             return JSONResponse({"deleted": name})
     return JSONResponse({"error": "Not found"}, status_code=404)
 
@@ -989,13 +963,13 @@ class _RenameListBody(BaseModel):
     new_name: str
 
 
-@app.post("/api/station-lists/{name}/rename", response_model=None)
-async def api_rename_station_list(name: str, body: _RenameListBody) -> JSONResponse:
+@app.post("/api/stream-lists/{name}/rename", response_model=None)
+async def api_rename_stream_list(name: str, body: _RenameListBody) -> JSONResponse:
     name = name.strip()
     new = body.new_name.strip()
     if _bad_list_name(name) or _bad_list_name(new):
         return JSONResponse({"error": "Invalid list name"}, status_code=400)
-    d = _station_lists_dir()
+    d = _stream_lists_dir()
     src = None
     for suffix in (".jsonl", ".json"):
         p = d / f"{name}{suffix}"
@@ -1010,17 +984,17 @@ async def api_rename_station_list(name: str, body: _RenameListBody) -> JSONRespo
     if dst.exists():
         return JSONResponse({"error": f"A list named {new!r} already exists"}, status_code=409)
     src.rename(dst)
-    _log.info("[station-lists] renamed %r -> %r", name, new)
+    _log.info("[stream-lists] renamed %r -> %r", name, new)
     return JSONResponse({"old": name, "name": new})
 
 
-@app.get("/api/station-lists/{name}/raw", response_model=None)
-async def api_get_station_list_raw(name: str) -> JSONResponse:
+@app.get("/api/stream-lists/{name}/raw", response_model=None)
+async def api_get_stream_list_raw(name: str) -> JSONResponse:
     """Return the raw JSONL text of a station list (for the editor)."""
     name = name.strip()
     if _bad_list_name(name):
         return JSONResponse({"error": "Invalid list name"}, status_code=400)
-    d = _station_lists_dir()
+    d = _stream_lists_dir()
     for suffix in (".jsonl", ".json"):
         p = d / f"{name}{suffix}"
         if p.exists():
@@ -1032,8 +1006,8 @@ class _RawListBody(BaseModel):
     content: str
 
 
-@app.post("/api/station-lists/{name}/raw", response_model=None)
-async def api_save_station_list_raw(name: str, body: _RawListBody) -> JSONResponse:
+@app.post("/api/stream-lists/{name}/raw", response_model=None)
+async def api_save_stream_list_raw(name: str, body: _RawListBody) -> JSONResponse:
     """Save raw JSONL text to a list (used by the editor's Save / Save As).
 
     Validates that every non-empty line is valid JSON so the file can't be
@@ -1050,6 +1024,144 @@ async def api_save_station_list_raw(name: str, body: _RawListBody) -> JSONRespon
             json.loads(s)
         except Exception as exc:
             return JSONResponse({"error": f"Invalid JSON on line {i}: {exc}"}, status_code=400)
+    d = _stream_lists_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    content = body.content if body.content.endswith("\n") else body.content + "\n"
+    (d / f"{name}.jsonl").write_text(content, encoding="utf-8")
+    _log.info("[stream-lists] saved raw %r (%d bytes)", name, len(content))
+    return JSONResponse({"name": name})
+
+
+class _SaveListBody(BaseModel):
+    geosncls: list[str]
+
+
+@app.post("/api/stream-lists/{name}", response_model=None)
+async def api_save_stream_list(name: str, body: _SaveListBody) -> dict:
+    name = name.strip()
+    if not name or ".." in name or "/" in name or "\\" in name:
+        return JSONResponse({"error": "Invalid list name"}, status_code=400)
+    d = _stream_lists_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / f"{name}.jsonl"
+    lines = "\n".join(json.dumps({"geosncl": g}) for g in sorted(body.geosncls)) + "\n"
+    path.write_text(lines)
+    _log.info("[stream-lists] saved %r (%d stations)", name, len(body.geosncls))
+    return {"name": name, "count": len(body.geosncls)}
+
+
+# ── /api/station-lists (station-code lists — Station List Builder) ────────────────
+#
+# Station lists hold station codes ({"station": "P143"} per line) under
+# <base>/station-lists/.  They are the down-selected-stations lists produced by the
+# Station List Builder and used as include/exclude sets by the Stream List
+# Builder.  Endpoints mirror /api/stream-lists but for the station directory.
+
+def _list_station_list_names() -> list[str]:
+    d = _station_lists_dir()
+    if not d.exists():
+        return []
+    return sorted(p.stem for p in d.glob("*.jsonl"))
+
+
+def _stations_for_list(list_name: str) -> list[str]:
+    """Return the station codes in a named station list (upper-cased, sorted, unique)."""
+    d = _station_lists_dir()
+    path = d / f"{list_name}.jsonl"
+    if not path.exists():
+        return []
+    out: set[str] = set()
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            station = (rec.get("station") or "").strip().upper()
+            if station:
+                out.add(station)
+    except Exception:
+        return []
+    return sorted(out)
+
+
+@app.get("/api/station-lists")
+async def api_station_lists() -> dict:
+    return {"lists": _list_station_list_names()}
+
+
+@app.get("/api/station-lists/{name}", response_model=None)
+async def api_get_station_list(name: str) -> JSONResponse:
+    name = name.strip()
+    if _bad_list_name(name):
+        return JSONResponse({"error": "Invalid list name"}, status_code=400)
+    if not (_station_lists_dir() / f"{name}.jsonl").exists():
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    return JSONResponse({"name": name, "stations": _stations_for_list(name)})
+
+
+@app.delete("/api/station-lists/{name}", response_model=None)
+async def api_delete_station_list(name: str) -> JSONResponse:
+    name = name.strip()
+    if _bad_list_name(name):
+        return JSONResponse({"error": "Invalid list name"}, status_code=400)
+    path = _station_lists_dir() / f"{name}.jsonl"
+    if path.exists():
+        path.unlink()
+        _log.info("[station-lists] deleted %r", name)
+        return JSONResponse({"deleted": name})
+    return JSONResponse({"error": "Not found"}, status_code=404)
+
+
+@app.post("/api/station-lists/{name}/rename", response_model=None)
+async def api_rename_station_list(name: str, body: _RenameListBody) -> JSONResponse:
+    name = name.strip()
+    new = body.new_name.strip()
+    if _bad_list_name(name) or _bad_list_name(new):
+        return JSONResponse({"error": "Invalid list name"}, status_code=400)
+    d = _station_lists_dir()
+    src = d / f"{name}.jsonl"
+    if not src.exists():
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    if new == name:
+        return JSONResponse({"old": name, "name": new})
+    dst = d / f"{new}.jsonl"
+    if dst.exists():
+        return JSONResponse({"error": f"A list named {new!r} already exists"}, status_code=409)
+    src.rename(dst)
+    _log.info("[station-lists] renamed %r -> %r", name, new)
+    return JSONResponse({"old": name, "name": new})
+
+
+@app.get("/api/station-lists/{name}/raw", response_model=None)
+async def api_get_station_list_raw(name: str) -> JSONResponse:
+    name = name.strip()
+    if _bad_list_name(name):
+        return JSONResponse({"error": "Invalid list name"}, status_code=400)
+    p = _station_lists_dir() / f"{name}.jsonl"
+    if not p.exists():
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    return JSONResponse({"name": name, "content": p.read_text(encoding="utf-8")})
+
+
+@app.post("/api/station-lists/{name}/raw", response_model=None)
+async def api_save_station_list_raw(name: str, body: _RawListBody) -> JSONResponse:
+    """Save raw JSONL text to a station list (editor). Each non-empty line must be a
+    JSON object with a non-empty 'station'."""
+    name = name.strip()
+    if _bad_list_name(name):
+        return JSONResponse({"error": "Invalid list name"}, status_code=400)
+    for i, line in enumerate(body.content.splitlines(), start=1):
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            rec = json.loads(s)
+        except Exception as exc:
+            return JSONResponse({"error": f"Invalid JSON on line {i}: {exc}"}, status_code=400)
+        if not isinstance(rec, dict) or not str(rec.get("station", "")).strip():
+            return JSONResponse(
+                {"error": f"Line {i}: each row needs a non-empty \"station\""}, status_code=400)
     d = _station_lists_dir()
     d.mkdir(parents=True, exist_ok=True)
     content = body.content if body.content.endswith("\n") else body.content + "\n"
@@ -1058,22 +1170,37 @@ async def api_save_station_list_raw(name: str, body: _RawListBody) -> JSONRespon
     return JSONResponse({"name": name})
 
 
-class _SaveListBody(BaseModel):
-    geosncls: list[str]
+class _SaveStationListBody(BaseModel):
+    stations: list[str]
 
 
 @app.post("/api/station-lists/{name}", response_model=None)
-async def api_save_station_list(name: str, body: _SaveListBody) -> dict:
+async def api_save_station_list(name: str, body: _SaveStationListBody) -> dict:
     name = name.strip()
-    if not name or ".." in name or "/" in name or "\\" in name:
+    if _bad_list_name(name):
         return JSONResponse({"error": "Invalid list name"}, status_code=400)
     d = _station_lists_dir()
     d.mkdir(parents=True, exist_ok=True)
-    path = d / f"{name}.jsonl"
-    lines = "\n".join(json.dumps({"geosncl": g}) for g in sorted(body.geosncls)) + "\n"
-    path.write_text(lines)
-    _log.info("[station-lists] saved %r (%d stations)", name, len(body.geosncls))
-    return {"name": name, "count": len(body.geosncls)}
+    stations = sorted({s.strip().upper() for s in body.stations if s and s.strip()})
+    lines = "\n".join(json.dumps({"station": s}) for s in stations) + "\n"
+    (d / f"{name}.jsonl").write_text(lines)
+    _log.info("[station-lists] saved %r (%d stations)", name, len(stations))
+    return {"name": name, "count": len(stations)}
+
+
+@app.get("/api/station-builder/network-stations")
+async def api_station_builder_network_stations(network: str = Query(...)) -> JSONResponse:
+    """Return the station codes in a network (station names only, not the
+    individual streams) — used by the Station List Builder's Load Network."""
+    if not network.strip():
+        return JSONResponse({"error": "network is required"}, status_code=400)
+    loop = asyncio.get_event_loop()
+    try:
+        from earthscope_positions.stations.station_list import network_stations
+        stations = await loop.run_in_executor(None, network_stations, network)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    return JSONResponse({"network": network, "stations": stations, "count": len(stations)})
 
 
 # ── /api/stations ────────────────────────────────────────────────────────────
@@ -1288,7 +1415,7 @@ def _geosncl_edid_map() -> dict[str, str]:
     needs each stream's edid — not just its geosncl — or every request comes back
     empty ("no-data").
     """
-    d = _station_lists_dir()
+    d = _stream_lists_dir()
     mapping: dict[str, str] = {}
     if not d.exists():
         return mapping
@@ -1296,7 +1423,7 @@ def _geosncl_edid_map() -> dict[str, str]:
         if path.suffix not in (".jsonl", ".json"):
             continue
         try:
-            for rec in _read_station_list_file(path):
+            for rec in _read_stream_list_file(path):
                 gs = rec.get("geosncl") or rec.get("edid", "")
                 eid = rec.get("edid") or rec.get("geosncl", "")
                 if gs and eid:
@@ -1364,6 +1491,7 @@ async def _fetch_missing_events(
                 "get", "-i", tf_path,
                 "--start", day_str, "--end", next_str,
                 "--workers", str(workers),
+                *_data_dir_args(),
             ]
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -1413,14 +1541,14 @@ async def _fetch_missing_events(
 
 def _resolve_list_geosncls(name: str) -> list[str]:
     """Return geosncls for a saved list name (empty if not found/unreadable)."""
-    sl_dir = _station_lists_dir()
+    sl_dir = _stream_lists_dir()
     list_path = sl_dir / f"{name}.jsonl"
     if not list_path.exists():
         list_path = sl_dir / f"{name}.json"
     if not list_path.exists():
         return []
     try:
-        records = _read_station_list_file(list_path)
+        records = _read_stream_list_file(list_path)
         return [g for rec in records if (g := (rec.get("geosncl") or rec.get("edid", "")))]
     except Exception:
         return []
@@ -1591,8 +1719,7 @@ async def api_export_run(
         cmd = [sys.executable, "-m", "earthscope_positions.es_pos", "export", format]
         for l in sel:
             cmd += ["-i", l]
-        cmd += ["--start-time", start, "--stop-time", end,
-                "--data-directory", str(paths.base_dir())]
+        cmd += ["--start-time", start, "--stop-time", end, *_data_dir_args()]
         if format == "geojson":
             cmd += ["--format", gj_format]
         if force:
@@ -1717,25 +1844,33 @@ async def api_plots_img(path: str) -> FileResponse | JSONResponse:
 def _stations_payload(geosncls) -> list[dict]:
     """Group geosncls by station FCID and attach coordinates (from coordinates.csv).
 
-    Returns [{"site": "P143", "lat": 38.76, "lon": -119.76, "streams": [...]}].
+    Included stations are the union of (a) every station in the "all-stations"
+    list and (b) any station with at least one stream — coordinates.csv is only
+    consulted for lat/lon, not to decide which stations to include, since it
+    also holds thousands of unrelated reference-file entries (GAGE/ShakeAlert/
+    RTDB) that aren't part of the active real-time network.
+
+    Returns [{"station": "P143", "lat": 38.76, "lon": -119.76, "streams": [...]}].
     """
     by_station: dict[str, list[str]] = {}
     for gs in geosncls:
         parts = gs.split(".")
         if not parts:
             continue
-        site = parts[0].upper()
-        by_station.setdefault(site, []).append(gs)
+        station = parts[0].upper()
+        by_station.setdefault(station, []).append(gs)
 
     coords = _station_builder_coords
+    all_stations = set(by_station) | set(_stations_for_list("all-stations"))
+
     stations = []
-    for site in sorted(by_station):
-        coord = coords.get(site) if coords else None
+    for station in sorted(all_stations):
+        coord = coords.get(station) if coords else None
         stations.append({
-            "site": site,
+            "station": station,
             "lat": coord.latitude if coord else None,
             "lon": coord.longitude if coord else None,
-            "streams": sorted(by_station[site]),
+            "streams": sorted(by_station.get(station, [])),
         })
     return stations
 
@@ -1744,15 +1879,70 @@ def _stations_payload(geosncls) -> list[dict]:
 async def api_station_builder_data() -> JSONResponse:
     """All known stations with coordinates and available geosncl streams.
 
-    Streams are the union of every station-list file (data/station-lists/) and
+    Streams are the union of every station-list file (data/stream-lists/) and
     everything already downloaded (the Arrow file index), so the map shows all
     unique station/streams — not just the ones that happen to have data on disk.
 
     Returns:
-        {"stations": [{"site": "P143", "lat": 38.76, "lon": -119.76, "streams": [...]}]}
+        {"stations": [{"station": "P143", "lat": 38.76, "lon": -119.76, "streams": [...]}]}
     """
     geosncls = sorted(set(_all_list_geosncls()) | set(_indexed_geosncls()))
     return JSONResponse({"stations": _stations_payload(geosncls)})
+
+
+# ── /api/coordinates (editable station-coordinate file) ───────────────────────
+
+from earthscope_positions import coordinates as _coords_mod  # noqa: E402
+
+
+def _reload_coords() -> None:
+    """Re-load the in-memory coordinate table used by the Station Builder map."""
+    global _station_builder_coords
+    try:
+        from earthscope_positions.coordinates import Coordinates
+        _station_builder_coords = Coordinates()
+    except Exception as exc:  # pragma: no cover - defensive
+        print(f"  coords   : reload failed ({exc})", file=sys.stderr)
+
+
+class _CoordinatesBody(BaseModel):
+    content: str
+
+
+@app.get("/api/coordinates/raw")
+async def api_coordinates_get() -> JSONResponse:
+    """Return the current editable coordinates CSV text (seeding on first use)."""
+    try:
+        return JSONResponse({"content": _coords_mod.read_text()})
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.put("/api/coordinates/raw", response_model=None)
+async def api_coordinates_put(body: _CoordinatesBody) -> JSONResponse:
+    """Edit Coordinates: validate the edited CSV and replace the file."""
+    try:
+        count = _coords_mod.save_edited(body.content)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception as exc:  # pragma: no cover - defensive
+        return JSONResponse({"error": str(exc)}, status_code=500)
+    _reload_coords()
+    return JSONResponse({"ok": True, "count": count})
+
+
+@app.post("/api/coordinates/update", response_model=None)
+async def api_coordinates_update(body: _CoordinatesBody) -> JSONResponse:
+    """Update Coordinates: validate an uploaded CSV and merge it in (uploaded
+    rows win on station matches; ``source`` defaults to 'user' when omitted)."""
+    try:
+        total, added, updated = _coords_mod.merge_upload(body.content)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception as exc:  # pragma: no cover - defensive
+        return JSONResponse({"error": str(exc)}, status_code=500)
+    _reload_coords()
+    return JSONResponse({"ok": True, "total": total, "added": added, "updated": updated})
 
 
 # ── /api/replay ──────────────────────────────────────────────────────────────
@@ -1761,7 +1951,7 @@ from earthscope_positions.replay import replay as _replay_mod  # noqa: E402
 
 
 class _ReplayPreloadBody(BaseModel):
-    station_lists: list[str] = []
+    stream_lists: list[str] = []
     all_stations: bool = False
     start_time: str = ""
     stop_time: str = ""
@@ -1804,13 +1994,13 @@ async def api_replay_preload(body: _ReplayPreloadBody) -> JSONResponse:
     # Resolve geosncls
     if body.all_stations:
         geosncls = _indexed_geosncls()
-    elif body.station_lists:
+    elif body.stream_lists:
         geosncl_set: set[str] = set()
-        for lst in body.station_lists:
+        for lst in body.stream_lists:
             geosncl_set.update(_geosncls_for_list(lst))
         geosncls = sorted(geosncl_set)
     else:
-        return JSONResponse({"error": "Specify station_lists or all_stations=true"}, status_code=400)
+        return JSONResponse({"error": "Specify stream_lists or all_stations=true"}, status_code=400)
 
     # Apply stream filters
     geosncls = _replay_mod.filter_geosncls(
@@ -1834,7 +2024,7 @@ async def api_replay_preload(body: _ReplayPreloadBody) -> JSONResponse:
         "window_stop_ms":   int(stop_dt.timestamp() * 1000),
         "start_time":       body.start_time,
         "stop_time":        body.stop_time,
-        "station_lists":    body.station_lists,
+        "stream_lists":     body.stream_lists,
         "all_stations":     body.all_stations,
     }
 
@@ -1923,7 +2113,7 @@ async def api_readme() -> JSONResponse:
 
 def _all_list_geosncls() -> list[str]:
     """Return a deduplicated sorted list of all geosncls from every station list file."""
-    d = _station_lists_dir()
+    d = _stream_lists_dir()
     if not d.exists():
         return []
     seen: set[str] = set()
@@ -1931,7 +2121,7 @@ def _all_list_geosncls() -> list[str]:
         if path.suffix not in (".jsonl", ".json"):
             continue
         try:
-            records = _read_station_list_file(path)
+            records = _read_stream_list_file(path)
             for rec in records:
                 g = rec.get("geosncl") or rec.get("edid", "")
                 if g:
@@ -2137,7 +2327,8 @@ async def api_ppsd_run(
             f"{n_groups} group(s), {len(all_files)} file(s)  ({start} → {end})"})
 
         loop = asyncio.get_event_loop()
-        run_dir = paths.plots_dir() / "ppsd" / f"{start}_{end}"
+        output_root = paths.plots_dir() / "ppsd"
+        date_range = f"{start}_{end}"
         written_total = 0
 
         for i, (key, files) in enumerate(groups):
@@ -2166,8 +2357,9 @@ async def api_ppsd_run(
             def _render(files=files, label=label, slug=slug, title_prefix=title_prefix):
                 from earthscope_positions.export import ppsd_writer as pw
                 return pw.write_ppsd_from_caches(
-                    files, run_dir,
-                    label=label, slug=slug, title_prefix=title_prefix,
+                    files, output_root,
+                    label=label, mode=mode, date_range=date_range,
+                    slug=slug, title_prefix=title_prefix,
                 )
 
             try:

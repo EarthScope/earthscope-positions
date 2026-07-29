@@ -49,16 +49,31 @@ import { marked } from "marked";
 
 const pages = [
   {
-    route: "/station-builder",
-    label: "Station Builder",
+    route: "/station-list-builder",
+    label: "Station List Builder",
     icon: "map",
     color: "teal",
     description:
-      "Interactively build station lists by clicking on a map. Filter by rectangle or polygon, search by stream code, and save named lists for use in other tools.",
+      "Interactively down-select stations by clicking on a map, and save them as named station lists (station codes only). These feed the Stream List Builder's include/exclude sets.",
     tips: [
-      "Draw a rectangle on the map to select stations in an area.",
-      "Use the stream filter chips to narrow by processing center or solution type.",
+      "Draw a rectangle (Shift + drag) on the map to select stations in an area.",
+      "Hover a station for its 4-character code; zoom in to also see its streams.",
+      "Click a station's popup to Select/Deselect it, or launch a Radial Search centered on it.",
       "Save your selection as a named list (e.g. \"ShakeAlert\") for reuse.",
+    ],
+  },
+  {
+    route: "/stream-list-builder",
+    label: "Stream List Builder",
+    icon: "share_location",
+    color: "deep-purple",
+    description:
+      "Pick individual streams from stations in your include/exclude station lists, and save them as named stream lists used by Fetch, Completeness, Positions, PPSD, Export and Replay.",
+    tips: [
+      "Choose Include/Exclude Station Lists to control which stations' streams appear on the map.",
+      "Click a station to toggle all its streams, or open its panel to toggle individual streams.",
+      "Use the Filter Streams chips (processing center / stream type) with Add matching /",
+      "Remove matching to bulk-adjust the current selection.",
     ],
   },
   {
@@ -67,11 +82,11 @@ const pages = [
     icon: "cloud_download",
     color: "cyan",
     description:
-      "Download GNSS position data for your station lists — a guided, three-step walkthrough (choose lists → date range & filters → fetch) with a live progress bar and log.",
+      "Download GNSS position data for your stream lists — a guided, three-step walkthrough (choose lists → date range & filters → fetch) with a live progress bar and log.",
     tips: [
-      "Only missing (station, day) pairs are downloaded; existing or previously-attempted data is skipped.",
+      "Only missing (stream, day) pairs are downloaded; existing or previously-attempted data is skipped.",
       "Optionally narrow by processing center or stream type before fetching.",
-      "Only one fetch runs at a time — you can switch tabs and it keeps going.",
+      "Only one fetch runs at a time — you can switch tabs and it keeps going; when it finishes, click Restart fetch to run the same configuration again.",
     ],
   },
   {
@@ -80,9 +95,10 @@ const pages = [
     icon: "grid_on",
     color: "blue",
     description:
-      "Heatmap view of data completeness and ingest latency across stations and time. Identify gaps, coverage issues, and high-latency stations at a glance.",
+      "Heatmap view of data completeness and ingest latency across streams and time. Identify gaps, coverage issues, and high-latency streams at a glance.",
     tips: [
-      "Select a station list and date range, then click a time-window button.",
+      "Select a stream list and date range, then click a time-window button.",
+      "In the calendar picker, click once for the start day and again for the end day, or drag across days.",
       "Hover over cells to see row counts and latency values.",
       "Use the Fetch Missing button to download any missing Arrow files.",
     ],
@@ -93,9 +109,9 @@ const pages = [
     icon: "show_chart",
     color: "indigo",
     description:
-      "Time-series plots of East, North, and Up position components for one or more stations over a selected date range.",
+      "Time-series plots of East, North, and Up position components for one or more streams over a selected date range.",
     tips: [
-      "Type or paste comma-separated geosncl codes to overlay multiple stations.",
+      "Type or paste comma-separated geosncl codes to overlay multiple streams.",
       "Zoom and pan the chart; use the reset button to restore the full range.",
     ],
   },
@@ -105,11 +121,11 @@ const pages = [
     icon: "graphic_eq",
     color: "deep-orange",
     description:
-      "Compute Probabilistic Power Spectral Density plots from locally stored Arrow files. Generate one plot per processing center or one plot per stream.",
+      "Compute Probabilistic Power Spectral Density plots from locally stored Arrow files. Generate one plot per processing center, solution type, or individual stream.",
     tips: [
       "\"By Processing Center\" groups all streams from a center into a single 3-panel PNG.",
-      "\"By Stream\" produces one PNG per geosncl — useful for comparing individual sites.",
-      "Output PNGs appear under data/plots/ppsd/ and are viewable in File Plots.",
+      "\"By Stream\" produces one PNG per geosncl — useful for comparing individual streams.",
+      "Output PNGs are organized under data/plots/ppsd/<mode>/ and are viewable in File Plots.",
     ],
   },
   {
@@ -120,6 +136,7 @@ const pages = [
     description:
       "Browse and view PNG plots stored under data/plots/. Navigate the directory tree with collapsible folders and click any image to view it full-size.",
     tips: [
+      "PPSD plots are grouped by type (by-stream, by-center, …), then by plot, with one dated file per run.",
       "Click a folder caret to expand it — children are loaded on first open.",
       "Click an image name to display it in the viewer panel.",
     ],
@@ -132,7 +149,7 @@ const pages = [
     description:
       "Convert downloaded Arrow position data into MiniSEED or GeoJSON files. Edit the output path-spec (directory structure & filenames) and regenerate on demand.",
     tips: [
-      "Choose MiniSEED or GeoJSON (compact / full / both) and a station list + date range.",
+      "Choose MiniSEED or GeoJSON (compact / full / both) and a stream list + date range.",
       "Edit the path-spec TOML in the editor, Save spec, then Convert to remake files.",
       "Enable overwrite to regenerate files that already exist under the new layout.",
     ],
@@ -143,11 +160,11 @@ const pages = [
     icon: "replay",
     color: "purple",
     description:
-      "Replay archived position data to a Kafka topic at any speed. Select a station list, set a 6-hour (or longer) window, preload the data, then start the replay.",
+      "Replay archived position data to a Kafka topic at any speed. Select a stream list, set a 6-hour (or longer) window, preload the data, then start the replay.",
     tips: [
       "Preload resolves which Arrow files cover the time window before replay starts.",
       "Time scale > 1× speeds up the replay; apply_latency re-introduces original ingest delays.",
-      "The stream count summary shows how many stations have data in the selected window.",
+      "The stream count summary shows how many streams have data in the selected window.",
     ],
   },
 ];

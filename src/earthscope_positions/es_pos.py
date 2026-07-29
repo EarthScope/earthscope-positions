@@ -12,7 +12,7 @@ Usage:
   es-pos fetch concat data/arrow/P548.CI.LY_.20/202501/*.arrow -o merged.arrow
 
   es-pos process completeness
-  es-pos process completeness --overwrite --data-dir /custom/data/arrow
+  es-pos process completeness --overwrite --data-directory /custom/data
 
   es-pos process ppsd
   es-pos process ppsd -i ShakeAlert --start 2026-01-01 --end 2026-01-31
@@ -36,30 +36,26 @@ def _project_root() -> pathlib.Path:
 
 
 def _add_data_dir_args(p: argparse.ArgumentParser, *, arrow: bool = True) -> None:
-    """Add --data-directory (base) and, when *arrow*, --arrow-data-directory."""
+    """Add the standard --data-directory flag.
+
+    (*arrow* is accepted for call-site compatibility but no longer does anything;
+    the Arrow root is always ``<data-directory>/arrow``.)
+    """
     p.add_argument(
         "--data-directory",
         metavar="PATH",
         default=None,
         help=(
             "Base data directory (default: $ES_POS_DATA_DIRECTORY or ./data).  "
-            "Arrow files live under <PATH>/arrow, station lists under "
-            "<PATH>/station-lists, plots under <PATH>/plots."
+            "Arrow files live under <PATH>/arrow, stream lists under "
+            "<PATH>/stream-lists, plots under <PATH>/plots."
         ),
     )
-    if arrow:
-        p.add_argument(
-            "--arrow-data-directory",
-            metavar="PATH",
-            default=None,
-            help="Override just the Arrow data root (supersedes --data-directory/arrow).",
-        )
 
 
 def _apply_data_dir_args(args: argparse.Namespace) -> None:
-    """Push the resolved --data-directory / --arrow-data-directory into `paths`."""
+    """Push the resolved --data-directory into `paths` (Arrow root = <base>/arrow)."""
     paths.set_base_dir(getattr(args, "data_directory", None))
-    paths.set_arrow_dir(getattr(args, "arrow_data_directory", None))
 
 
 def _build_top_parser() -> tuple[
@@ -82,7 +78,7 @@ Typical workflow:
   4.  es-pos webserver                   (open http://localhost:8000)
 
 Subcommands:
-  stations   Discover and manage GNSS station lists.
+  stations   Discover and manage GNSS stream lists.
   fetch      Download and manage position data.
   process    Post-process downloaded data.
   export     Export to MiniSEED 3, GeoJSON, or PPSD plots.
@@ -97,7 +93,7 @@ Use 'es-pos <subcommand> --help' for per-command options.
 
     sub.add_parser(
         "stations",
-        help="Discover and manage GNSS station lists.",
+        help="Discover and manage GNSS stream lists.",
         add_help=False,
     )
     sub.add_parser(
@@ -139,14 +135,14 @@ run on demand per file (much slower on large date ranges).
 
 Already-existing cache files are skipped unless --overwrite is given.
 
-Station selection: use -i/--input (station list) or --all for all indexed stations.
+Station selection: use -i/--input (stream list) or --all for all indexed stations.
 Date range: use --start / --end to restrict which files are processed.
 
 Examples:
   es-pos process ppsd
   es-pos process ppsd --overwrite
   es-pos process ppsd -i ShakeAlert --start 2026-01-01 --end 2026-01-31
-  es-pos process ppsd --data-dir /data/archive/arrow
+  es-pos process ppsd --data-directory /data/archive
 """,
     )
     ppsd_proc_p.add_argument(
@@ -155,8 +151,8 @@ Examples:
         metavar="LIST",
         dest="input",
         help=(
-            "Station list name or file.  May be repeated.  "
-            "Resolved as: path, path+.jsonl, data/station-lists/<name>.jsonl.  "
+            "Stream list name or file.  May be repeated.  "
+            "Resolved as: path, path+.jsonl, data/stream-lists/<name>.jsonl.  "
             "Mutually exclusive with --all."
         ),
     )
@@ -218,7 +214,7 @@ pre-computing them here makes the Completeness & Latency tab load faster.
 Examples:
   es-pos process completeness
   es-pos process completeness --overwrite
-  es-pos process completeness --arrow-data-directory /data/archive/arrow
+  es-pos process completeness --data-directory /data/archive
 """,
     )
     _add_data_dir_args(comp_p)
@@ -254,14 +250,15 @@ Web UI tabs:
 
   Positions
     Interactive ENU time-series plots with linear-axis power spectra
-    (down to 5-minute noise).  Select a station list and date range,
+    (down to 5-minute noise).  Select a stream list and date range,
     overlay multiple stations.
 
   Station Builder
-    Interactive map of all stations from reference/coordinates/coordinates.csv.
+    Interactive map of all stations from the editable coordinates file
+    (<data-dir>/coordinates.csv, seeded from resources/coordinates.csv).
     Click or rectangle-drag to select stations; filter by processing center
-    and PPP solution type; save selections as station lists for use with
-    'es-pos fetch get'.
+    and PPP solution type; save selections as stream lists for use with
+    'es-pos fetch get'.  Update/Edit Coordinates add or change stations.
 
   File Plots
     Browse and display PNG/JPEG plots from ./data/plots/, including PPSD
@@ -270,7 +267,7 @@ Web UI tabs:
 Examples:
   es-pos webserver
   es-pos webserver --port 9000
-  es-pos webserver --data-dir /archive/data/arrow
+  es-pos webserver --data-directory /archive/data
 """,
     )
     web_p.add_argument(
@@ -365,7 +362,7 @@ using ENU — East, North, Up — coordinate order:
                              "EError":...,"NError":...,"UError":...,
                              "quality":...,"sampleRate":1}}
 
-Station selection: use -i/--input (station list) or --all for all indexed stations.
+Station selection: use -i/--input (stream list) or --all for all indexed stations.
 Date range: specify exactly two of --start-time, --stop-time, --duration; the
 third is derived automatically.
 
@@ -385,9 +382,9 @@ Examples:
         metavar="LIST",
         dest="input",
         help=(
-            "Station list name or file.  May be repeated.  "
-            "Resolved in order: as given, with .jsonl, in data/station-lists/, "
-            "in data/station-lists/ with .jsonl.  Mutually exclusive with --all."
+            "Stream list name or file.  May be repeated.  "
+            "Resolved in order: as given, with .jsonl, in data/stream-lists/, "
+            "in data/stream-lists/ with .jsonl.  Mutually exclusive with --all."
         ),
     )
     gj_p.add_argument(
@@ -450,7 +447,7 @@ written to miniseed_path_spec.toml in the working directory on first run.
 
 Data gaps (time jumps or null values) produce separate records within each file.
 
-Station selection: use -i/--input (station list) or --all for all indexed stations.
+Station selection: use -i/--input (stream list) or --all for all indexed stations.
 Date range: specify exactly two of --start-time, --stop-time, --duration; the
 third is derived automatically.
 
@@ -470,9 +467,9 @@ Examples:
         metavar="LIST",
         dest="input",
         help=(
-            "Station list name or file.  May be repeated.  "
-            "Resolved in order: as given, with .jsonl, in data/station-lists/, "
-            "in data/station-lists/ with .jsonl.  Mutually exclusive with --all."
+            "Stream list name or file.  May be repeated.  "
+            "Resolved in order: as given, with .jsonl, in data/stream-lists/, "
+            "in data/stream-lists/ with .jsonl.  Mutually exclusive with --all."
         ),
     )
     ms_p.add_argument(
@@ -527,7 +524,8 @@ By default one PNG is produced per station (geosncl).  Use --combined to
 accumulate all selected stations into a single plot.
 
 Output directory:
-  {output}/{start}_{end}/ppsd-{station}.png
+  {output}/{mode}/ppsd-{name}/ppsd-{name}_{start}_{end}.png
+  (mode: by-stream, by-center, or all)
 
 The generated PNG files appear immediately in the File Plots tab of the
 web UI ('es-pos webserver') under data/plots/ppsd/.
@@ -550,9 +548,9 @@ Examples:
         metavar="LIST",
         dest="input",
         help=(
-            "Station list name or file.  May be repeated.  "
-            "Resolved in order: as given, with .jsonl, in data/station-lists/, "
-            "in data/station-lists/ with .jsonl.  Mutually exclusive with --all."
+            "Stream list name or file.  May be repeated.  "
+            "Resolved in order: as given, with .jsonl, in data/stream-lists/, "
+            "in data/stream-lists/ with .jsonl.  Mutually exclusive with --all."
         ),
     )
     ppsd_p.add_argument(
@@ -605,7 +603,7 @@ where data_arrival = data_time + ingest_latency (if --apply-latency).
 
 The message key is the GEOSNCL string.  Connection is plain-text (no TLS).
 
-Station selection: use -i/--input (station list) or --all.
+Station selection: use -i/--input (stream list) or --all.
 Date range: exactly two of --start-time, --stop-time, --duration.
 Duration format: '7d', '24h', '90m', '3600s', or bare integer (days).
 
@@ -624,7 +622,7 @@ Examples:
         action="append",
         metavar="LIST",
         dest="input",
-        help="Station list name or file.  May be repeated.  Mutually exclusive with --all.",
+        help="Stream list name or file.  May be repeated.  Mutually exclusive with --all.",
     )
     replay_p.add_argument(
         "--all", action="store_true",
@@ -728,7 +726,7 @@ def _resolve_list_path(name: str) -> "pathlib.Path | None":
     """Find a station-list JSONL file — same search order as es-pos fetch."""
     p = pathlib.Path(name)
     stem = p.stem if p.suffix in (".jsonl", ".json") else p.name
-    sl = paths.station_lists_dir()
+    sl = paths.stream_lists_dir()
     candidates = [
         p,
         p.parent / (stem + ".jsonl"),
@@ -740,13 +738,13 @@ def _resolve_list_path(name: str) -> "pathlib.Path | None":
 
 
 def _load_geosncls_from_lists(list_args: list[str]) -> list[str]:
-    """Load sorted, deduplicated geosncl strings from one or more station list files."""
+    """Load sorted, deduplicated geosncl strings from one or more stream list files."""
     import json as _json
     geosncls: set[str] = set()
     for arg in list_args:
         path = _resolve_list_path(arg)
         if path is None:
-            print(f"  [warn] Station list not found: {arg!r}", file=sys.stderr)
+            print(f"  [warn] Stream list not found: {arg!r}", file=sys.stderr)
             continue
         try:
             raw = path.read_bytes()
@@ -836,7 +834,7 @@ def _cmd_export_ppsd(args: argparse.Namespace) -> None:
     elif getattr(args, "input", None):
         geosncls = _load_geosncls_from_lists(args.input)
         if not geosncls:
-            sys.exit("No geosncls found in the specified station list(s).")
+            sys.exit("No geosncls found in the specified stream list(s).")
         arrow_files = sorted(
             p
             for gs in geosncls
@@ -1005,7 +1003,13 @@ def _cmd_export_miniseed(args: argparse.Namespace) -> None:
 
 def _cmd_webserver(args: argparse.Namespace) -> None:
     import uvicorn
-    from earthscope_positions.webserver.webserver import app, set_public_base
+    from earthscope_positions.webserver.webserver import (
+        app, set_public_base, run_startup_preflight,
+    )
+
+    # Blocking pre-flight: verify login (abort if not authed), seed coordinates,
+    # and preload the default station/stream lists — all before we start serving.
+    run_startup_preflight()
 
     set_public_base(args.hostname, args.port)
     print(
@@ -1206,9 +1210,9 @@ def main() -> None:
     # to the delegated module's parser, which gives correct per-command help.
     args, remaining = ap.parse_known_args()
 
-    # Apply --data-directory / --arrow-data-directory for groups handled in this
-    # module (process/export/replay/webserver).  The stations/fetch/test groups
-    # re-parse and apply the same flags in their own main().
+    # Apply --data-directory for groups handled in this module
+    # (process/export/replay/webserver).  The stations/fetch/test groups re-parse
+    # and apply the same flag in their own main().
     _apply_data_dir_args(args)
 
     group = args.group

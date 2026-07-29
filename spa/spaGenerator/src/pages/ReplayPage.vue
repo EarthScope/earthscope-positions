@@ -13,11 +13,11 @@
           <q-separator />
           <q-card-section class="q-gutter-sm">
 
-            <!-- Station lists (multi-select) -->
+            <!-- Stream lists (multi-select) -->
             <q-select
               v-model="selectedLists"
               :options="listOptions"
-              label="Station list(s)"
+              label="Stream list(s)"
               multiple
               use-chips
               dense
@@ -216,7 +216,7 @@
         <div v-if="replayStatus === 'idle'" class="flex flex-center text-grey-5 q-pa-xl" style="min-height:200px">
           <div class="text-center">
             <q-icon name="play_circle_outline" size="48px" class="q-mb-sm" />
-            <div>Configure a station list and date range, then click Preload.</div>
+            <div>Configure a stream list and date range, then click Preload.</div>
           </div>
         </div>
 
@@ -268,7 +268,7 @@
               <template v-if="replayState.missing_not_fetched?.length">
                 <q-banner class="bg-orange-1 text-orange-10 q-mt-md rounded-borders" dense>
                   <template #avatar><q-icon name="cloud_download" color="orange" /></template>
-                  <strong>{{ replayState.missing_not_fetched.length }} station(s)</strong> have not been fetched for this date range.
+                  <strong>{{ replayState.missing_not_fetched.length }} stream(s)</strong> have not been fetched for this date range.
                   <div class="text-caption q-mt-xs">
                     {{ replayState.missing_not_fetched.slice(0, 5).join(", ") }}
                     <span v-if="replayState.missing_not_fetched.length > 5">… and {{ replayState.missing_not_fetched.length - 5 }} more</span>
@@ -283,7 +283,7 @@
               <template v-if="replayState.missing_no_data?.length">
                 <q-banner class="bg-grey-2 text-grey-8 q-mt-sm rounded-borders" dense>
                   <template #avatar><q-icon name="block" color="grey-6" /></template>
-                  <strong>{{ replayState.missing_no_data.length }} station(s)</strong> were previously fetched but the API returned no data.
+                  <strong>{{ replayState.missing_no_data.length }} stream(s)</strong> were previously fetched but the API returned no data.
                   <div class="text-caption q-mt-xs">
                     {{ replayState.missing_no_data.slice(0, 5).join(", ") }}
                     <span v-if="replayState.missing_no_data.length > 5">… and {{ replayState.missing_no_data.length - 5 }} more</span>
@@ -577,7 +577,7 @@
             &nbsp;·&nbsp; {{ startDate.slice(0, 10) }} → {{ stopDate.slice(0, 10) }}
           </div>
           <div class="text-caption text-grey-6 q-mt-xs">
-            Only the {{ replayState.missing_not_fetched?.length ?? 0 }} station(s) with no prior fetch attempt will be downloaded.
+            Only the {{ replayState.missing_not_fetched?.length ?? 0 }} stream(s) with no prior fetch attempt will be downloaded.
           </div>
         </q-card-section>
         <q-card-section v-if="fetchLog.length" style="max-height: 40vh; overflow-y:auto" class="q-pt-none">
@@ -628,7 +628,7 @@
 import { ref, computed, onMounted, onUnmounted, onActivated, onDeactivated, watch, nextTick } from "vue";
 import type { Chart as ChartType } from "chart.js";
 import {
-  getStationLists,
+  getStreamLists,
   replayPreload,
   getReplayStatus,
   replayGo,
@@ -644,6 +644,7 @@ import {
   PROC_CENTERS, STREAM_TYPE_CODES, solTypeLabel, sortSolTypes,
   defaultSelectedCenters, defaultSelectedStreamTypes,
 } from "../constants/streamTypes";
+import { createRangeSelectHandler } from "../utils/dateRangePicker";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -822,21 +823,18 @@ function toggleItem(list: string[], item: string): void {
   else list.push(item);
 }
 
-function onRangeSelect(val: { from: string; to: string } | string | null) {
-  if (!val) return;
-  // Quasar's range q-date emits a plain string for a single-day pick and a
-  // {from, to} object for a multi-day range. Support both so the same day can be
-  // selected once (from === to).
-  const from = typeof val === "string" ? val : val.from;
-  const to   = typeof val === "string" ? val : val.to;
-  if (!from || !to) return;
-  // Preserve existing time component if already entered; otherwise default to
-  // 00:00:00 → 23:59:59 (seconds precision).
-  const existStart = startDate.value.slice(11) || "00:00:00";
-  const existStop  = stopDate.value.slice(11)  || "23:59:59";
-  startDate.value = from + "T" + existStart;
-  stopDate.value  = to   + "T" + existStop;
-}
+const onRangeSelect = createRangeSelectHandler(
+  (from, to) => { dateRange.value = { from, to }; },
+  (from, to) => {
+    dateRange.value = { from, to };
+    // Preserve existing time component if already entered; otherwise default to
+    // 00:00:00 → 23:59:59 (seconds precision).
+    const existStart = startDate.value.slice(11) || "00:00:00";
+    const existStop  = stopDate.value.slice(11)  || "23:59:59";
+    startDate.value = from + "T" + existStart;
+    stopDate.value  = to   + "T" + existStop;
+  },
+);
 
 async function copy(text: string) {
   try { await navigator.clipboard.writeText(text); } catch { /* ignore */ }
@@ -867,13 +865,13 @@ async function copyLog() {
   await copy(lines);
 }
 
-// ─── Station lists ────────────────────────────────────────────────────────────
+// ─── Stream lists ─────────────────────────────────────────────────────────────
 
 const { confirmDeleteList } = useListDelete(loadListOptions);
 
 async function loadListOptions() {
   try {
-    const resp = await getStationLists();
+    const resp = await getStreamLists();
     listOptions.value = resp.lists.map((l) => ({ label: l, value: l }));
   } catch {
     listOptions.value = [];
@@ -886,7 +884,7 @@ async function fetchFilterOptions() {
   try {
     const params = new URLSearchParams();
     for (const l of selectedLists.value) params.append("lists", l);
-    const res = await fetch(`/api/station-lists/filter-options?${params}`);
+    const res = await fetch(`/api/stream-lists/filter-options?${params}`);
     if (!res.ok) {
       availableCenters.value  = ALL_CENTERS;
       availableSolTypes.value = ALL_SOL_TYPES;
@@ -1057,7 +1055,7 @@ async function doPreload() {
   startPolling();
   try {
     await replayPreload({
-      station_lists:    selectedLists.value,
+      stream_lists:     selectedLists.value,
       all_stations:     false,
       start_time:       startDate.value,
       stop_time:        stopDate.value,
@@ -1129,7 +1127,7 @@ function startFetch() {
   // Snap datetimes to date-only (YYYY-MM-DD) for the fetch endpoint
   const fetchStart = startDate.value.slice(0, 10);
   const fetchEnd   = stopDate.value.slice(0, 10);
-  // Target only the stations that haven't been fetched at all
+  // Target only the streams that haven't been fetched at all
   const notFetched = replayState.value.missing_not_fetched ?? [];
   openFetchMissingStream(
     {
@@ -1181,7 +1179,7 @@ onMounted(async () => {
       outputFormat.value    = s.config.output_format ?? "compact";
       startDate.value       = s.config.start_time;
       stopDate.value        = s.config.stop_time;
-      selectedLists.value   = s.config.station_lists ?? [];
+      selectedLists.value   = s.config.stream_lists ?? [];
     }
   } catch { /* server not ready yet */ }
 });
@@ -1208,7 +1206,7 @@ watch(chartCanvas, (el) => {
   if (el && isRunning.value) initChart();
 });
 
-// Refresh filter options when station lists change
+// Refresh filter options when stream lists change
 watch(selectedLists, () => {
   fetchFilterOptions();
 });

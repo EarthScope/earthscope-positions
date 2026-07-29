@@ -10,17 +10,17 @@
           bordered
           header-nav
         >
-          <!-- ── Step 1: choose stations ─────────────────────────────────── -->
-          <q-step :name="1" title="Choose stations" icon="checklist" :done="step > 1">
+          <!-- ── Step 1: choose streams ──────────────────────────────────── -->
+          <q-step :name="1" title="Choose streams" icon="checklist" :done="step > 1">
             <div class="text-body2 text-grey-7 q-mb-md">
-              Pick one or more station lists to download position data for. Build
-              lists in the <router-link to="/station-builder">Station Builder</router-link>.
+              Pick one or more stream lists to download position data for. Build
+              lists in the <router-link to="/stream-list-builder">Stream List Builder</router-link>.
             </div>
 
             <q-select
               v-model="selectedLists"
               :options="listOptions"
-              label="Station list(s)"
+              label="Stream list(s)"
               multiple use-chips dense outlined emit-value map-options
               :disable="running"
             >
@@ -124,12 +124,18 @@
 
             <div class="row q-gutter-sm q-mb-md">
               <q-btn
-                v-if="!running"
+                v-if="!running && !done"
                 color="primary" icon="cloud_download" label="Start fetch" no-caps unelevated
                 :disable="!canStart"
                 @click="startFetch"
               />
-              <q-btn v-else color="negative" icon="stop" label="Cancel" no-caps outline @click="cancel" />
+              <q-btn
+                v-if="!running && done"
+                color="primary" icon="refresh" label="Restart fetch" no-caps unelevated
+                :disable="!canStart"
+                @click="startFetch"
+              />
+              <q-btn v-if="running" color="negative" icon="stop" label="Cancel" no-caps outline @click="cancel" />
               <q-btn flat color="grey-7" label="Back" no-caps :disable="running" @click="step = 2" />
               <q-btn
                 v-if="done && exitCode === 0"
@@ -187,6 +193,7 @@ import { useListDelete } from "../composables/useListDelete";
 import {
   solTypeLabel, sortSolTypes, defaultSelectedCenters, defaultSelectedStreamTypes,
 } from "../constants/streamTypes";
+import { createRangeSelectHandler } from "../utils/dateRangePicker";
 
 const {
   step, selectedLists, startDate, endDate, filterCenters, filterSolTypes, workers,
@@ -207,15 +214,18 @@ function toggleItem(list: string[], item: string): void {
   if (i >= 0) list.splice(i, 1); else list.push(item);
 }
 
-function onRangeSelect(val: { from: string; to: string } | null) {
-  if (!val) return;
-  startDate.value = val.from;
-  endDate.value = val.to;
-}
+const onRangeSelect = createRangeSelectHandler(
+  (from, to) => { dateRange.value = { from, to }; },
+  (from, to) => {
+    dateRange.value = { from, to };
+    startDate.value = from;
+    endDate.value = to;
+  },
+);
 
 async function loadListOptions() {
   try {
-    const res = await fetch("/api/station-lists");
+    const res = await fetch("/api/stream-lists");
     const data = await res.json();
     listOptions.value = (data.lists ?? []).map((l: string) => ({ label: l, value: l }));
   } catch { listOptions.value = []; }
@@ -225,7 +235,7 @@ async function fetchFilterOptions() {
   try {
     const params = new URLSearchParams();
     for (const l of selectedLists.value) params.append("lists", l);
-    const res = await fetch(`/api/station-lists/filter-options?${params}`);
+    const res = await fetch(`/api/stream-lists/filter-options?${params}`);
     if (!res.ok) return;
     const data = await res.json();
     availableCenters.value  = data.centers  ?? [];

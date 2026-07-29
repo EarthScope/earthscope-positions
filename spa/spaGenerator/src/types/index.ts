@@ -81,7 +81,7 @@ export interface StationsResponse {
   total: number;
 }
 
-export interface StationListsResponse {
+export interface StreamListsResponse {
   lists: string[];
 }
 
@@ -107,7 +107,7 @@ export interface ReplayConfig {
   start_data_ms: number;
   start_time: string;
   stop_time: string;
-  station_lists: string[];
+  stream_lists: string[];
   all_stations: boolean;
   start_replay_wall_ms?: number;
 }
@@ -177,7 +177,7 @@ export interface PpsdEvent {
 }
 
 export interface ReplayPreloadBody {
-  station_lists: string[];
+  stream_lists: string[];
   all_stations: boolean;
   start_time: string;
   stop_time: string;

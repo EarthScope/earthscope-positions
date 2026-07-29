@@ -7,11 +7,11 @@ Priority (highest → lowest):
   2. ShakeAlert extended coords    reference/coordinates/station_coords_extended.dat
   3. RealTimeDB                    reference/coordinates/rtdb.csv
 
-Any site appearing in a higher-priority source is kept and the lower-priority
-entry is discarded.  The output has no duplicate sites.
+Any station appearing in a higher-priority source is kept and the lower-priority
+entry is discarded.  The output has no duplicate stations.
 
 Output: reference/coordinates/coordinates.csv
-  Columns: site, latitude, longitude, height, source
+  Columns: station, latitude, longitude, height, source
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ def parse_gage(path: pathlib.Path) -> list[dict]:
             parts = [p.strip() for p in line.split(",")]
             if len(parts) < 5:
                 continue
-            site = parts[0].upper()
+            station = parts[0].upper()
             try:
                 lat = float(parts[2])
                 lon = float(parts[3])
@@ -54,7 +54,7 @@ def parse_gage(path: pathlib.Path) -> list[dict]:
                 continue
             rows.append(
                 {
-                    "site": site,
+                    "station": station,
                     "latitude": lat,
                     "longitude": lon,
                     "height": hgt,
@@ -67,7 +67,7 @@ def parse_gage(path: pathlib.Path) -> list[dict]:
 def parse_shakealert(path: pathlib.Path) -> list[dict]:
     """
     Format (fixed whitespace-separated, after skipping # comments):
-      Site  Lat  Lon  EllipElev  X  Y  Z  Epoch  Net  Status  ...
+      Station  Lat  Lon  EllipElev  X  Y  Z  Epoch  Net  Status  ...
     Columns 0-3 are the ones we need.
     """
     rows = []
@@ -79,7 +79,7 @@ def parse_shakealert(path: pathlib.Path) -> list[dict]:
             parts = line.split()
             if len(parts) < 4:
                 continue
-            site = parts[0].upper()
+            station = parts[0].upper()
             try:
                 lat = float(parts[1])
                 lon = float(parts[2])
@@ -88,7 +88,7 @@ def parse_shakealert(path: pathlib.Path) -> list[dict]:
                 continue
             rows.append(
                 {
-                    "site": site,
+                    "station": station,
                     "latitude": lat,
                     "longitude": lon,
                     "height": hgt,
@@ -106,7 +106,7 @@ def parse_rtdb(path: pathlib.Path) -> list[dict]:
     with path.open(newline="") as fh:
         reader = csv.DictReader(fh)
         for row in reader:
-            site = row["FourCharID"].strip().upper()
+            station = row["FourCharID"].strip().upper()
             try:
                 lat = float(row["Lat"])
                 lon = float(row["Long"])
@@ -115,7 +115,7 @@ def parse_rtdb(path: pathlib.Path) -> list[dict]:
                 continue
             rows.append(
                 {
-                    "site": site,
+                    "station": station,
                     "latitude": lat,
                     "longitude": lon,
                     "height": hgt,
@@ -132,16 +132,16 @@ def parse_rtdb(path: pathlib.Path) -> list[dict]:
 
 def merge(sources: list[list[dict]]) -> list[dict]:
     """
-    Apply priority-ordered merge: first occurrence of each site wins.
-    Returns rows sorted by site name.
+    Apply priority-ordered merge: first occurrence of each station wins.
+    Returns rows sorted by station name.
     """
     seen: dict[str, dict] = {}
     for source_rows in sources:
         for row in source_rows:
-            site = row["site"]
-            if site not in seen:
-                seen[site] = row
-    return sorted(seen.values(), key=lambda r: r["site"])
+            station = row["station"]
+            if station not in seen:
+                seen[station] = row
+    return sorted(seen.values(), key=lambda r: r["station"])
 
 
 # ---------------------------------------------------------------------------
@@ -176,14 +176,14 @@ def main() -> None:
     for row in merged:
         src_counts[row["source"]] = src_counts.get(row["source"], 0) + 1
 
-    print(f"\nMerged: {len(merged)} unique sites")
+    print(f"\nMerged: {len(merged)} unique stations")
     for src in ("gage", "shakealert", "rtdb"):
         print(f"  {src:12s}: {src_counts.get(src, 0):5d}")
 
     OUT.parent.mkdir(parents=True, exist_ok=True)
     with OUT.open("w", newline="") as fh:
         writer = csv.DictWriter(
-            fh, fieldnames=["site", "latitude", "longitude", "height", "source"]
+            fh, fieldnames=["station", "latitude", "longitude", "height", "source"]
         )
         writer.writeheader()
         writer.writerows(merged)

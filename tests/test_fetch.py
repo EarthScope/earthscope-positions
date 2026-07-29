@@ -180,7 +180,7 @@ def test_no_data_cached_skips_api(project_tree, mock_positions_api):
 
 def test_cmd_get_end_to_end(project_tree, fake_token, mock_positions_api):
     # A station list file the command will read.
-    sl = project_tree / "data" / "station-lists" / "mylist.jsonl"
+    sl = project_tree / "data" / "stream-lists" / "mylist.jsonl"
     sl.write_bytes(orjson.dumps({"geosncl": _GEOSNCL, "edid": _EDID}) + b"\n")
 
     _register(mock_positions_api, body=make_positions_arrow(20), status=200)

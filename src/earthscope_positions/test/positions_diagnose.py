@@ -513,7 +513,7 @@ Examples:
         default=None,
         help=(
             "Base data directory (default: $ES_POS_DATA_DIRECTORY or ./data).  "
-            "Station lists are read from <PATH>/station-lists; output goes to "
+            "Stream lists are read from <PATH>/stream-lists; output goes to "
             "<PATH>/positions_diagnose."
         ),
     )

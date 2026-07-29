@@ -6,13 +6,12 @@ The **base data directory** is resolved with this precedence:
     2. the ``ES_POS_DATA_DIRECTORY`` environment variable
     3. ``<project-root>/data``   (the default, i.e. ``./data``)
 
-Every data sub-directory (``arrow/``, ``station-lists/``, ``plots/``,
-``positions_diagnose/``) derives from the base.  The Arrow sub-directory can be
-overridden independently via :func:`set_arrow_dir` (CLI
-``--arrow-data-directory``), which supersedes the base for Arrow data only.
+Every data sub-directory (``arrow/``, ``stream-lists/``, ``station-lists/``,
+``plots/``, ``positions_diagnose/``) derives from the base — including the Arrow
+data root, which is always ``<base>/arrow``.
 
 Import this module and call the accessor functions (``arrow_dir()``,
-``station_lists_dir()``, …) rather than constructing ``.../data/...`` paths by
+``stream_lists_dir()``, …) rather than constructing ``.../data/...`` paths by
 hand, so a single flag/env var controls the whole tree.
 """
 from __future__ import annotations
@@ -23,7 +22,6 @@ import pathlib
 ENV_VAR = "ES_POS_DATA_DIRECTORY"
 
 _base_override: pathlib.Path | None = None
-_arrow_override: pathlib.Path | None = None
 
 
 def project_root() -> pathlib.Path:
@@ -44,17 +42,6 @@ def set_base_dir(path: "str | os.PathLike[str] | None") -> None:
     _base_override = pathlib.Path(path).expanduser() if path else None
 
 
-def set_arrow_dir(path: "str | os.PathLike[str] | None") -> None:
-    """Set (or clear, with ``None``) the Arrow-root override.
-
-    Wired to the CLI ``--arrow-data-directory`` flag.  When set, it supersedes
-    the base for Arrow data only (``station-lists/``, ``plots/`` still derive
-    from the base).
-    """
-    global _arrow_override
-    _arrow_override = pathlib.Path(path).expanduser() if path else None
-
-
 def base_dir() -> pathlib.Path:
     """Return the resolved base data directory (see module docstring)."""
     if _base_override is not None:
@@ -66,14 +53,27 @@ def base_dir() -> pathlib.Path:
 
 
 def arrow_dir() -> pathlib.Path:
-    """Root of the Arrow position-data tree (``<base>/arrow`` unless overridden)."""
-    if _arrow_override is not None:
-        return _arrow_override
+    """Root of the Arrow position-data tree — always ``<base>/arrow``."""
     return base_dir() / "arrow"
 
 
+def stream_lists_dir() -> pathlib.Path:
+    """Directory holding **stream**-list JSONL files (``<base>/stream-lists``).
+
+    These hold full geosncl (stream) records and are consumed by
+    replay/fetch/PPSD/export.  Station (station-code) lists live in
+    :func:`station_lists_dir`.
+    """
+    return base_dir() / "stream-lists"
+
+
 def station_lists_dir() -> pathlib.Path:
-    """Directory holding station-list JSONL files (``<base>/station-lists``)."""
+    """Directory holding **station**-list JSONL files (``<base>/station-lists``).
+
+    These hold station codes (one ``{"station": "P143"}`` per line) — the
+    down-selected-stations lists produced by the Station List Builder and used as
+    include/exclude sets by the Stream List Builder.
+    """
     return base_dir() / "station-lists"
 
 
@@ -85,3 +85,12 @@ def plots_dir() -> pathlib.Path:
 def positions_diagnose_dir() -> pathlib.Path:
     """Directory holding positions-diagnose output (``<base>/positions_diagnose``)."""
     return base_dir() / "positions_diagnose"
+
+
+def coordinates_file() -> pathlib.Path:
+    """Editable, user-managed station-coordinates CSV (``<base>/coordinates.csv``).
+
+    Seeded on first use from the bundled ``resources/coordinates.csv`` — see
+    :mod:`earthscope_positions.coordinates`.
+    """
+    return base_dir() / "coordinates.csv"

@@ -6,7 +6,7 @@
       <q-select
         v-model="selectedList"
         :options="listOptions"
-        label="Station list"
+        label="Stream list"
         dense outlined emit-value map-options
         style="min-width: 180px"
         @update:model-value="reloadStations"
@@ -29,7 +29,7 @@
       </q-select>
       <q-input
         v-model="searchText"
-        label="Filter stations"
+        label="Filter streams"
         dense outlined clearable
         style="min-width: 220px"
         placeholder="e.g. (*.PB.* | *.CI.*) & LY_"
@@ -186,7 +186,7 @@
             &nbsp;·&nbsp; {{ startDate }} → {{ endDate }}
           </div>
           <div v-if="selectedList === 'all'" class="text-warning q-mt-xs text-caption">
-            ⚠ Select a specific station list before fetching.
+            ⚠ Select a specific stream list before fetching.
           </div>
         </q-card-section>
         <q-card-section v-if="fetchLog.length" style="max-height: 42vh; overflow-y: auto" class="q-pt-none">
@@ -215,7 +215,7 @@
     <q-dialog v-model="saveOpen" persistent>
       <q-card style="min-width: 400px">
         <q-card-section class="row items-center q-pb-none">
-          <div class="text-h6">Save Station List</div>
+          <div class="text-h6">Save Stream List</div>
           <q-space />
           <q-btn icon="close" flat round dense v-close-popup :disable="saveRunning" />
         </q-card-section>
@@ -223,7 +223,7 @@
           <div class="text-caption text-grey-7 q-mb-sm">{{ selected.size }} stream(s) will be saved.</div>
           <q-input v-model="saveListName" label="List name" dense outlined autofocus
             :error="!!saveError" :error-message="saveError"
-            placeholder="e.g. my-stations"
+            placeholder="e.g. my-streams"
             @keyup.enter="doSave"
           />
         </q-card-section>
@@ -270,10 +270,11 @@
 import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from "vue";
 import { useQuasar } from "quasar";
 import { Chart, registerables } from "chart.js";
-import { getStationLists, getStations, getPositions, getDataRange, openFetchMissingStream, saveStationList, savePlotImage } from "../api";
+import { getStreamLists, getStations, getPositions, getDataRange, openFetchMissingStream, saveStreamList, savePlotImage } from "../api";
 import type { PositionTrace, FetchEvent } from "../types";
 import { useSharedControls } from "../composables/useSharedControls";
 import { useListDelete } from "../composables/useListDelete";
+import { createRangeSelectHandler } from "../utils/dateRangePicker";
 
 const $q = useQuasar();
 
@@ -376,7 +377,7 @@ async function doSave() {
   saveError.value   = "";
   saveRunning.value = true;
   try {
-    await saveStationList(name, [...selected.value]);
+    await saveStreamList(name, [...selected.value]);
     // Refresh list options, keeping current selection
     const currentList = selectedList.value;
     await loadListOptions();
@@ -567,11 +568,11 @@ onBeforeUnmount(() => {
   Object.values(_canvasCleanup).forEach(fn => fn?.());
 });
 
-// ─── Station lists ────────────────────────────────────────────────────────────
+// ─── Stream lists ─────────────────────────────────────────────────────────────
 
 async function loadListOptions() {
   try {
-    const r = await getStationLists();
+    const r = await getStreamLists();
     listOptions.value = [{ label: "All", value: "all" }, ...r.lists.map(l => ({ label: l, value: l }))];
   } catch { listOptions.value = [{ label: "All", value: "all" }]; }
 }
@@ -618,13 +619,16 @@ function onToChange() {
   if (from && to && to > from) rangeDays.value = Math.round((to.getTime() - from.getTime()) / 86_400_000);
   _syncRange(); activeWindow.value = null; positionCache.value.clear(); scheduleLoad();
 }
-function onRangeSelect(val: { from: string; to: string } | null) {
-  if (!val?.from || !val?.to) return;
-  startDate.value = val.from; endDate.value = val.to;
-  const from = parseDateStr(val.from), to = parseDateStr(val.to);
-  if (from && to && to > from) rangeDays.value = Math.round((to.getTime() - from.getTime()) / 86_400_000);
-  activeWindow.value = null; positionCache.value.clear(); scheduleLoad();
-}
+const onRangeSelect = createRangeSelectHandler(
+  (from, to) => { dateRange.value = { from, to }; },
+  (from, to) => {
+    dateRange.value = { from, to };
+    startDate.value = from; endDate.value = to;
+    const fromD = parseDateStr(from), toD = parseDateStr(to);
+    if (fromD && toD && toD > fromD) rangeDays.value = Math.round((toD.getTime() - fromD.getTime()) / 86_400_000);
+    activeWindow.value = null; positionCache.value.clear(); scheduleLoad();
+  },
+);
 
 // ─── Tree interaction ─────────────────────────────────────────────────────────
 

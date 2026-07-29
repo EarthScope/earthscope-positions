@@ -4,11 +4,11 @@
     <!-- ── Controls ────────────────────────────────────────────────────── -->
     <div class="row items-end q-gutter-sm q-mb-sm">
 
-      <!-- Station list -->
+      <!-- Stream list -->
       <q-select
         v-model="selectedList"
         :options="listOptions"
-        label="Station list"
+        label="Stream list"
         dense
         outlined
         emit-value
@@ -36,7 +36,7 @@
       <!-- Search within list -->
       <q-input
         v-model="searchText"
-        label="Filter stations"
+        label="Filter streams"
         dense
         outlined
         clearable
@@ -144,10 +144,10 @@
         <q-card-section class="q-pt-sm q-pb-xs">
           <div class="text-caption text-grey-7">
             {{ startDate }} → {{ endDate }}
-            &nbsp;·&nbsp; Page {{ (data?.page ?? 0) + 1 }} ({{ pageGeosncls.length }} station{{ pageGeosncls.length !== 1 ? "s" : "" }})
+            &nbsp;·&nbsp; Page {{ (data?.page ?? 0) + 1 }} ({{ pageGeosncls.length }} stream{{ pageGeosncls.length !== 1 ? "s" : "" }})
           </div>
           <div class="text-caption text-grey-6 q-mt-xs">
-            Only stations on the current page are checked. Stations with existing data or prior no-data records are skipped automatically.
+            Only streams on the current page are checked. Streams with existing data or prior no-data records are skipped automatically.
           </div>
         </q-card-section>
 
@@ -237,7 +237,7 @@
       <!-- Meta line + top pagination -->
       <div class="row items-center q-gutter-sm q-mb-xs flex-wrap">
         <span class="text-caption text-grey-6">
-          Showing {{ data.stations.length }} of {{ data.total }} station(s) ·
+          Showing {{ data.stations.length }} of {{ data.total }} stream(s) ·
           {{ data.bucketStarts.length }} × {{ binLabel }} bins
           ({{ spanLabel }})
         </span>
@@ -331,10 +331,11 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, nextTick } from "vue";
 import HeatmapGrid from "../components/HeatmapGrid.vue";
-import { getStationLists, getCompleteness, openFetchMissingStream } from "../api";
+import { getStreamLists, getCompleteness, openFetchMissingStream } from "../api";
 import type { CompletenessResponse, BucketData, FetchEvent } from "../types";
 import { useSharedControls } from "../composables/useSharedControls";
 import { useListDelete } from "../composables/useListDelete";
+import { createRangeSelectHandler } from "../utils/dateRangePicker";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -375,7 +376,7 @@ const LATENCY_LEGEND = [
 
 const loading = ref(false);
 
-// Station list dropdown
+// Stream list dropdown
 const listOptions = ref<{ label: string; value: string }[]>([]);
 const { selectedList, searchText, startDate, endDate, activeWindow, rangeDays, dateRange } = useSharedControls();
 const { confirmDeleteList } = useListDelete(loadListOptions);
@@ -454,17 +455,17 @@ onMounted(async () => {
   }
 });
 
-// ─── Station lists ────────────────────────────────────────────────────────────
+// ─── Stream lists ─────────────────────────────────────────────────────────────
 
 async function loadListOptions() {
   try {
-    const resp = await getStationLists();
+    const resp = await getStreamLists();
     listOptions.value = [
       { label: "All", value: "all" },
       ...resp.lists.map((l) => ({ label: l, value: l })),
     ];
   } catch (e) {
-    console.error("Failed to load station lists", e);
+    console.error("Failed to load stream lists", e);
     listOptions.value = [{ label: "All", value: "all" }];
   }
 }
@@ -520,20 +521,22 @@ function onToChange() {
   loadCompleteness();
 }
 
-function onRangeSelect(val: { from: string; to: string } | null) {
-  // val is null while the user is mid-drag (only from selected, not to yet)
-  if (!val?.from || !val?.to) return;
-  startDate.value = val.from;
-  endDate.value = val.to;
-  const from = parseDateStr(val.from);
-  const to = parseDateStr(val.to);
-  if (from && to && to > from) {
-    rangeDays.value = Math.round((to.getTime() - from.getTime()) / 86_400_000);
-  }
-  activeWindow.value = null;
-  page.value = 0;
-  loadCompleteness();
-}
+const onRangeSelect = createRangeSelectHandler(
+  (from, to) => { dateRange.value = { from, to }; },
+  (from, to) => {
+    dateRange.value = { from, to };
+    startDate.value = from;
+    endDate.value = to;
+    const fromD = parseDateStr(from);
+    const toD = parseDateStr(to);
+    if (fromD && toD && toD > fromD) {
+      rangeDays.value = Math.round((toD.getTime() - fromD.getTime()) / 86_400_000);
+    }
+    activeWindow.value = null;
+    page.value = 0;
+    loadCompleteness();
+  },
+);
 
 function applyWindow(w: { label: string; hours: number }) {
   const end = new Date();

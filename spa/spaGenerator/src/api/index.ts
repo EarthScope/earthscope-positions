@@ -1,14 +1,14 @@
 import axios from "axios";
 import type {
-  CompletenessResponse, StationsResponse, StationListsResponse,
+  CompletenessResponse, StationsResponse, StreamListsResponse,
   PositionsResponse, FetchEvent, FetchMissingBody,
   ReplayState, ReplayPreloadBody,
 } from "../types";
 
 const http = axios.create({ baseURL: "/api" });
 
-export async function getStationLists(): Promise<StationListsResponse> {
-  const r = await http.get<StationListsResponse>("/station-lists");
+export async function getStreamLists(): Promise<StreamListsResponse> {
+  const r = await http.get<StreamListsResponse>("/stream-lists");
   return r.data;
 }
 
@@ -56,8 +56,8 @@ export async function getDataRange(): Promise<{ min: string | null; max: string 
   return r.data;
 }
 
-export async function saveStationList(name: string, geosncls: string[]): Promise<{ name: string; count: number }> {
-  const r = await http.post<{ name: string; count: number }>(`/station-lists/${encodeURIComponent(name)}`, { geosncls });
+export async function saveStreamList(name: string, geosncls: string[]): Promise<{ name: string; count: number }> {
+  const r = await http.post<{ name: string; count: number }>(`/stream-lists/${encodeURIComponent(name)}`, { geosncls });
   return r.data;
 }
 

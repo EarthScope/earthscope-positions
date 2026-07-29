@@ -63,7 +63,7 @@ The SPA (Single Page Application) is pre-built in `spa/spaBuild/` and served by 
 ## Data flow
 
 ```
-es-pos stations get  ──►  data/station-lists/<name>.json
+es-pos stations get  ──►  data/stream-lists/<name>.json
                               │
                               ▼
 es-pos fetch get     ──►  data/arrow/<GEOSNCL>/YYYYMM/<GEOSNCL>_<start>_<end>.arrow
@@ -130,7 +130,7 @@ Sample rate is nominally 1 Hz (one row per second).
 
 ### `es-pos stations`
 
-Discover and manage station lists from the EarthScope API. Lists are written to `./data/station-lists/<name>.json`.
+Discover and manage stream lists from the EarthScope API. Lists are written to `./data/stream-lists/<name>.json`.
 
 ```bash
 # Discover all ShakeAlert streams
@@ -184,7 +184,6 @@ but pre-computing them speeds up the **Completeness & Latency** tab significantl
 es-pos process completeness
 es-pos process completeness --overwrite                    # regenerate even if files exist
 es-pos process completeness --data-directory /archive      # custom base data directory
-es-pos process completeness --arrow-data-directory /a/arrow # override just the Arrow root
 ```
 
 Each Arrow file gets a sibling `.completeness.arrow` with 96 rows (one per 15-min bin):
@@ -319,7 +318,10 @@ Algorithm parameters (matching MonitorApplication.java):
 | Power bins | 100 |
 | Power range | −80 to +20 dB (m²/Hz) |
 
-Output: `data/plots/ppsd/<start>_<end>/ppsd-<geosncl>.png`
+Output: `data/plots/ppsd/<mode>/ppsd-<geosncl>/ppsd-<geosncl>_<start>_<end>.png`
+(`<mode>` is `by-stream`, `by-center`, or `all`) — grouped by PPSD type first,
+then by plot identity, so repeated runs for the same station/group accumulate
+side-by-side instead of scattering across per-run date folders.
 
 Plots are visible in the **File Plots** tab of the web UI immediately after generation.
 
@@ -396,7 +398,6 @@ es-pos replay -i ShakeAlert --start-time 2026-01-01 --duration 1d \
 | `--filter-solution DIGIT` | all | Keep only streams with this PPP solution digit 0–6 (repeatable). |
 | `--filter-type DIGIT` | all | Keep only streams with this solution-type digit 0–3 (repeatable). |
 | `--data-directory PATH` | `./data` | Base data directory (see [Data directory](#data-directory)). |
-| `--arrow-data-directory PATH` | `<base>/arrow` | Override just the Arrow data root; supersedes `--data-directory`. |
 
 #### Web UI Replay tab
 
@@ -453,9 +454,12 @@ The web server exposes a REST API at `/api/`:
 |----------|-------------|
 | `GET /api/status` | Server status (stations indexed, file counts) |
 | `GET /api/data-range` | Earliest and latest dates in the data |
-| `GET /api/station-lists` | Names of all saved station lists |
-| `GET /api/station-lists/{name}` | Geosncl strings in a named list |
-| `POST /api/station-lists/{name}` | Save a station list `{"geosncls": [...]}` |
+| `GET /api/stream-lists` | Names of all saved stream lists |
+| `GET /api/stream-lists/{name}` | Geosncl strings in a named list |
+| `POST /api/stream-lists/{name}` | Save a stream list `{"geosncls": [...]}` |
+| `GET /api/station-lists` | Names of all saved station (station-code) lists |
+| `GET /api/station-lists/{name}` | Station codes in a named list |
+| `POST /api/station-lists/{name}` | Save a station list `{"stations": [...]}` |
 | `GET /api/stations?list=&search=` | Geosncl inventory with filter/search |
 | `GET /api/completeness?list=&start=&end=` | Heat-map completeness data |
 | `GET /api/positions?geosncls=&start=&end=` | Position time series |
@@ -472,9 +476,9 @@ The web server exposes a REST API at `/api/`:
 
 ---
 
-## Station lists
+## Stream lists
 
-Station lists are JSON files in `./data/station-lists/`:
+Stream lists are JSON files in `./data/stream-lists/`:
 
 ```json
 [
@@ -486,8 +490,8 @@ Station lists are JSON files in `./data/station-lists/`:
 
 Built three ways:
 1. **CLI** — `es-pos stations get datasource/radial` then optionally `es-pos stations filter`
-2. **Web UI Station Builder tab** — interactive map with click/drag selection and stream-type filters
-3. **Manually** — any JSON editor placed in `./data/station-lists/`
+2. **Web UI Stream List Builder tab** — interactive map with click/drag selection and stream-type filters
+3. **Manually** — any JSON editor placed in `./data/stream-lists/`
 
 Used by `es-pos fetch get -i <name>` and loaded in the web UI via the list selector.
 
@@ -533,6 +537,7 @@ The layout is derived from the base:
 
 ```
 <base>/arrow/                 # downloaded position Arrow files
+<base>/stream-lists/          # stream-list JSONL files
 <base>/station-lists/         # station-list JSONL files
 <base>/plots/                 # generated plot images (e.g. ppsd/)
 <base>/positions_diagnose/    # es-pos test fetch output
@@ -548,16 +553,9 @@ es-pos fetch get -i ShakeAlert --start 2026-01-01 --data-directory /mnt/es
 ES_POS_DATA_DIRECTORY=/mnt/es es-pos webserver   # same, via environment
 ```
 
-The Arrow root can be pointed somewhere else independently with
-`--arrow-data-directory PATH`, which **supersedes** `--data-directory` for Arrow
-data only (station lists and plots still come from the base). This is handy for
-`es-pos replay`, `process`, and `export` when the Arrow archive lives on a
-separate volume:
-
-```bash
-es-pos replay -i ShakeAlert --start-time 2026-01-01 --duration 1d \
-    --data-directory /mnt/es --arrow-data-directory /fast-nvme/arrow
-```
+The Arrow root is always `<data-directory>/arrow`; every sub-directory
+(`arrow/`, `stream-lists/`, `station-lists/`, `plots/`, …) derives from the single
+`--data-directory` base.
 
 ### MiniSEED path spec (`miniseed_path_spec.toml`)
 
@@ -599,12 +597,14 @@ earthscope-positions/
 │   │   └── src/pages/
 │   │       ├── CompletenessPage.vue
 │   │       ├── PositionsPage.vue
-│   │       ├── StationBuilderPage.vue
+│   │       ├── StationListBuilderPage.vue
+│   │       ├── StreamListBuilderPage.vue
 │   │       ├── PlotsPage.vue
 │   │       └── ReplayPage.vue
 │   └── spaBuild/              # Compiled SPA (git-ignored; run npm run build)
 ├── data/
 │   ├── arrow/                 # Downloaded position data
+│   ├── stream-lists/          # Saved stream list JSON files
 │   ├── station-lists/         # Saved station list JSON files
 │   └── plots/                 # Generated plots (power spectral density, etc.)
 ├── reference/
