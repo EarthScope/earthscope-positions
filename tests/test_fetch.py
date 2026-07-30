@@ -140,6 +140,46 @@ def test_fetch_500_is_retryable_error(project_tree, mock_positions_api):
     assert status == "error-503"
 
 
+# ---------------------------------------------------------------------------
+# _run_parallel — per-task token refresh (a long job must not run for hours on
+# a token that expired partway through; a 401 from that must not be reported
+# as a permanent failure when the stream may well have real data).
+# ---------------------------------------------------------------------------
+
+
+def test_401_is_retried_with_a_refreshed_token(project_tree, mock_positions_api, monkeypatch):
+    day_start, day_end = _day()
+    tokens_used: list[str] = []
+
+    def fake_ensure_token_for_worker() -> str:
+        # Simulate the startup token having expired mid-run: the first check
+        # still returns the stale token (matching the API's 401 below); every
+        # check after that returns a freshly "refreshed" one.
+        tok = "stale-token" if not tokens_used else "refreshed-token"
+        tokens_used.append(tok)
+        return tok
+
+    monkeypatch.setattr(
+        positions_fetch, "_ensure_token_for_worker", fake_ensure_token_for_worker
+    )
+
+    _register(mock_positions_api, json={"detail": "unauthorized"}, status=401)
+    _register(mock_positions_api, body=make_positions_arrow(10), status=200)
+
+    progress = positions_fetch._Progress(1)
+    task = (
+        "startup-token", _EDID, _GEOSNCL, day_start, day_end,
+        False, False, positions_fetch._MAX_RETRIES,
+    )
+    positions_fetch._run_parallel([task], 1, progress)
+
+    # The retry succeeded once the token was refreshed — not a permanent failure.
+    assert progress.ok == 1
+    assert progress.failed == 0
+    assert len(tokens_used) >= 2
+    assert mock_positions_api.calls[-1].request.headers["authorization"] == "Bearer refreshed-token"
+
+
 def test_fetch_skips_when_file_exists(project_tree, mock_positions_api):
     """Second fetch is served from cache — no API call registered, none made."""
     day_start, day_end = _day()

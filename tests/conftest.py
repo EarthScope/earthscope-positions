@@ -72,14 +72,18 @@ def project_tree(tmp_path, monkeypatch):
 
 @pytest.fixture
 def fake_token(monkeypatch):
-    """Make ``_ensure_token()`` return a dummy token.
+    """Make ``_ensure_token()`` / ``_ensure_token_for_worker()`` return a dummy token.
 
     Only ``positions_fetch`` owns a token helper now; station discovery goes
     through the SDK client (faked separately), and the radial search imports
     ``positions_fetch._ensure_token`` at call time — so patching it here covers
-    both the fetch path and radial search.
+    both the fetch path and radial search.  Worker threads re-check the token
+    per task via ``_ensure_token_for_worker`` (see its docstring), so that must
+    be patched too or a test would fall through to reading real credentials
+    from disk.
     """
     monkeypatch.setattr(positions_fetch, "_ensure_token", lambda: "test-token")
+    monkeypatch.setattr(positions_fetch, "_ensure_token_for_worker", lambda: "test-token")
     return "test-token"
 
 

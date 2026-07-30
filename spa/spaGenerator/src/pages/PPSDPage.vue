@@ -112,6 +112,43 @@
           <q-separator />
           <q-card-section class="q-gutter-sm">
 
+            <!-- Common-mode removal -->
+            <div class="text-caption text-grey-6">Remove common mode using</div>
+            <q-option-group
+              v-model="cmrMethod"
+              :options="CMR_METHOD_OPTIONS"
+              type="radio"
+              inline
+              dense
+              :disable="running"
+            />
+            <div v-if="cmrMethod !== 'none'" class="row items-center q-gutter-xs q-pl-md">
+              <span class="text-caption text-grey-7">Modes to remove</span>
+              <q-input
+                v-model.number="cmrNModesRemoved"
+                type="number"
+                dense
+                outlined
+                :min="1"
+                :max="10"
+                style="width: 70px"
+                :disable="running"
+              />
+            </div>
+            <div v-if="cmrMethod !== 'none'" class="text-caption text-grey-6 q-pl-md">
+              Computed per processing center + solution/software subgroup — the
+              shared source of clock/orbit noise — before the PSD. Single-stream
+              subgroups have nothing to remove and use raw data.
+              <span v-if="cmrMethod === 'pca'">
+                PCA also needs every stream in a subgroup to overlap simultaneously;
+                where they don't, raw data is used instead.
+              </span>
+            </div>
+
+          </q-card-section>
+          <q-separator />
+          <q-card-section class="q-gutter-sm">
+
             <!-- Action buttons -->
             <q-btn
               class="full-width"
@@ -264,9 +301,16 @@ import {
 import type { PpsdMode } from "../types";
 import { createRangeSelectHandler } from "../utils/dateRangePicker";
 
+const CMR_METHOD_OPTIONS = [
+  { label: "None", value: "none" as const },
+  { label: "PCA",  value: "pca"  as const },
+  { label: "KLE",  value: "kle"  as const },
+];
+
 const { selectedLists, startDate, endDate, dateRange } = useSharedControls();
 const {
   filterCenters, filterSolTypes,
+  cmrMethod, cmrNModesRemoved,
   logs, running, done, exitCode,
   progressCurrent, progressTotal, completedFiles,
   getCancel, setCancel, clearCancel,
@@ -392,6 +436,11 @@ async function runPpsd(mode: PpsdMode) {
   // Pass the stream-type / center enumeration labels so output filenames use them.
   params.set("sol_labels", JSON.stringify(SOL_TYPE_LABELS));
   params.set("center_labels", JSON.stringify(PROC_CENTERS));
+  if (cmrMethod.value !== "none") {
+    params.set("cmr", "true");
+    params.set("cmr_method", cmrMethod.value);
+    params.set("n_modes_removed", String(Math.max(1, Math.min(10, cmrNModesRemoved.value || 1))));
+  }
 
   const controller = new AbortController();
   setCancel(() => controller.abort());

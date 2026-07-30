@@ -61,6 +61,15 @@
       <q-checkbox v-model="downsampleEnabled" label="Downsample" dense size="sm" />
       <q-btn label="Fetch Missing" icon="cloud_download" color="primary" dense outline no-caps
         size="sm" class="self-center" @click="openFetchDialog" />
+      <q-checkbox v-model="removeMean" label="Remove mean" dense size="sm" />
+      <q-input v-model.number="outlierThreshold" label="Outlier (m)" type="number"
+        dense outlined style="width: 95px" :min="0.01" :step="0.5">
+        <q-tooltip>
+          Samples more than this far from a stream's own median are dropped —
+          from the plots, and from Coherence/Karhunen-Loève/PCA/common-mode-removed,
+          so a single bad fix can't dominate variance-based analysis
+        </q-tooltip>
+      </q-input>
     </div>
 
     <!-- ── Selection controls ────────────────────────────────────────────── -->
@@ -73,9 +82,48 @@
         :disable="selected.size === 0" @click="openSavePlotDialog">
         <q-tooltip>Write the current plots to a PNG in File Plots</q-tooltip>
       </q-btn>
-      <q-checkbox v-model="removeMean" label="Remove mean" dense size="sm" />
-      <q-input v-model.number="outlierThreshold" label="Outlier (m)" type="number"
-        dense outlined style="width: 95px" :min="0.01" :step="0.5" />
+      <q-btn label="Coherence"        dense flat no-caps size="sm" icon="grid_on"
+        :disable="selected.size < 2 || selected.size > COHERENCE_MAX_STREAMS" @click="openCoherenceDialog">
+        <q-tooltip>
+          Pairwise coherence across the selected streams (2-{{ COHERENCE_MAX_STREAMS }}) —
+          how much common-mode signal they share at different timescales.
+          Capped here since it's pairwise (N² pairs); Karhunen-Loève and PCA have no cap.
+        </q-tooltip>
+      </q-btn>
+      <q-btn label="Karhunen-Loève"   dense flat no-caps size="sm" icon="hub"
+        :disable="selected.size < 2" @click="openKleDialog">
+        <q-tooltip>
+          Network PCA (pairwise-complete covariance) — decompose the selected
+          streams into shared ("common-mode") modes and see how strongly each
+          stream participates
+        </q-tooltip>
+      </q-btn>
+      <q-btn label="PCA"              dense flat no-caps size="sm" icon="scatter_plot"
+        :disable="selected.size < 2" @click="openPcaDialog">
+        <q-tooltip>
+          Classical PCA — same idea as Karhunen-Loève, but built only from
+          epochs where every selected stream has simultaneous data
+        </q-tooltip>
+      </q-btn>
+      <q-btn :label="`Common mode: ${cmrMethodLabel}`" dense flat no-caps size="sm" icon="layers_clear">
+        <q-menu anchor="bottom left" self="top left">
+          <div class="q-pa-sm" style="min-width: 240px">
+            <div class="text-caption text-grey-7 q-mb-xs">Remove common mode using</div>
+            <q-option-group
+              v-model="cmrMethod" :options="CMR_METHOD_OPTIONS"
+              type="radio" dense
+            />
+            <q-input
+              v-if="cmrMethod !== 'none'" v-model.number="cmrNModesRemoved" label="Modes to remove"
+              type="number" dense outlined class="q-mt-sm" :min="1" :max="5"
+            />
+            <div v-if="cmrMethod !== 'none'" class="text-caption text-grey-6 q-mt-xs">
+              Adds a second East/North/Up plot set with the dominant mode(s) subtracted.
+            </div>
+          </div>
+        </q-menu>
+      </q-btn>
+      <q-spinner v-if="cmrLoading" size="16px" color="primary" />
       <span class="text-caption text-grey-6 self-center">
         · Shift+click to add · Shift+drag to zoom · right-click to reset zoom · Shift+click line to deselect
       </span>
@@ -154,6 +202,32 @@
             <div class="text-caption text-grey-7 q-mb-xs">{{ comp.label }}</div>
             <canvas :ref="el => setCanvas(comp.key, el)" class="chart-canvas" />
           </div>
+
+          <!-- Common-mode-removed time-series (optional second set) -->
+          <template v-if="cmrMethod !== 'none'">
+            <q-separator class="q-my-sm" />
+            <q-banner v-if="cmrError" dense class="bg-red-1 text-negative q-mb-sm">{{ cmrError }}</q-banner>
+            <template v-else-if="cmrResult">
+              <div class="text-caption text-grey-7 q-mb-xs">
+                Common-mode removed ({{ cmrResult.method.toUpperCase() }}, {{ cmrNModesRemoved }}
+                mode{{ cmrNModesRemoved === 1 ? "" : "s" }}) ·
+                variance explained — E {{ (cmrResult.varianceExplainedPct.east[0] ?? 0).toFixed(0) }}%,
+                N {{ (cmrResult.varianceExplainedPct.north[0] ?? 0).toFixed(0) }}%,
+                U {{ (cmrResult.varianceExplainedPct.up[0] ?? 0).toFixed(0) }}%
+                <span v-if="cmrResult.method === 'pca' && cmrResult.nCompleteEpochs">
+                  · complete epochs — E {{ cmrResult.nCompleteEpochs.east.toLocaleString() }},
+                  N {{ cmrResult.nCompleteEpochs.north.toLocaleString() }},
+                  U {{ cmrResult.nCompleteEpochs.up.toLocaleString() }}
+                </span>
+              </div>
+              <div v-for="comp in COMPONENTS" :key="comp.key + '_cmr'" class="chart-block q-mb-sm">
+                <div class="text-caption text-grey-7 q-mb-xs">
+                  {{ comp.label }} — common-mode removed ({{ cmrResult.method.toUpperCase() }})
+                </div>
+                <canvas :ref="el => setCanvas(comp.key + '_cmr', el)" class="chart-canvas" />
+              </div>
+            </template>
+          </template>
 
           <!-- Scatter plots: E-N, N-U, U-E -->
           <div class="row no-wrap q-col-gutter-xs q-mb-sm" style="flex-shrink: 0">
@@ -263,6 +337,216 @@
       </q-card>
     </q-dialog>
 
+    <!-- ── Pairwise Coherence dialog ────────────────────────────────────── -->
+    <q-dialog v-model="coherenceOpen">
+      <q-card style="min-width: 960px; max-width: 96vw">
+        <q-card-section class="row items-center q-pb-none">
+          <div class="text-h6">Pairwise Coherence</div>
+          <q-space />
+          <q-option-group
+            v-model="coherenceComponent" :options="COMPONENT_OPTIONS"
+            type="radio" inline dense :disable="coherenceLoading"
+            @update:model-value="loadCoherence" class="q-mr-md"
+          />
+          <q-btn icon="save" flat round dense class="q-mr-xs"
+            :disable="coherenceLoading || !coherenceResult?.pairs.length"
+            @click="saveCoherencePlot">
+            <q-tooltip>Save to file (PNG)</q-tooltip>
+          </q-btn>
+          <q-btn icon="close" flat round dense v-close-popup />
+        </q-card-section>
+        <q-card-section class="text-caption text-grey-7 q-pt-none">
+          Magnitude-squared coherence vs. period for every pair of selected streams —
+          how much signal they share at a given timescale, regardless of sign or scale.
+          1.0 = fully shared; 0 = independent.  Computed fresh from full-resolution
+          data for exactly this selection (not the downsampled chart cache).
+        </q-card-section>
+        <q-separator />
+
+        <q-card-section v-if="coherenceLoading" class="flex flex-center" style="min-height: 200px">
+          <q-spinner size="36px" color="primary" />
+        </q-card-section>
+
+        <q-banner v-else-if="coherenceError" dense class="bg-red-1 text-negative">
+          {{ coherenceError }}
+        </q-banner>
+
+        <q-card-section v-else-if="coherenceResult" style="max-height: 78vh; overflow-y: auto">
+          <div v-if="coherenceResult.pairs_skipped.length" class="text-caption text-warning q-mb-sm">
+            ⚠ {{ coherenceResult.pairs_skipped.length }} pair(s) skipped for insufficient overlapping data
+          </div>
+          <div v-if="!coherenceResult.pairs.length" class="text-caption text-grey-6">
+            No pair had enough overlapping data to compute coherence.
+          </div>
+
+          <template v-else>
+            <div class="text-overline text-grey-7">
+              Coherence vs. period
+              <span v-if="coherenceResult.pairs.length > MAX_LEGEND_LINES" class="text-grey-5">
+                (legend hidden — {{ coherenceResult.pairs.length }} pairs)
+              </span>
+            </div>
+            <div style="position: relative; height: 320px">
+              <canvas ref="coherenceLineCanvas"></canvas>
+            </div>
+
+            <div class="text-overline text-grey-7 q-mt-md">Coherence distribution across pairs</div>
+            <div class="text-caption text-grey-6 q-mb-xs">
+              For each period, the fraction of pairs whose coherence falls in each 0.05-wide
+              bin — color is pair density, not any one pair's value (see the plot above for
+              that per-pair).
+            </div>
+            <div style="overflow: auto; max-height: 440px; position: relative">
+              <canvas
+                ref="coherenceHeatmapCanvas"
+                @mousemove="onHeatmapMouseMove"
+                @mouseleave="onHeatmapMouseLeave"
+              ></canvas>
+              <div
+                v-if="coherenceHeatmapTip"
+                class="heatmap-tip"
+                :style="{ left: (coherenceHeatmapTip.x + 12) + 'px', top: (coherenceHeatmapTip.y + 12) + 'px' }"
+              >{{ coherenceHeatmapTip.text }}</div>
+            </div>
+            <div class="row items-center q-gutter-xs q-mt-sm">
+              <span class="text-caption text-grey-6">low</span>
+              <div class="coh-legend-bar"></div>
+              <span class="text-caption text-grey-6">high density of pairs</span>
+            </div>
+          </template>
+        </q-card-section>
+      </q-card>
+    </q-dialog>
+
+    <!-- ── Karhunen-Loeve dialog ────────────────────────────────────────── -->
+    <q-dialog v-model="kleOpen">
+      <q-card style="min-width: 820px; max-width: 96vw">
+        <q-card-section class="row items-center q-pb-none">
+          <div class="text-h6">Karhunen-Loève Decomposition</div>
+          <q-space />
+          <q-btn icon="save" flat round dense class="q-mr-xs"
+            :disable="kleLoading || !kleResults"
+            @click="saveKlePlot">
+            <q-tooltip>Save to file (PNG)</q-tooltip>
+          </q-btn>
+          <q-btn icon="close" flat round dense v-close-popup />
+        </q-card-section>
+        <q-card-section class="text-caption text-grey-7 q-pt-none">
+          Network PCA over the selected streams, computed independently for East, North,
+          and Up and shown together — each mode is a shared signal, its "variance
+          explained" is how much of that component's total variance it accounts for, and
+          its loadings show how strongly (and in what direction) each stream participates.
+          Mode&nbsp;1 is what <strong>Coherence</strong> and <strong>common-mode
+          removed</strong> use.
+        </q-card-section>
+        <q-separator />
+
+        <q-card-section v-if="kleLoading" class="flex flex-center" style="min-height: 200px">
+          <q-spinner size="36px" color="primary" />
+        </q-card-section>
+
+        <q-banner v-else-if="kleError" dense class="bg-red-1 text-negative">
+          {{ kleError }}
+        </q-banner>
+
+        <q-card-section v-else-if="kleResults" style="max-height: 76vh; overflow-y: auto">
+          <div
+            v-if="_ENU.some(c => kleResults![c].min_pair_overlap < 100)"
+            class="text-caption text-warning q-mb-sm"
+          >
+            ⚠ Smallest pairwise overlap — E: {{ kleResults.east.min_pair_overlap }},
+            N: {{ kleResults.north.min_pair_overlap }}, U: {{ kleResults.up.min_pair_overlap }}
+            sample(s) — some covariance entries may be noisy.
+          </div>
+
+          <div class="text-overline text-grey-7">Variance explained per mode</div>
+          <div class="kle-bar-wrap"><canvas ref="kleVarianceCanvas"></canvas></div>
+
+          <div class="row items-center q-mt-md q-mb-xs">
+            <div class="text-overline text-grey-7 col">Mode</div>
+            <q-select
+              v-model="kleLoadingMode" :options="kleModeOptions"
+              dense outlined emit-value map-options style="width: 140px"
+            />
+          </div>
+
+          <div class="text-caption text-grey-6 q-mb-xs">
+            Reconstructed time series — what this mode's shared signal actually looks like.
+          </div>
+          <div class="kle-bar-wrap"><canvas ref="kleModeSeriesCanvas"></canvas></div>
+
+          <div class="text-overline text-grey-7 q-mt-md">Stream loadings (spatial pattern)</div>
+          <div class="kle-bar-wrap"><canvas ref="kleLoadingsCanvas"></canvas></div>
+        </q-card-section>
+      </q-card>
+    </q-dialog>
+
+    <!-- ── PCA dialog ───────────────────────────────────────────────────── -->
+    <q-dialog v-model="pcaOpen">
+      <q-card style="min-width: 820px; max-width: 96vw">
+        <q-card-section class="row items-center q-pb-none">
+          <div class="text-h6">Principal Component Analysis</div>
+          <q-space />
+          <q-btn icon="save" flat round dense class="q-mr-xs"
+            :disable="pcaLoading || !pcaResults || !pcaHasAnyModes"
+            @click="savePcaPlot">
+            <q-tooltip>Save to file (PNG)</q-tooltip>
+          </q-btn>
+          <q-btn icon="close" flat round dense v-close-popup />
+        </q-card-section>
+        <q-card-section class="text-caption text-grey-7 q-pt-none">
+          Classical PCA over the selected streams, computed independently for East, North,
+          and Up and shown together — the sibling of Karhunen-Loève, but built only from
+          epochs where <strong>every</strong> selected stream has simultaneous data (no
+          pairwise-complete approximation), so each mode's time series is an exact
+          projection rather than a fitted reconstruction.
+        </q-card-section>
+        <q-separator />
+
+        <q-card-section v-if="pcaLoading" class="flex flex-center" style="min-height: 200px">
+          <q-spinner size="36px" color="primary" />
+        </q-card-section>
+
+        <q-banner v-else-if="pcaError" dense class="bg-red-1 text-negative">
+          {{ pcaError }}
+        </q-banner>
+
+        <q-card-section v-else-if="pcaResults" style="max-height: 76vh; overflow-y: auto">
+          <div class="text-caption text-grey-7 q-mb-sm">
+            Complete epochs (every stream present simultaneously) —
+            E: {{ pcaResults.east.n_complete_epochs.toLocaleString() }},
+            N: {{ pcaResults.north.n_complete_epochs.toLocaleString() }},
+            U: {{ pcaResults.up.n_complete_epochs.toLocaleString() }}
+          </div>
+          <div v-if="!pcaHasAnyModes" class="text-caption text-warning">
+            ⚠ No epochs where all {{ pcaResults.east.geosncls.length }} streams overlapped
+            simultaneously in any component — PCA has nothing to decompose. Try
+            Karhunen-Loève instead, which tolerates gaps that don't align across streams.
+          </div>
+          <template v-else>
+            <div class="text-overline text-grey-7">Variance explained per mode</div>
+            <div class="kle-bar-wrap"><canvas ref="pcaVarianceCanvas"></canvas></div>
+
+            <div class="row items-center q-mt-md q-mb-xs">
+              <div class="text-overline text-grey-7 col">Mode</div>
+              <q-select
+                v-model="pcaLoadingMode" :options="pcaModeOptions"
+                dense outlined emit-value map-options style="width: 140px"
+              />
+            </div>
+
+            <div class="text-caption text-grey-6 q-mb-xs">
+              Reconstructed time series — exact at the complete epochs above, blank elsewhere.
+            </div>
+            <div class="kle-bar-wrap"><canvas ref="pcaModeSeriesCanvas"></canvas></div>
+
+            <div class="text-overline text-grey-7 q-mt-md">Stream loadings (spatial pattern)</div>
+            <div class="kle-bar-wrap"><canvas ref="pcaLoadingsCanvas"></canvas></div>
+          </template>
+        </q-card-section>
+      </q-card>
+    </q-dialog>
+
   </q-page>
 </template>
 
@@ -270,8 +554,14 @@
 import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from "vue";
 import { useQuasar } from "quasar";
 import { Chart, registerables } from "chart.js";
-import { getStreamLists, getStations, getPositions, getDataRange, openFetchMissingStream, saveStreamList, savePlotImage } from "../api";
-import type { PositionTrace, FetchEvent } from "../types";
+import {
+  getStreamLists, getStations, getPositions, getDataRange, openFetchMissingStream,
+  saveStreamList, savePlotImage, getCoherence, getKle, getPca, getCommonModeRemoved,
+} from "../api";
+import type {
+  PositionTrace, FetchEvent, CoherenceResponse, KleResponse, PcaResponse,
+  CommonModeRemovedResponse, CmrMethod,
+} from "../types";
 import { useSharedControls } from "../composables/useSharedControls";
 import { useListDelete } from "../composables/useListDelete";
 import { createRangeSelectHandler } from "../utils/dateRangePicker";
@@ -338,9 +628,31 @@ const focusedKey    = ref<string | null>(null);
 const positionCache    = ref<Map<string, PositionTrace>>(new Map());
 const positionsLoading = ref(false);
 
+// Common-mode-removed second plot set (optional) — a network-wide quantity,
+// so unlike positionCache it can't be cached per-stream; it's recomputed
+// whenever the selection, date range, method, or mode count changes.
+const CMR_METHOD_OPTIONS = [
+  { label: "None", value: "none" as const },
+  { label: "PCA",  value: "pca"  as const },
+  { label: "KLE",  value: "kle"  as const },
+];
+const cmrMethod = ref<CmrMethod>("none");
+const cmrMethodLabel = computed(() =>
+  cmrMethod.value === "none" ? "None" : cmrMethod.value.toUpperCase()
+);
+const cmrNModesRemoved = ref(1);
+const cmrLoading = ref(false);
+const cmrError = ref("");
+const cmrResult = ref<CommonModeRemovedResponse | null>(null);
+
 // ── Chart objects (plain, not reactive – Vue proxy breaks Chart.js) ──────────
-const _canvas:        Record<string, HTMLCanvasElement | null> = { east: null, north: null, up: null };
-const _chart:         Record<string, Chart | null>             = { east: null, north: null, up: null };
+// The "_cmr" keys are the common-mode-removed counterparts of east/north/up.
+const _canvas:        Record<string, HTMLCanvasElement | null> = {
+  east: null, north: null, up: null, east_cmr: null, north_cmr: null, up_cmr: null,
+};
+const _chart:         Record<string, Chart | null>             = {
+  east: null, north: null, up: null, east_cmr: null, north_cmr: null, up_cmr: null,
+};
 const _scatterCanvas: Record<string, HTMLCanvasElement | null> = { en: null, nu: null, ue: null };
 const _scatterChart:  Record<string, Chart | null>             = { en: null, nu: null, ue: null };
 const _histCanvas:    Record<string, HTMLCanvasElement | null> = { east: null, north: null, up: null };
@@ -348,7 +660,9 @@ const _histChart:     Record<string, Chart | null>             = { east: null, n
 const _histStats:     Record<string, { mean: number; std: number } | null> = { east: null, north: null, up: null };
 
 // Cleanup functions for canvas event listeners
-const _canvasCleanup: Record<string, (() => void) | null> = { east: null, north: null, up: null };
+const _canvasCleanup: Record<string, (() => void) | null> = {
+  east: null, north: null, up: null, east_cmr: null, north_cmr: null, up_cmr: null,
+};
 
 // ── Zoom state (reactive, watched to sync charts) ───────────────────────────
 const _posZoom = ref<{ min: number; max: number } | null>(null);
@@ -409,6 +723,18 @@ function _defaultPlotName(): string {
   return _cleanName(
     `${list}_${startDate.value}_${rangeDays.value}d_${selected.value.size}streams_${ts}`,
   );
+}
+
+/** Default filename for coherence/KLE saves (a lighter-weight variant of
+ *  _defaultPlotName() — those popups aren't tied to the list/range picker UI
+ *  the same way, just the current selection + component). */
+function _defaultAnalysisName(kind: string, component?: string): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const d = new Date();
+  const ts = `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}`
+    + `T${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}Z`;
+  const parts = [kind, component, `${selected.value.size}streams`, ts].filter(Boolean);
+  return _cleanName(parts.join("_"));
 }
 
 function openSavePlotDialog() {
@@ -494,6 +820,728 @@ async function doSavePlot() {
   } finally {
     savePlotSaving.value = false;
   }
+}
+
+// ── Pairwise Coherence dialog ────────────────────────────────────────────────
+// Deliberately independent of positionCache: whether the current `selected`
+// set was built up one checkbox at a time or via a bulk action (Select All /
+// group check), this always issues one fresh combined request for exactly
+// what's selected right now, so the two access patterns can't produce
+// different (or partially-loaded / differently-downsampled) results here.
+
+const COMPONENT_OPTIONS = [
+  { label: "East",  value: "east"  as const },
+  { label: "North", value: "north" as const },
+  { label: "Up",    value: "up"    as const },
+];
+
+const coherenceOpen      = ref(false);
+const coherenceLoading   = ref(false);
+const coherenceError     = ref("");
+const coherenceComponent = ref<"east" | "north" | "up">("east");
+const coherenceResult    = ref<CoherenceResponse | null>(null);
+const coherenceLineCanvas = ref<HTMLCanvasElement | null>(null);
+const coherenceHeatmapCanvas = ref<HTMLCanvasElement | null>(null);
+const coherenceHeatmapTip = ref<{ x: number; y: number; text: string } | null>(null);
+let _coherenceLineChart: Chart | null = null;
+
+const MAX_LEGEND_LINES = 40;
+// Pairwise -> O(n^2) pairs, so (unlike KLE/PCA) coherence is capped.
+const COHERENCE_MAX_STREAMS = 35;
+
+function openCoherenceDialog() {
+  coherenceOpen.value = true;
+  loadCoherence();
+}
+
+async function loadCoherence() {
+  if (selected.value.size < 2) { coherenceError.value = "Select at least 2 streams."; return; }
+  if (selected.value.size > COHERENCE_MAX_STREAMS) {
+    coherenceError.value = `Select at most ${COHERENCE_MAX_STREAMS} streams.`;
+    return;
+  }
+  coherenceError.value = "";
+  coherenceLoading.value = true;
+  coherenceResult.value = null;
+  let result: CoherenceResponse;
+  try {
+    result = await getCoherence({
+      geosncls: [...selected.value].join(","),
+      start: startDate.value,
+      end: endDate.value,
+      component: coherenceComponent.value,
+      outlierM: outlierThreshold.value,
+    });
+  } catch (e: any) {
+    coherenceError.value = e?.response?.data?.error ?? "Failed to compute coherence.";
+    coherenceLoading.value = false;
+    return;
+  }
+  coherenceResult.value = result;
+  // Loading must flip to false — and the DOM must update — BEFORE we grab the
+  // canvas refs below: they only mount once the v-else-if="coherenceResult"
+  // branch replaces the spinner, so building charts while still "loading"
+  // silently no-ops against a null ref.
+  coherenceLoading.value = false;
+  await nextTick();
+  buildCoherenceLineChart();
+  drawCoherenceHeatmap();
+}
+
+function pairLabel(a: string, b: string): string {
+  return `${a} × ${b}`;
+}
+
+/** Human-friendly period label for a value in seconds (used on both the line
+ *  chart's x-axis and the heatmap's frequency axis — same underlying list). */
+function formatPeriod(seconds: number): string {
+  if (seconds < 60) return `${seconds.toFixed(0)}s`;
+  if (seconds < 3600) return `${(seconds / 60).toFixed(0)}m`;
+  if (seconds < 86400) return `${(seconds / 3600).toFixed(1)}h`;
+  return `${(seconds / 86400).toFixed(1)}d`;
+}
+
+function buildCoherenceLineChart() {
+  const canvas = coherenceLineCanvas.value;
+  const result = coherenceResult.value;
+  if (!canvas || !result) return;
+  _coherenceLineChart?.destroy();
+
+  const showLegend = result.pairs.length <= MAX_LEGEND_LINES;
+  const datasets = result.pairs.map((p, i) => ({
+    label: pairLabel(p.a, p.b),
+    data: result.frequencies.map((f, idx) => ({ x: 1 / f, y: p.coherence[idx] })),
+    borderColor: COLORS[i % COLORS.length],
+    borderWidth: 1.25, pointRadius: 0, tension: 0,
+  }));
+
+  _coherenceLineChart = new Chart(canvas, {
+    type: "line",
+    data: { datasets },
+    options: {
+      animation: false, responsive: true, maintainAspectRatio: false, parsing: false,
+      scales: {
+        x: {
+          type: "logarithmic", reverse: true,
+          title: { display: true, text: "Period", font: { size: 11 } },
+          ticks: { callback: v => formatPeriod(Number(v)), maxTicksLimit: 10 },
+          grid: { color: "#e0e0e0" },
+        },
+        y: {
+          min: 0, max: 1,
+          title: { display: true, text: "Coherence", font: { size: 11 } },
+          grid: { color: "#e0e0e0" },
+        },
+      },
+      plugins: {
+        legend: {
+          display: showLegend, position: "right",
+          labels: { font: { size: 9 }, boxWidth: 10 },
+        },
+        tooltip: {
+          callbacks: {
+            title: items => formatPeriod(1 / Number(items[0].parsed.x)),
+            label: item => `${item.dataset.label}: ${Number(item.parsed.y).toFixed(3)}`,
+          },
+        },
+      },
+    },
+  });
+}
+
+// Sequential density colormap (dark navy -> cyan -> green -> yellow -> red),
+// matching the PPSD probability-density plots elsewhere in this app — color
+// here means "fraction of pairs", not a coherence value.
+const _DENSITY_STOPS: [number, number, number][] = [
+  [0, 0, 102],
+  [0, 153, 204],
+  [0, 255, 0],
+  [255, 255, 0],
+  [255, 0, 0],
+];
+function densityColor(t: number): [number, number, number] {
+  const k = Math.min(1, Math.max(0, t)) * (_DENSITY_STOPS.length - 1);
+  const i = Math.min(_DENSITY_STOPS.length - 2, Math.floor(k));
+  const f = k - i;
+  const [r0, g0, b0] = _DENSITY_STOPS[i];
+  const [r1, g1, b1] = _DENSITY_STOPS[i + 1];
+  return [Math.round(r0 + (r1 - r0) * f), Math.round(g0 + (g1 - g0) * f), Math.round(b0 + (b1 - b0) * f)];
+}
+
+const HEATMAP_YAXIS_W = 40;
+const HEATMAP_PLOT_W  = 720;
+const HEATMAP_HEADER_H = 22;
+const HEATMAP_ROW_H   = 16;
+const HEATMAP_BOTTOM_PAD = 10;  // room for the "0.0" tick label's own height, so it isn't clipped by the canvas edge
+const N_COH_BINS = 20;              // coherence-value bins, 0..1
+const COH_BIN_SIZE = 1 / N_COH_BINS;
+
+// Per-period, per-coherence-bin density (fraction of pairs) — kept around
+// after drawing so the mouse tooltip can hit-test without recomputing.
+let _coherenceHeatmapDensity: number[][] | null = null;
+
+/** Build the 2D density histogram: density[col][bin] = fraction of pairs
+ *  whose coherence at that period falls in that bin.  This is what lets the
+ *  heatmap scale to any pair count — individual pair identity is dropped
+ *  here (that's what the line plot above is for); the heatmap instead shows
+ *  the *distribution* of coherence across all pairs, at each period. */
+function _buildCoherenceDensity(result: CoherenceResponse): number[][] {
+  const { frequencies, pairs } = result;
+  const nCols = frequencies.length;
+  const density: number[][] = Array.from({ length: nCols }, () => new Array(N_COH_BINS).fill(0));
+  for (const p of pairs) {
+    for (let c = 0; c < nCols; c++) {
+      const v = Math.min(1, Math.max(0, p.coherence[c]));
+      const bin = Math.min(N_COH_BINS - 1, Math.floor(v * N_COH_BINS));
+      density[c][bin] += 1;
+    }
+  }
+  const nPairs = pairs.length || 1;
+  for (let c = 0; c < nCols; c++)
+    for (let b = 0; b < N_COH_BINS; b++)
+      density[c][b] /= nPairs;
+  return density;
+}
+
+function drawCoherenceHeatmap() {
+  const canvas = coherenceHeatmapCanvas.value;
+  const result = coherenceResult.value;
+  if (!canvas || !result || !result.pairs.length) return;
+
+  const { frequencies } = result;
+  const nCols = frequencies.length;
+  const density = _buildCoherenceDensity(result);
+  _coherenceHeatmapDensity = density;
+
+  let vmax = 0;
+  for (const col of density) for (const v of col) vmax = Math.max(vmax, v);
+  if (vmax <= 0) vmax = 1;
+
+  const width = HEATMAP_YAXIS_W + HEATMAP_PLOT_W;
+  const height = HEATMAP_HEADER_H + N_COH_BINS * HEATMAP_ROW_H + HEATMAP_BOTTOM_PAD;
+
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.round(width * dpr);
+  canvas.height = Math.round(height * dpr);
+  canvas.style.width = width + "px";
+  canvas.style.height = height + "px";
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  ctx.scale(dpr, dpr);
+  ctx.fillStyle = "#fcfcfb";
+  ctx.fillRect(0, 0, width, height);
+
+  // Header: a handful of period ticks (frequencies increase -> periods decrease).
+  ctx.fillStyle = "#52514e";
+  ctx.font = "10px monospace";
+  ctx.textAlign = "center";
+  const nTicks = 7;
+  for (let t = 0; t < nTicks; t++) {
+    const frac = t / (nTicks - 1);
+    const idx = Math.min(nCols - 1, Math.round(frac * (nCols - 1)));
+    const x = HEATMAP_YAXIS_W + frac * HEATMAP_PLOT_W;
+    ctx.fillText(formatPeriod(1 / frequencies[idx]), x, 14);
+  }
+
+  // Y-axis: coherence value, 0.0 at the bottom -> 1.0 at the top.  "middle"
+  // baseline (rather than the default "alphabetic") keeps every label —
+  // including "0.0", whose tick sits exactly on the canvas's bottom edge —
+  // centered on its tick instead of drawn below it and clipped off.
+  ctx.textAlign = "right";
+  ctx.textBaseline = "middle";
+  ctx.font = "9px monospace";
+  for (let tick = 0; tick <= 5; tick++) {
+    const v = tick / 5;
+    const y = HEATMAP_HEADER_H + (1 - v) * N_COH_BINS * HEATMAP_ROW_H;
+    ctx.fillStyle = "#52514e";
+    ctx.fillText(v.toFixed(1), HEATMAP_YAXIS_W - 6, y);
+  }
+  ctx.textBaseline = "alphabetic";
+
+  const colW = HEATMAP_PLOT_W / nCols;
+  for (let b = 0; b < N_COH_BINS; b++) {
+    const y = HEATMAP_HEADER_H + (N_COH_BINS - 1 - b) * HEATMAP_ROW_H;
+    for (let c = 0; c < nCols; c++) {
+      const [r8, g8, b8] = densityColor(density[c][b] / vmax);
+      ctx.fillStyle = `rgb(${r8},${g8},${b8})`;
+      ctx.fillRect(HEATMAP_YAXIS_W + c * colW, y, colW + 1, HEATMAP_ROW_H);
+    }
+  }
+}
+
+function onHeatmapMouseMove(e: MouseEvent) {
+  const result = coherenceResult.value;
+  if (!result || !result.pairs.length || !_coherenceHeatmapDensity) { coherenceHeatmapTip.value = null; return; }
+  const canvas = e.currentTarget as HTMLCanvasElement;
+  const rect = canvas.getBoundingClientRect();
+  const x = e.clientX - rect.left, y = e.clientY - rect.top;
+  if (x < HEATMAP_YAXIS_W || y < HEATMAP_HEADER_H) { coherenceHeatmapTip.value = null; return; }
+
+  const rowIdx = Math.floor((y - HEATMAP_HEADER_H) / HEATMAP_ROW_H);
+  const b = N_COH_BINS - 1 - rowIdx;
+  const colW = HEATMAP_PLOT_W / result.frequencies.length;
+  const col = Math.floor((x - HEATMAP_YAXIS_W) / colW);
+  if (b < 0 || b >= N_COH_BINS || col < 0 || col >= result.frequencies.length) {
+    coherenceHeatmapTip.value = null;
+    return;
+  }
+  const period = formatPeriod(1 / result.frequencies[col]);
+  const frac = _coherenceHeatmapDensity[col][b];
+  const lo = (b * COH_BIN_SIZE).toFixed(2);
+  const hi = ((b + 1) * COH_BIN_SIZE).toFixed(2);
+  coherenceHeatmapTip.value = {
+    x, y,
+    text: `${period} · coherence ${lo}–${hi}: ${(frac * 100).toFixed(1)}% of pairs`,
+  };
+}
+function onHeatmapMouseLeave() { coherenceHeatmapTip.value = null; }
+
+/** Stack the line chart + heatmap canvases into one white-background PNG. */
+function _buildCoherenceCompositeCanvas(): HTMLCanvasElement | null {
+  const result = coherenceResult.value;
+  const lineCanvas = _coherenceLineChart?.canvas;
+  const heatCanvas = coherenceHeatmapCanvas.value;
+  if (!result || (!lineCanvas && !heatCanvas)) return null;
+
+  const dpr = window.devicePixelRatio || 1;
+  const gap = 14;
+  const titleH = 46;
+  const fullW = Math.max(lineCanvas?.clientWidth ?? 0, heatCanvas?.clientWidth ?? 0, 900);
+  let totalH = titleH;
+  if (lineCanvas) totalH += lineCanvas.clientHeight + gap;
+  if (heatCanvas) totalH += heatCanvas.clientHeight + gap;
+
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.round(fullW * dpr);
+  canvas.height = Math.round(totalH * dpr);
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+  ctx.scale(dpr, dpr);
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, fullW, totalH);
+
+  ctx.textBaseline = "top";
+  ctx.fillStyle = "#222";
+  ctx.font = "bold 14px sans-serif";
+  ctx.fillText(
+    `Pairwise Coherence — ${coherenceComponent.value}   ${startDate.value} → ${endDate.value}   ${result.geosncls.length} stream(s)`,
+    8, 10,
+  );
+  ctx.font = "11px sans-serif";
+  ctx.fillStyle = "#666";
+  ctx.fillText(`Generated ${new Date().toISOString().replace("T", " ").slice(0, 19)} UTC`, 8, 28);
+
+  let y = titleH;
+  if (lineCanvas) { ctx.drawImage(lineCanvas, 0, y, lineCanvas.clientWidth, lineCanvas.clientHeight); y += lineCanvas.clientHeight + gap; }
+  if (heatCanvas) { ctx.drawImage(heatCanvas, 0, y, heatCanvas.clientWidth, heatCanvas.clientHeight); y += heatCanvas.clientHeight + gap; }
+  return canvas;
+}
+
+function saveCoherencePlot() {
+  const canvas = _buildCoherenceCompositeCanvas();
+  if (!canvas) { $q.notify({ type: "warning", message: "Nothing to save yet." }); return; }
+  $q.dialog({
+    title: "Save coherence plot",
+    message: "File name",
+    prompt: { model: _defaultAnalysisName("coherence", coherenceComponent.value), type: "text" },
+    cancel: true,
+    persistent: true,
+  }).onOk(async (name: string) => {
+    const clean = _cleanName(name.trim());
+    if (!clean) return;
+    try {
+      const res = await savePlotImage(clean, canvas.toDataURL("image/png"), "coherence");
+      $q.notify({ type: "positive", message: `Saved ${res.name} — see File Plots (coherence/).` });
+    } catch (e: any) {
+      $q.notify({ type: "negative", message: e?.response?.data?.error ?? "Failed to save." });
+    }
+  });
+}
+
+// ── Shared decomposition chart builders (KLE + PCA share this rendering) ──
+// Both dialogs show all three components (E/N/U) together — one clustered
+// bar per mode/stream per component, one line per component — using the
+// same fixed color per component everywhere (bars, loadings, and lines).
+
+type PerComponent<T> = Record<"east" | "north" | "up", T>;
+const _ENU = ["east", "north", "up"] as const;
+const COMPONENT_COLORS: PerComponent<string> = { east: "#1E88E5", north: "#43A047", up: "#FB8C00" };
+const COMPONENT_LABELS: PerComponent<string> = { east: "East", north: "North", up: "Up" };
+
+function _buildVarianceClusterChart(
+  canvas: HTMLCanvasElement, results: PerComponent<{ variance_explained_pct: number[] }>,
+): Chart {
+  const maxModes = Math.max(..._ENU.map(c => results[c].variance_explained_pct.length));
+  const labels = Array.from({ length: maxModes }, (_, i) => `Mode ${i + 1}`);
+  const datasets = _ENU.map(c => ({
+    label: COMPONENT_LABELS[c],
+    data: Array.from({ length: maxModes }, (_, i) => results[c].variance_explained_pct[i] ?? null),
+    backgroundColor: COMPONENT_COLORS[c] + "CC",
+    borderColor: COMPONENT_COLORS[c],
+    borderWidth: 1,
+  }));
+  return new Chart(canvas, {
+    type: "bar",
+    data: { labels, datasets },
+    options: {
+      animation: false, responsive: true, maintainAspectRatio: false,
+      scales: {
+        y: { min: 0, max: 100, title: { display: true, text: "%", font: { size: 11 } } },
+      },
+      plugins: {
+        legend: { display: true, position: "top", labels: { font: { size: 10 }, boxWidth: 12 } },
+        tooltip: { callbacks: { label: item => `${item.dataset.label}: ${Number(item.parsed.y).toFixed(1)}%` } },
+      },
+    },
+  });
+}
+
+function _buildLoadingsClusterChart(
+  canvas: HTMLCanvasElement, geosncls: string[],
+  results: PerComponent<{ loadings: number[][] }>, modeIndex: number,
+): Chart {
+  const datasets = _ENU.map(c => {
+    const loadings = results[c].loadings[modeIndex] ?? [];
+    return {
+      label: COMPONENT_LABELS[c],
+      data: geosncls.map((_, i) => loadings[i] ?? null),
+      backgroundColor: COMPONENT_COLORS[c] + "CC",
+      borderColor: COMPONENT_COLORS[c],
+      borderWidth: 1,
+    };
+  });
+  return new Chart(canvas, {
+    type: "bar",
+    data: { labels: geosncls, datasets },
+    options: {
+      animation: false, responsive: true, maintainAspectRatio: false,
+      scales: {
+        x: { ticks: { font: { size: 9 }, maxRotation: 60, minRotation: 40 } },
+        y: { title: { display: true, text: "Loading", font: { size: 11 } } },
+      },
+      plugins: {
+        legend: { display: true, position: "top", labels: { font: { size: 10 }, boxWidth: 12 } },
+        tooltip: { callbacks: { label: item => `${item.dataset.label}: ${Number(item.parsed.y).toFixed(3)}` } },
+      },
+    },
+  });
+}
+
+/** All 3 components' reconstructed mode series overlaid on one chart, each
+ *  its own (same everywhere in this dialog) color — what the shared signal
+ *  actually looks like, as opposed to the loadings chart which only shows
+ *  which streams it's concentrated in. */
+function _buildModeSeriesOverlayChart(
+  canvas: HTMLCanvasElement,
+  results: PerComponent<{ modeTimes: number[]; modeSeries: (number | null)[][] }>,
+  modeIndex: number,
+): Chart {
+  const datasets = _ENU.map(c => {
+    const r = results[c];
+    const series = r.modeSeries[modeIndex] ?? [];
+    return {
+      label: COMPONENT_LABELS[c],
+      data: r.modeTimes.map((t, i) => ({ x: t, y: series[i] ?? null })),
+      borderColor: COMPONENT_COLORS[c], borderWidth: 1.25, pointRadius: 0, tension: 0, spanGaps: false,
+    };
+  });
+  return new Chart(canvas, {
+    type: "line",
+    data: { datasets },
+    options: {
+      animation: false, responsive: true, maintainAspectRatio: false, parsing: false,
+      scales: {
+        x: { type: "linear", ticks: { maxTicksLimit: 8, callback: v => _epochLabel(Number(v)) }, grid: { color: "#e0e0e0" } },
+        y: { title: { display: true, text: "m", font: { size: 11 } }, grid: { color: "#e0e0e0" } },
+      },
+      plugins: {
+        legend: { display: true, position: "top", labels: { font: { size: 10 }, boxWidth: 12 } },
+        tooltip: {
+          callbacks: {
+            title: items => _epochLabel(Number(items[0].parsed.x)),
+            label: item => `${item.dataset.label}: ${Number(item.parsed.y).toFixed(4)} m`,
+          },
+        },
+      },
+    },
+  });
+}
+
+/** Stack up to 3 canvases (variance / mode-series / loadings) into one
+ *  white-background PNG with a title bar — shared by KLE and PCA saves. */
+function _buildDecompositionCompositeCanvas(
+  title: string,
+  varCanvas: HTMLCanvasElement | undefined, seriesCanvas: HTMLCanvasElement | undefined,
+  loadCanvas: HTMLCanvasElement | undefined,
+): HTMLCanvasElement | null {
+  if (!varCanvas && !seriesCanvas && !loadCanvas) return null;
+
+  const dpr = window.devicePixelRatio || 1;
+  const gap = 14;
+  const titleH = 46;
+  const fullW = Math.max(
+    varCanvas?.clientWidth ?? 0, seriesCanvas?.clientWidth ?? 0, loadCanvas?.clientWidth ?? 0, 700,
+  );
+  let totalH = titleH;
+  if (varCanvas) totalH += varCanvas.clientHeight + gap;
+  if (seriesCanvas) totalH += seriesCanvas.clientHeight + gap;
+  if (loadCanvas) totalH += loadCanvas.clientHeight + gap;
+
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.round(fullW * dpr);
+  canvas.height = Math.round(totalH * dpr);
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+  ctx.scale(dpr, dpr);
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, fullW, totalH);
+
+  ctx.textBaseline = "top";
+  ctx.fillStyle = "#222";
+  ctx.font = "bold 14px sans-serif";
+  ctx.fillText(title, 8, 10);
+  ctx.font = "11px sans-serif";
+  ctx.fillStyle = "#666";
+  ctx.fillText(`Generated ${new Date().toISOString().replace("T", " ").slice(0, 19)} UTC`, 8, 28);
+
+  let y = titleH;
+  if (varCanvas) { ctx.drawImage(varCanvas, 0, y, varCanvas.clientWidth, varCanvas.clientHeight); y += varCanvas.clientHeight + gap; }
+  if (seriesCanvas) { ctx.drawImage(seriesCanvas, 0, y, seriesCanvas.clientWidth, seriesCanvas.clientHeight); y += seriesCanvas.clientHeight + gap; }
+  if (loadCanvas) { ctx.drawImage(loadCanvas, 0, y, loadCanvas.clientWidth, loadCanvas.clientHeight); y += loadCanvas.clientHeight + gap; }
+  return canvas;
+}
+
+// ── Karhunen-Loeve dialog ─────────────────────────────────────────────────────
+// Shows all three components (E/N/U) together — fetched in parallel — rather
+// than one at a time behind a radio button, so the shared common-mode
+// structure across components is visible in one view.
+
+const kleOpen      = ref(false);
+const kleLoading    = ref(false);
+const kleError      = ref("");
+const kleResults    = ref<PerComponent<KleResponse> | null>(null);
+const kleLoadingMode = ref(0);  // 0-based index into loadings/modeSeries
+const kleVarianceCanvas = ref<HTMLCanvasElement | null>(null);
+const kleLoadingsCanvas = ref<HTMLCanvasElement | null>(null);
+const kleModeSeriesCanvas = ref<HTMLCanvasElement | null>(null);
+let _kleVarianceChart: Chart | null = null;
+let _kleLoadingsChart: Chart | null = null;
+let _kleModeSeriesChart: Chart | null = null;
+
+const kleModeOptions = computed(() => {
+  const r = kleResults.value;
+  if (!r) return [];
+  const maxModes = Math.max(..._ENU.map(c => r[c].eigenvalues.length));
+  return Array.from({ length: maxModes }, (_, i) => ({ label: `Mode ${i + 1}`, value: i }));
+});
+
+function openKleDialog() {
+  kleOpen.value = true;
+  kleLoadingMode.value = 0;
+  loadKle();
+}
+
+async function loadKle() {
+  if (selected.value.size < 2) { kleError.value = "Select at least 2 streams."; return; }
+  kleError.value = "";
+  kleLoading.value = true;
+  kleResults.value = null;
+  let results: PerComponent<KleResponse>;
+  try {
+    const [east, north, up] = await Promise.all(_ENU.map(component => getKle({
+      geosncls: [...selected.value].join(","),
+      start: startDate.value,
+      end: endDate.value,
+      component,
+      outlierM: outlierThreshold.value,
+    })));
+    results = { east, north, up };
+  } catch (e: any) {
+    kleError.value = e?.response?.data?.error ?? "Failed to compute the decomposition.";
+    kleLoading.value = false;
+    return;
+  }
+  kleResults.value = results;
+  kleLoadingMode.value = 0;
+  // Same ordering fix as loadCoherence(): flip loading false (mounting the
+  // canvases) before nextTick(), not in a finally that runs after the build.
+  kleLoading.value = false;
+  await nextTick();
+  buildKleCharts();
+}
+
+function buildKleCharts() {
+  const results = kleResults.value;
+  if (!results) return;
+  if (kleVarianceCanvas.value) {
+    _kleVarianceChart?.destroy();
+    _kleVarianceChart = _buildVarianceClusterChart(kleVarianceCanvas.value, results);
+  }
+  rebuildKleLoadingsChart();
+  rebuildKleModeSeriesChart();
+}
+
+function rebuildKleLoadingsChart() {
+  const results = kleResults.value;
+  const canvas = kleLoadingsCanvas.value;
+  if (!results || !canvas) return;
+  _kleLoadingsChart?.destroy();
+  _kleLoadingsChart = _buildLoadingsClusterChart(canvas, results.east.geosncls, results, kleLoadingMode.value);
+}
+
+function rebuildKleModeSeriesChart() {
+  const results = kleResults.value;
+  const canvas = kleModeSeriesCanvas.value;
+  if (!results || !canvas) return;
+  _kleModeSeriesChart?.destroy();
+  _kleModeSeriesChart = _buildModeSeriesOverlayChart(canvas, results, kleLoadingMode.value);
+}
+
+watch(kleLoadingMode, () => { rebuildKleLoadingsChart(); rebuildKleModeSeriesChart(); });
+
+function saveKlePlot() {
+  const results = kleResults.value;
+  if (!results) { $q.notify({ type: "warning", message: "Nothing to save yet." }); return; }
+  const canvas = _buildDecompositionCompositeCanvas(
+    `Karhunen-Loève — E/N/U   mode ${kleLoadingMode.value + 1}   ${results.east.geosncls.length} stream(s)`,
+    _kleVarianceChart?.canvas, _kleModeSeriesChart?.canvas, _kleLoadingsChart?.canvas,
+  );
+  if (!canvas) { $q.notify({ type: "warning", message: "Nothing to save yet." }); return; }
+  $q.dialog({
+    title: "Save Karhunen-Loève plot",
+    message: "File name",
+    prompt: { model: _defaultAnalysisName("kle"), type: "text" },
+    cancel: true,
+    persistent: true,
+  }).onOk(async (name: string) => {
+    const clean = _cleanName(name.trim());
+    if (!clean) return;
+    try {
+      const res = await savePlotImage(clean, canvas.toDataURL("image/png"), "kle");
+      $q.notify({ type: "positive", message: `Saved ${res.name} — see File Plots (kle/).` });
+    } catch (e: any) {
+      $q.notify({ type: "negative", message: e?.response?.data?.error ?? "Failed to save." });
+    }
+  });
+}
+
+// ── Principal Component Analysis (PCA) dialog ────────────────────────────────
+// Sibling of the KLE dialog above — same shared chart builders, same shape
+// of result, and same all-3-components-together display, but PCA only
+// speaks for epochs where every stream overlaps simultaneously
+// (n_complete_epochs), vs. KLE's pairwise-complete covariance which uses
+// every stream's data even where the network doesn't fully align.
+
+const pcaOpen      = ref(false);
+const pcaLoading   = ref(false);
+const pcaError     = ref("");
+const pcaResults   = ref<PerComponent<PcaResponse> | null>(null);
+const pcaLoadingMode = ref(0);
+const pcaVarianceCanvas = ref<HTMLCanvasElement | null>(null);
+const pcaLoadingsCanvas = ref<HTMLCanvasElement | null>(null);
+const pcaModeSeriesCanvas = ref<HTMLCanvasElement | null>(null);
+let _pcaVarianceChart: Chart | null = null;
+let _pcaLoadingsChart: Chart | null = null;
+let _pcaModeSeriesChart: Chart | null = null;
+
+const pcaHasAnyModes = computed(() => {
+  const r = pcaResults.value;
+  return !!r && _ENU.some(c => r[c].n_modes > 0);
+});
+
+const pcaModeOptions = computed(() => {
+  const r = pcaResults.value;
+  if (!r) return [];
+  const maxModes = Math.max(..._ENU.map(c => r[c].eigenvalues.length));
+  return Array.from({ length: maxModes }, (_, i) => ({ label: `Mode ${i + 1}`, value: i }));
+});
+
+function openPcaDialog() {
+  pcaOpen.value = true;
+  pcaLoadingMode.value = 0;
+  loadPca();
+}
+
+async function loadPca() {
+  if (selected.value.size < 2) { pcaError.value = "Select at least 2 streams."; return; }
+  pcaError.value = "";
+  pcaLoading.value = true;
+  pcaResults.value = null;
+  let results: PerComponent<PcaResponse>;
+  try {
+    const [east, north, up] = await Promise.all(_ENU.map(component => getPca({
+      geosncls: [...selected.value].join(","),
+      start: startDate.value,
+      end: endDate.value,
+      component,
+      outlierM: outlierThreshold.value,
+    })));
+    results = { east, north, up };
+  } catch (e: any) {
+    pcaError.value = e?.response?.data?.error ?? "Failed to compute the decomposition.";
+    pcaLoading.value = false;
+    return;
+  }
+  pcaResults.value = results;
+  pcaLoadingMode.value = 0;
+  pcaLoading.value = false;
+  await nextTick();
+  buildPcaCharts();
+}
+
+function buildPcaCharts() {
+  const results = pcaResults.value;
+  if (!results || !pcaHasAnyModes.value) return;
+  if (pcaVarianceCanvas.value) {
+    _pcaVarianceChart?.destroy();
+    _pcaVarianceChart = _buildVarianceClusterChart(pcaVarianceCanvas.value, results);
+  }
+  rebuildPcaLoadingsChart();
+  rebuildPcaModeSeriesChart();
+}
+
+function rebuildPcaLoadingsChart() {
+  const results = pcaResults.value;
+  const canvas = pcaLoadingsCanvas.value;
+  if (!results || !canvas || !pcaHasAnyModes.value) return;
+  _pcaLoadingsChart?.destroy();
+  _pcaLoadingsChart = _buildLoadingsClusterChart(canvas, results.east.geosncls, results, pcaLoadingMode.value);
+}
+
+function rebuildPcaModeSeriesChart() {
+  const results = pcaResults.value;
+  const canvas = pcaModeSeriesCanvas.value;
+  if (!results || !canvas || !pcaHasAnyModes.value) return;
+  _pcaModeSeriesChart?.destroy();
+  _pcaModeSeriesChart = _buildModeSeriesOverlayChart(canvas, results, pcaLoadingMode.value);
+}
+
+watch(pcaLoadingMode, () => { rebuildPcaLoadingsChart(); rebuildPcaModeSeriesChart(); });
+
+function savePcaPlot() {
+  const results = pcaResults.value;
+  if (!results) { $q.notify({ type: "warning", message: "Nothing to save yet." }); return; }
+  const canvas = _buildDecompositionCompositeCanvas(
+    `PCA — E/N/U   mode ${pcaLoadingMode.value + 1}   ${results.east.geosncls.length} stream(s)`,
+    _pcaVarianceChart?.canvas, _pcaModeSeriesChart?.canvas, _pcaLoadingsChart?.canvas,
+  );
+  if (!canvas) { $q.notify({ type: "warning", message: "Nothing to save yet." }); return; }
+  $q.dialog({
+    title: "Save PCA plot",
+    message: "File name",
+    prompt: { model: _defaultAnalysisName("pca"), type: "text" },
+    cancel: true,
+    persistent: true,
+  }).onOk(async (name: string) => {
+    const clean = _cleanName(name.trim());
+    if (!clean) return;
+    try {
+      const res = await savePlotImage(clean, canvas.toDataURL("image/png"), "pca");
+      $q.notify({ type: "positive", message: `Saved ${res.name} — see File Plots (pca/).` });
+    } catch (e: any) {
+      $q.notify({ type: "negative", message: e?.response?.data?.error ?? "Failed to save." });
+    }
+  });
 }
 
 // ── Fetch dialog ─────────────────────────────────────────────────────────────
@@ -693,6 +1741,13 @@ function setCanvas(key: string, el: unknown) {
   if (!canvas) {
     _chart[key]?.destroy(); _chart[key] = null;
     _canvasCleanup[key]?.(); _canvasCleanup[key] = null;
+    // Also drop the (now-detached) element itself — otherwise the next
+    // updateCharts() call that runs while this block is unmounted (e.g. the
+    // debounced loadPositions() triggered by the Clear that unmounted it)
+    // sees a stale-but-truthy _canvas[key], happily builds a Chart bound to
+    // a canvas no longer in the DOM, and — since _chart[key] is then
+    // non-null — never rebuilds it against the real canvas once one remounts.
+    _canvas[key] = null;
   } else {
     _canvas[key] = canvas;
     _canvasCleanup[key] = _attachListeners(canvas, key);
@@ -700,12 +1755,12 @@ function setCanvas(key: string, el: unknown) {
 }
 function setScatterCanvas(key: string, el: unknown) {
   const canvas = el as HTMLCanvasElement | null;
-  if (!canvas) { _scatterChart[key]?.destroy(); _scatterChart[key] = null; }
+  if (!canvas) { _scatterChart[key]?.destroy(); _scatterChart[key] = null; _scatterCanvas[key] = null; }
   else { _scatterCanvas[key] = canvas; }
 }
 function setHistCanvas(key: string, el: unknown) {
   const canvas = el as HTMLCanvasElement | null;
-  if (!canvas) { _histChart[key]?.destroy(); _histChart[key] = null; }
+  if (!canvas) { _histChart[key]?.destroy(); _histChart[key] = null; _histCanvas[key] = null; }
   else { _histCanvas[key] = canvas; }
 }
 
@@ -890,8 +1945,10 @@ function _median(arr: number[]): number {
   return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
 }
 type Processed = { chartData: Array<{ x: number; y: number | null }>; specTimes: number[]; specVals: number[] };
+// Structural — satisfied by both PositionTrace and CommonModeRemovedTrace.
+type ComponentSource = Pick<PositionTrace, "times" | "east" | "north" | "up">;
 
-function processComponent(trace: PositionTrace, comp: "east" | "north" | "up"): Processed {
+function processComponent(trace: ComponentSource, comp: "east" | "north" | "up"): Processed {
   const raw = trace[comp] as (number | null)[];
   const times = trace.times;
   const validRaw = raw.filter((v): v is number => v !== null);
@@ -1073,6 +2130,31 @@ function updateCharts() {
     if (pc) { pc.data.datasets = datasets as any; pc.update("none"); }
   }
 
+  // ── Common-mode-removed time-series (optional second set) ───────────────────
+  if (cmrMethod.value !== "none" && cmrResult.value) {
+    const cmrProcessed = new Map<string, Record<"east" | "north" | "up", Processed>>();
+    for (const station of cmrResult.value.stations) {
+      cmrProcessed.set(station.geosncl, {
+        east:  processComponent(station, "east"),
+        north: processComponent(station, "north"),
+        up:    processComponent(station, "up"),
+      });
+    }
+    for (const { key, label } of COMPONENTS) {
+      const cmrKey = `${key}_cmr`;
+      if (!_chart[cmrKey]) _chart[cmrKey] = _makePosChart(cmrKey, `${label} — common-mode removed`);
+      const datasets: object[] = [];
+      for (const [geosncl, comps] of cmrProcessed) {
+        const color = _colorFor(geosncl);
+        const base = { label: geosncl, borderColor: color, backgroundColor: color + "22",
+                       borderWidth: 1, pointRadius: 0, tension: 0, spanGaps: false };
+        datasets.push({ ...base, data: comps[key as "east" | "north" | "up"].chartData });
+      }
+      const pc = _chart[cmrKey];
+      if (pc) { pc.data.datasets = datasets as any; pc.update("none"); }
+    }
+  }
+
   // ── Scatter plots ────────────────────────────────────────────────────────────
   // Global min/max across all components so all scatter axes share the same scale
   let gMin = Infinity, gMax = -Infinity;
@@ -1160,6 +2242,40 @@ async function loadPositions() {
     } catch (e) { console.error("Failed to load positions", e); }
     finally { positionsLoading.value = false; }
   }
+  if (cmrMethod.value !== "none") loadCommonModeRemoved();
+  updateCharts();
+}
+
+async function loadCommonModeRemoved() {
+  cmrError.value = "";
+  if (cmrMethod.value === "none") return;
+  if (selected.value.size < 2) {
+    cmrError.value = "Select at least 2 streams to compute a common mode.";
+    cmrResult.value = null; updateCharts(); return;
+  }
+  if (!startDate.value || !endDate.value) return;
+  cmrLoading.value = true;
+  try {
+    cmrResult.value = await getCommonModeRemoved({
+      geosncls: [...selected.value].join(","),
+      start: startDate.value, end: endDate.value,
+      method: cmrMethod.value === "pca" ? "pca" : "kle",
+      nModesRemoved: cmrNModesRemoved.value,
+      downsample: downsampleEnabled.value,
+      outlierM: outlierThreshold.value,
+    });
+  } catch (e: any) {
+    cmrError.value = e?.response?.data?.error ?? "Failed to compute common-mode-removed series.";
+    cmrResult.value = null;
+  } finally {
+    cmrLoading.value = false;
+  }
+  // The _cmr canvases only mount once cmrResult is set (v-else-if="cmrResult"
+  // in the template) — wait for that DOM update before updateCharts() reads
+  // _canvas[cmrKey], or the very first render after enabling CMR silently
+  // finds no canvas yet and never draws anything (only a later, unrelated
+  // updateCharts() call — e.g. from selecting another stream — would).
+  await nextTick();
   updateCharts();
 }
 
@@ -1168,6 +2284,11 @@ async function loadPositions() {
 watch(selected,                        () => scheduleLoad(),                          { deep: false });
 watch([removeMean, outlierThreshold],  () => updateCharts());
 watch(downsampleEnabled,               () => { positionCache.value.clear(); scheduleLoad(); });
+watch(cmrMethod, (method) => {
+  if (method !== "none") loadCommonModeRemoved();
+  else { cmrResult.value = null; cmrError.value = ""; updateCharts(); }
+});
+watch(cmrNModesRemoved, () => { if (cmrMethod.value !== "none") loadCommonModeRemoved(); });
 
 // ─── Fetch missing ────────────────────────────────────────────────────────────
 
@@ -1202,4 +2323,16 @@ function startFetch() {
 .chart-block-sm { position: relative; height: 160px; flex-shrink: 0; }
 .chart-block-sq { position: relative; height: 260px; flex-shrink: 0; }
 .chart-canvas-full { position: absolute; inset: 0; width: 100% !important; height: 100% !important; }
+
+.coh-legend-bar {
+  width: 200px; height: 12px; border-radius: 2px;
+  background: linear-gradient(to right,
+    rgb(0,0,102), rgb(0,153,204), rgb(0,255,0), rgb(255,255,0), rgb(255,0,0));
+}
+.heatmap-tip {
+  position: absolute; z-index: 10; pointer-events: none;
+  background: rgba(11,11,11,0.85); color: #fff; font-size: 11px;
+  padding: 3px 6px; border-radius: 4px; white-space: nowrap;
+}
+.kle-bar-wrap { position: relative; height: 220px; }
 </style>

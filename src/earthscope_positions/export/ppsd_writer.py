@@ -440,11 +440,6 @@ def write_ppsd_from_caches(
 ) -> pathlib.Path | None:
     """Merge cached PPSD data for *files* and render a PNG under *output_root*.
 
-    Output path: ``<output_root>/<mode>/ppsd-<slug>/ppsd-<slug>_<date_range>.png``
-    — grouping by PPSD type (*mode*) first, then by plot identity, so repeated
-    runs for the same station/group accumulate side-by-side instead of
-    scattering across per-run date folders.
-
     Any file whose cache is missing or stale is computed on-the-fly (fallback).
     Returns the written PNG path, or None if no valid data was found.
     """
@@ -464,8 +459,37 @@ def write_ppsd_from_caches(
     if total_frames == 0:
         return None
 
+    return render_ppsd_from_histograms(
+        hist_e, hist_n, hist_u, total_frames, len(files),
+        output_root, label=label, mode=mode, date_range=date_range,
+        slug=slug, title_prefix=title_prefix, verbose=verbose,
+    )
+
+
+def render_ppsd_from_histograms(
+    hist_e: np.ndarray, hist_n: np.ndarray, hist_u: np.ndarray,
+    total_frames: int, n_files: int,
+    output_root: pathlib.Path,
+    *,
+    label: str,
+    mode: str,
+    date_range: str,
+    slug: str | None = None,
+    title_prefix: str = "",
+    verbose: bool = False,
+) -> pathlib.Path | None:
+    """Render a 3-panel PPSD PNG from already-merged (E, N, U) histograms.
+
+    Output path: ``<output_root>/<mode>/ppsd-<slug>/ppsd-<slug>_<date_range>.png``
+    — grouping by PPSD type (*mode*) first, then by plot identity, so repeated
+    runs for the same station/group accumulate side-by-side instead of
+    scattering across per-run date folders.
+
+    Split out of :func:`write_ppsd_from_caches` so callers that build
+    histograms some other way (e.g. from common-mode-removed residuals, which
+    can't use the per-file sparse cache) can still share the same rendering.
+    """
     cmap = ppsd_colormap()
-    n_files = len(files)
     pfx = f"{title_prefix} " if title_prefix else ""
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))

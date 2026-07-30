@@ -32,6 +32,7 @@ dependencies = [
     # Analysis and plotting (used by positions_diagnose_plot)
     "pandas>=2.0.0",
     "matplotlib>=3.7.0",
+    "scipy>=1.11.0",  # Welch/coherence spectral estimation (positions coherence analysis)
 
     # Web server
     "fastapi>=0.110.0",

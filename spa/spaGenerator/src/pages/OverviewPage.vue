@@ -113,6 +113,8 @@ const pages = [
     tips: [
       "Type or paste comma-separated geosncl codes to overlay multiple streams.",
       "Zoom and pan the chart; use the reset button to restore the full range.",
+      "Select 2 or more streams and click Coherence for a per-pair spectrum + a density heatmap of shared signal.",
+      "Karhunen-Loève and PCA both decompose the selection into shared modes (with each mode's own reconstructed time series); Common mode (None/PCA/KLE) can subtract the dominant one(s).",
     ],
   },
   {
@@ -125,6 +127,7 @@ const pages = [
     tips: [
       "\"By Processing Center\" groups all streams from a center into a single 3-panel PNG.",
       "\"By Stream\" produces one PNG per geosncl — useful for comparing individual streams.",
+      "Common mode (None/PCA/KLE) can remove shared clock/orbit noise per center+solution subgroup before computing.",
       "Output PNGs are organized under data/plots/ppsd/<mode>/ and are viewable in File Plots.",
     ],
   },

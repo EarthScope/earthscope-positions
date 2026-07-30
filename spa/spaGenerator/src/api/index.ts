@@ -2,7 +2,8 @@ import axios from "axios";
 import type {
   CompletenessResponse, StationsResponse, StreamListsResponse,
   PositionsResponse, FetchEvent, FetchMissingBody,
-  ReplayState, ReplayPreloadBody,
+  ReplayState, ReplayPreloadBody, CoherenceResponse, KleResponse, PcaResponse,
+  CommonModeRemovedResponse,
 } from "../types";
 
 const http = axios.create({ baseURL: "/api" });
@@ -46,6 +47,103 @@ export async function getPositions(params: {
       end: params.end,
       max_points: params.maxPoints ?? 2000,
       downsample: params.downsample ?? true,
+    },
+  });
+  return r.data;
+}
+
+/** Always issues one fresh, combined request for exactly the geosncls passed —
+ *  independent of the Positions page's incremental positionCache, so it
+ *  behaves identically whether the current selection was built up one stream
+ *  at a time or via a bulk action (Select All / group check). */
+export async function getCoherence(params: {
+  geosncls: string;  // comma-separated, 2-35
+  start: string;
+  end: string;
+  component: "east" | "north" | "up";
+  outlierM?: number;
+}): Promise<CoherenceResponse> {
+  const r = await http.get<CoherenceResponse>("/coherence", {
+    params: {
+      geosncls: params.geosncls,
+      start: params.start,
+      end: params.end,
+      component: params.component,
+      outlier_m: params.outlierM,
+    },
+  });
+  return r.data;
+}
+
+/** Karhunen-Loeve (network PCA) decomposition — same access-pattern
+ *  independence as getCoherence above. */
+export async function getKle(params: {
+  geosncls: string;
+  start: string;
+  end: string;
+  component: "east" | "north" | "up";
+  nModes?: number;
+  outlierM?: number;
+}): Promise<KleResponse> {
+  const r = await http.get<KleResponse>("/kle", {
+    params: {
+      geosncls: params.geosncls,
+      start: params.start,
+      end: params.end,
+      component: params.component,
+      n_modes: params.nModes ?? 5,
+      outlier_m: params.outlierM,
+    },
+  });
+  return r.data;
+}
+
+/** Classical PCA (network decomposition) — sibling of getKle, same
+ *  access-pattern independence. */
+export async function getPca(params: {
+  geosncls: string;
+  start: string;
+  end: string;
+  component: "east" | "north" | "up";
+  nModes?: number;
+  outlierM?: number;
+}): Promise<PcaResponse> {
+  const r = await http.get<PcaResponse>("/pca", {
+    params: {
+      geosncls: params.geosncls,
+      start: params.start,
+      end: params.end,
+      component: params.component,
+      n_modes: params.nModes ?? 5,
+      outlier_m: params.outlierM,
+    },
+  });
+  return r.data;
+}
+
+/** Each selected stream's E/N/U with the leading common-mode(s) removed (via
+ *  KLE or classical PCA), in the same shape as getPositions (drop-in for a
+ *  parallel chart set). */
+export async function getCommonModeRemoved(params: {
+  geosncls: string;
+  start: string;
+  end: string;
+  method: "kle" | "pca";
+  nModesRemoved?: number;
+  maxPoints?: number;
+  downsample?: boolean;
+  outlierM?: number;
+}): Promise<CommonModeRemovedResponse> {
+  const r = await http.get<CommonModeRemovedResponse>("/positions/common-mode-removed", {
+    params: {
+      geosncls: params.geosncls,
+      start: params.start,
+      end: params.end,
+      method: params.method,
+      n_modes_removed: params.nModesRemoved ?? 1,
+      max_points: params.maxPoints ?? 2000,
+      downsample: params.downsample ?? true,
+      outlier_m: params.outlierM,
     },
   });
   return r.data;
@@ -154,14 +252,16 @@ export function openFetchMissingPost(
   return () => controller.abort();
 }
 
-/** Save a client-rendered PNG (data URL) to data/plots/positions/. */
+/** Save a client-rendered PNG (data URL) to data/plots/<folder>/. */
 export async function savePlotImage(
   filename: string,
   dataUrl: string,
+  folder?: string,
 ): Promise<{ path: string; name: string }> {
   const r = await http.post<{ path: string; name: string }>("/plots/save", {
     filename,
     data_url: dataUrl,
+    folder: folder ?? "positions",
   });
   return r.data;
 }

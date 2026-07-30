@@ -90,6 +90,56 @@ def _ensure_token() -> str:
     return _read_tokens().access_token.get_secret_value()
 
 
+_token_refresh_lock = threading.Lock()
+
+
+def _ensure_token_for_worker() -> str:
+    """Like :func:`_ensure_token`, but safe to call from a worker thread on
+    every task (not just once at startup).
+
+    A long fetch job (many hours, thousands of streams) easily outlives a
+    single access token: with only one token fetched up front, every request
+    after expiry gets a 401 that looks identical to a real failure — and,
+    critically, the API never gets a chance to say "no data" for that
+    stream/day, so it's misreported as failed instead of no-data.  Re-checking
+    here (and refreshing if needed) on every attempt keeps the token valid for
+    the whole run.
+
+    The common case (token still fresh) only reads the local tokens file, so
+    calling this per-task is cheap.  Only the actual refresh subprocess call
+    is serialized, with a re-check after acquiring the lock so concurrent
+    workers hitting expiry at the same time don't all shell out separately.
+    Raises instead of exiting the process, so callers running in a worker
+    thread can catch and retry rather than silently losing the thread.
+    """
+    tokens = _read_tokens()
+    try:
+        body = tokens.access_token_body
+    except ValueError:
+        body = None
+    if body is not None and body.ttl.total_seconds() > _REFRESH_MARGIN:
+        return tokens.access_token.get_secret_value()
+
+    with _token_refresh_lock:
+        # Re-check: another thread may have refreshed it while we waited.
+        tokens = _read_tokens()
+        try:
+            body = tokens.access_token_body
+        except ValueError:
+            body = None
+        if body is not None and body.ttl.total_seconds() > _REFRESH_MARGIN:
+            return tokens.access_token.get_secret_value()
+
+        result = subprocess.run(
+            ["es", "user", "refresh-access-token"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"Token refresh failed: {result.stderr.strip()}")
+        return _read_tokens().access_token.get_secret_value()
+
+
 # ---------------------------------------------------------------------------
 # Path helpers
 # ---------------------------------------------------------------------------
@@ -547,7 +597,11 @@ def _run_parallel(
             except queue.Empty:
                 continue
 
-            token_v, edid, geosncl, ds, de, force, redownload, retries_left = task
+            # The token carried in the task tuple is only a startup snapshot;
+            # re-check (and refresh if needed) on every attempt so a long job
+            # doesn't run for hours on a token that expired partway through —
+            # see _ensure_token_for_worker.
+            _stale_token, edid, geosncl, ds, de, force, redownload, retries_left = task
             label = _geosncl_label(geosncl)
             station_lock = get_station_lock(label)
 
@@ -559,6 +613,7 @@ def _run_parallel(
 
             status = "error-exception"
             try:
+                token_v = _ensure_token_for_worker()
                 status = _fetch_one_day(token_v, edid, geosncl, ds, de, force, redownload)
             except Exception as exc:
                 print(
@@ -568,9 +623,15 @@ def _run_parallel(
             finally:
                 station_lock.release()
 
-            # Re-queue on transient 5xx without blocking — worker moves on immediately
-            if status.startswith("error-5") and retries_left > 0:
-                task_q.put((token_v, edid, geosncl, ds, de, force, redownload, retries_left - 1))
+            # Re-queue on transient errors without blocking — worker moves on
+            # immediately.  401/403 usually just means the token expired
+            # between the freshness check and the request; the next attempt
+            # re-checks it via _ensure_token_for_worker.
+            if (
+                (status.startswith("error-5") or status in ("error-401", "error-403"))
+                and retries_left > 0
+            ):
+                task_q.put((_stale_token, edid, geosncl, ds, de, force, redownload, retries_left - 1))
                 continue
 
             progress.update(status, label, ds.date())

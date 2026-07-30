@@ -35,13 +35,15 @@ import logging
 import pathlib
 import re
 import sys
+import threading
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 _log = logging.getLogger(__name__)
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.ipc as ipc
@@ -237,6 +239,7 @@ async def _refresh_index() -> None:
     async with _index_lock:  # type: ignore[union-attr]
         _file_index.clear()
         _file_index.update(new_index)
+    _clear_table_cache()  # file set may have changed — don't serve stale content
     _last_scan_time = time.time()
     _last_scan_files = sum(len(v) for v in _file_index.values())
 
@@ -319,10 +322,20 @@ def _read_stream_list_file(path: pathlib.Path) -> list[dict]:
 
 
 def _geosncls_for_list(list_name: str) -> list[str]:
-    """Return geosncls for a named list (or 'all'), filtered to what the index knows."""
-    available = set(_indexed_geosncls())
+    """Return every geosncl that belongs to a named list (or 'all').
+
+    Deliberately NOT filtered to what's already downloaded/indexed — most
+    callers need to know a stream belongs to a list before it has any local
+    data at all: Fetch Data's filter chips (that's the whole point — you're
+    about to fetch what's missing), the Completeness page's "not tried"
+    buckets, and station/stream trees for building lists or picking what to
+    fetch next. Callers that specifically need "and has local data for this
+    range" (replay, PPSD) already do their own file/date-range check
+    afterward, so they're unaffected by a list containing not-yet-fetched
+    streams.
+    """
     if list_name == "all":
-        return sorted(available)
+        return sorted(set(_all_list_geosncls()) | set(_indexed_geosncls()))
     d = _stream_lists_dir()
     path = d / f"{list_name}.jsonl"
     if not path.exists():
@@ -336,7 +349,7 @@ def _geosncls_for_list(list_name: str) -> list[str]:
     result: list[str] = []
     for rec in records:
         g = rec.get("geosncl") or rec.get("edid", "")
-        if g and g in available:
+        if g:
             result.append(g)
     return sorted(set(result))
 
@@ -352,6 +365,84 @@ def _entries_in_range(
         for (date, entry) in _file_index.get(geosncl, [])
         if start_date <= date < end_date
     ]
+
+
+# ── Shared time-filtered-table cache ──────────────────────────────────────────
+#
+# /api/positions and /api/coherence both need the same thing per stream: every
+# Arrow file in [start, end) read off disk, concatenated, and time-filtered.
+# That's the expensive part (disk I/O + IPC decode + concat) — cache *that*,
+# keyed on the exact (geosncl, start, end) triple, so repeat requests for it
+# (switching the coherence component, reopening a dialog, a second chart using
+# the same range) are served from memory.  Downstream per-request work
+# (downsampling, column extraction) stays uncached since it's cheap and varies
+# per call.
+#
+# Entries expire after _TABLE_CACHE_TTL_S, and the whole cache is cleared
+# whenever the file index is refreshed (_refresh_index — every
+# SCAN_INTERVAL_S, and on-demand right after a fetch job completes) since
+# that's already the "something on disk may have changed" signal; the TTL is
+# just a defensive upper bound on top of that.
+
+_TABLE_CACHE_TTL_S = 300.0
+_TABLE_CACHE_MAX_ENTRIES = 200
+_table_cache: "OrderedDict[tuple[str, int, int], tuple[float, pa.Table]]" = OrderedDict()
+_table_cache_lock = threading.Lock()
+
+
+def _clear_table_cache() -> None:
+    with _table_cache_lock:
+        _table_cache.clear()
+
+
+def _load_filtered_table(
+    geosncl: str, start_dt: dt.datetime, end_dt: dt.datetime
+) -> pa.Table | None:
+    """Return the concatenated, time-filtered Arrow table for *geosncl* over
+    [start_dt, end_dt), reusing a cached copy for the exact same request when
+    one is still fresh.  None if there's no data at all in range."""
+    start_ms = int(start_dt.timestamp() * 1000)
+    end_ms = int(end_dt.timestamp() * 1000)
+    key = (geosncl, start_ms, end_ms)
+
+    now = time.monotonic()
+    with _table_cache_lock:
+        hit = _table_cache.get(key)
+        if hit is not None:
+            cached_at, table = hit
+            if now - cached_at < _TABLE_CACHE_TTL_S:
+                _table_cache.move_to_end(key)
+                return table
+            del _table_cache[key]
+
+    entries = _entries_in_range(geosncl, start_dt, end_dt)
+    if not entries:
+        return None
+    tables = []
+    for entry in entries:
+        try:
+            buf = io.BytesIO(entry.arrow_path.read_bytes())
+            tables.append(ipc.open_stream(buf).read_all())
+        except Exception:
+            continue
+    if not tables:
+        return None
+
+    table = pa.concat_tables(tables)
+    time_col = table.column("time")
+    mask = pc.and_(
+        pc.greater_equal(time_col, pa.scalar(start_ms, pa.int64())),
+        pc.less(time_col, pa.scalar(end_ms, pa.int64())),
+    )
+    table = table.filter(mask).sort_by("time")
+
+    with _table_cache_lock:
+        _table_cache[key] = (now, table)
+        _table_cache.move_to_end(key)
+        while len(_table_cache) > _TABLE_CACHE_MAX_ENTRIES:
+            _table_cache.popitem(last=False)
+
+    return table
 
 
 # ── Boolean station filter ──────────────────────────────────────────────────
@@ -1302,25 +1393,10 @@ async def api_positions(
     geosncl_list = [g.strip() for g in geosncls.split(",") if g.strip()]
 
     def _load_one(geosncl: str) -> dict:
-        entries = _entries_in_range(geosncl, start_dt, end_dt)
-        tables = []
-        for entry in entries:
-            try:
-                buf = io.BytesIO(entry.arrow_path.read_bytes())
-                tables.append(ipc.open_stream(buf).read_all())
-            except Exception:
-                continue
-        if not tables:
+        table = _load_filtered_table(geosncl, start_dt, end_dt)
+        if table is None:
             return {"geosncl": geosncl, "times": [], "east": [], "north": [], "up": [],
                     "sigE": [], "sigN": [], "sigU": [], "downsampleFactor": 1}
-
-        table = pa.concat_tables(tables)
-        time_col = table.column("time")
-        mask = pc.and_(
-            pc.greater_equal(time_col, pa.scalar(start_ms, pa.int64())),
-            pc.less(time_col, pa.scalar(end_ms, pa.int64())),
-        )
-        table = table.filter(mask).sort_by("time")
 
         n = len(table)
         factor = 1
@@ -1356,6 +1432,391 @@ async def api_positions(
     total_pts = sum(len(s["times"]) for s in payload["stations"])
     _log.info("[positions] %d station(s), %d total points", len(geosncl_list), total_pts)
     return payload
+
+
+# ── /api/coherence, /api/kle, /api/positions/common-mode-removed ────────────
+#
+# All three analyze the same thing (a set of streams' position data over a
+# date range) in different ways, so they share validation + full-resolution
+# loading (_validate_and_load_dense) — see analysis/coherence.py and
+# analysis/kle.py for the actual math.
+
+_ANALYSIS_MIN_STREAMS = 2
+_COHERENCE_MAX_STREAMS = 35  # pairwise -> O(n^2) pairs; KLE/PCA have no cap
+
+
+def _reject_outliers(
+    times: np.ndarray, values: np.ndarray, threshold_m: float | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Drop samples more than *threshold_m* metres from this stream's own
+    median.  Variance-based analysis (KLE/PCA/coherence all pick out the
+    *maximum-variance* direction) is extremely sensitive to a single gross
+    outlier — e.g. a multi-km bad fix — even though it's a single point: it
+    can inflate that one stream's variance by many orders of magnitude and
+    make the whole decomposition collapse onto it ("mode 1 is 100% one
+    station, everything else 0").  Median (not mean/stddev) is what makes
+    this robust to exactly that case — a single outlier barely moves it."""
+    if threshold_m is None or len(values) == 0:
+        return times, values
+    median = float(np.median(values))
+    keep = np.abs(values - median) <= threshold_m
+    return times[keep], values[keep]
+
+
+def _load_component_raw(
+    geosncl: str, comp: str, start_dt: dt.datetime, end_dt: dt.datetime,
+    *, outlier_m: float | None = None,
+):
+    """Load one stream's (time_ms, value) arrays for *comp*, full resolution
+    (no downsampling — this analysis needs the real, evenly-spaced sample
+    sequence, not a plot-oriented thinned one)."""
+    table = _load_filtered_table(geosncl, start_dt, end_dt)
+    if table is None:
+        return np.array([], dtype=np.int64), np.array([], dtype=np.float64)
+    times = table.column("time").to_numpy(zero_copy_only=False)
+    values = table.column(comp).to_numpy(zero_copy_only=False)
+    valid = ~np.isnan(values)
+    times, values = times[valid], values[valid]
+    return _reject_outliers(times, values, outlier_m)
+
+
+def _parse_analysis_request(
+    geosncls: str, start: str, end: str, *, max_streams: int | None = None,
+) -> tuple[list[str], dt.datetime, dt.datetime, JSONResponse | None]:
+    """Shared validation for the coherence/KLE/PCA/common-mode-removed
+    endpoints.  Returns (geosncl_list, start_dt, end_dt, None) on success, or
+    (..., ..., ..., error_response) — check the last element first.
+
+    *max_streams* is opt-in (only coherence passes one — it's pairwise, so
+    O(n^2) pairs; KLE/PCA scale linearly and have no cap)."""
+    try:
+        start_dt = dt.datetime.fromisoformat(start).replace(tzinfo=_UTC)
+        end_dt = dt.datetime.fromisoformat(end).replace(tzinfo=_UTC)
+    except ValueError:
+        return [], dt.datetime.min, dt.datetime.min, JSONResponse(
+            {"error": "Invalid date format. Use YYYY-MM-DD."}, status_code=400
+        )
+    if end_dt <= start_dt:
+        return [], start_dt, end_dt, JSONResponse({"error": "end must be after start"}, status_code=400)
+
+    geosncl_list = sorted({g.strip() for g in geosncls.split(",") if g.strip()})
+    if len(geosncl_list) < _ANALYSIS_MIN_STREAMS:
+        return [], start_dt, end_dt, JSONResponse(
+            {"error": f"Select at least {_ANALYSIS_MIN_STREAMS} streams."}, status_code=400
+        )
+    if max_streams is not None and len(geosncl_list) > max_streams:
+        return [], start_dt, end_dt, JSONResponse(
+            {"error": f"Select at most {max_streams} streams (got {len(geosncl_list)})."},
+            status_code=400,
+        )
+    return geosncl_list, start_dt, end_dt, None
+
+
+async def _load_dense_component(
+    geosncl_list: list[str], component: str, start_dt: dt.datetime, end_dt: dt.datetime,
+    *, outlier_m: float | None = None,
+) -> dict[str, np.ndarray]:
+    """Load + densify one component for every stream, in parallel."""
+    from earthscope_positions.analysis import coherence as coh
+
+    start_ms = int(start_dt.timestamp() * 1000)
+    end_ms = int(end_dt.timestamp() * 1000)
+    loop = asyncio.get_event_loop()
+
+    def _load_and_densify(geosncl: str) -> np.ndarray:
+        times, values = _load_component_raw(geosncl, component, start_dt, end_dt, outlier_m=outlier_m)
+        return coh.densify_1hz(times, values, start_ms, end_ms)
+
+    dense_arrays = await asyncio.gather(*[
+        loop.run_in_executor(_executor, _load_and_densify, g) for g in geosncl_list
+    ])
+    return dict(zip(geosncl_list, dense_arrays))
+
+
+@app.get("/api/coherence")
+async def api_coherence(
+    geosncls: str = Query(..., description=f"Comma-separated geosncl codes (2-{_COHERENCE_MAX_STREAMS})"),
+    start: str = Query(...),
+    end: str = Query(...),
+    component: str = Query("east", pattern="^(east|north|up)$"),
+    outlier_m: float | None = Query(
+        None, gt=0,
+        description="Reject samples more than this many metres from each stream's own median before analysis",
+    ),
+) -> JSONResponse:
+    """Pairwise magnitude-squared coherence spectrum between every pair of
+    streams, all on one shared frequency axis — see analysis.coherence.
+
+    Always loads full-resolution data directly for whatever *geosncls* the
+    caller passes, independent of any positions-page cache or how those
+    streams were selected (one at a time vs. in bulk) — the two access
+    patterns must not affect what's analyzed.  Capped at
+    _COHERENCE_MAX_STREAMS since this is pairwise (O(n^2) pairs) — unlike
+    KLE/PCA, which scale linearly and have no such cap.
+    """
+    from earthscope_positions.analysis import coherence as coh
+
+    geosncl_list, start_dt, end_dt, err = _parse_analysis_request(
+        geosncls, start, end, max_streams=_COHERENCE_MAX_STREAMS,
+    )
+    if err is not None:
+        return err
+
+    dense = await _load_dense_component(geosncl_list, component, start_dt, end_dt, outlier_m=outlier_m)
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(_executor, coh.pairwise_coherence_spectra, dense)
+    result["component"] = component
+    result["start"] = start
+    result["end"] = end
+    _log.info(
+        "[coherence] %d stream(s), %s, %s -> %s, %d pair(s) skipped",
+        len(geosncl_list), component, start, end, len(result["pairs_skipped"]),
+    )
+    return JSONResponse(result)
+
+
+@app.get("/api/kle")
+async def api_kle(
+    geosncls: str = Query(..., description="Comma-separated geosncl codes (2 or more)"),
+    start: str = Query(...),
+    end: str = Query(...),
+    component: str = Query("east", pattern="^(east|north|up)$"),
+    n_modes: int = Query(5, ge=1, le=20),
+    max_points: int = Query(2000, ge=100, le=20000),
+    outlier_m: float | None = Query(
+        None, gt=0,
+        description="Reject samples more than this many metres from each stream's own median before analysis",
+    ),
+) -> JSONResponse:
+    """Karhunen-Loeve (network PCA) decomposition — see analysis.kle.
+
+    Alongside each mode's spatial loadings, also returns its reconstructed
+    time series (via kle.reconstruct_mode) — downsampled the same way
+    /api/positions is, since it's on the same dense 1 Hz grid — so the SPA
+    can show what a mode actually looks like in time, not just which streams
+    it's concentrated in.
+    """
+    from earthscope_positions.analysis import kle
+
+    geosncl_list, start_dt, end_dt, err = _parse_analysis_request(geosncls, start, end)
+    if err is not None:
+        return err
+
+    dense = await _load_dense_component(geosncl_list, component, start_dt, end_dt, outlier_m=outlier_m)
+    loop = asyncio.get_event_loop()
+
+    def _compute() -> tuple[dict, list[list[float | None]], np.ndarray, int]:
+        result = kle.karhunen_loeve(dense, n_modes=min(n_modes, len(geosncl_list)))
+        geosncls_sorted = result["geosncls"]
+        n_t = len(dense[geosncls_sorted[0]]) if geosncls_sorted else 0
+        indices = np.arange(n_t)
+        factor = 1
+        if n_t > max_points:
+            factor = max(1, n_t // max_points)
+            indices = indices[::factor][:max_points]
+        mode_series: list[list[float | None]] = []
+        for k in range(result["n_modes"]):
+            pc = kle.reconstruct_mode(dense, geosncls_sorted, result["loadings"][k])
+            sub = pc[indices]
+            mode_series.append([None if np.isnan(v) else float(v) for v in sub])
+        return result, mode_series, indices, factor
+
+    result, mode_series, indices, factor = await loop.run_in_executor(_executor, _compute)
+
+    start_ms = int(start_dt.timestamp() * 1000)
+    result["modeTimes"] = (start_ms + 1000 * indices).tolist()
+    result["modeSeries"] = mode_series
+    result["modeDownsampleFactor"] = factor
+    result["component"] = component
+    result["start"] = start
+    result["end"] = end
+    _log.info(
+        "[kle] %d stream(s), %s, %s -> %s: mode 1 explains %.1f%%",
+        len(geosncl_list), component, start, end,
+        result["variance_explained_pct"][0] if result["variance_explained_pct"] else 0.0,
+    )
+    return JSONResponse(result)
+
+
+@app.get("/api/pca")
+async def api_pca(
+    geosncls: str = Query(..., description="Comma-separated geosncl codes (2 or more)"),
+    start: str = Query(...),
+    end: str = Query(...),
+    component: str = Query("east", pattern="^(east|north|up)$"),
+    n_modes: int = Query(5, ge=1, le=20),
+    max_points: int = Query(2000, ge=100, le=20000),
+    outlier_m: float | None = Query(
+        None, gt=0,
+        description="Reject samples more than this many metres from each stream's own median before analysis",
+    ),
+) -> JSONResponse:
+    """Classical PCA (network decomposition) — see analysis.pca.
+
+    Sibling of /api/kle: same response shape (variance_explained_pct,
+    loadings, modeTimes/modeSeries), but built only from epochs where every
+    selected stream has simultaneous data (n_complete_epochs), rather than
+    KLE's pairwise-complete covariance — see analysis/pca.py for why that
+    tradeoff exists.
+    """
+    from earthscope_positions.analysis import pca as pca_mod
+
+    geosncl_list, start_dt, end_dt, err = _parse_analysis_request(geosncls, start, end)
+    if err is not None:
+        return err
+
+    dense = await _load_dense_component(geosncl_list, component, start_dt, end_dt, outlier_m=outlier_m)
+    loop = asyncio.get_event_loop()
+    start_ms = int(start_dt.timestamp() * 1000)
+
+    def _compute() -> tuple[dict, list[list[float | None]], list[int], int]:
+        result = pca_mod.principal_component_analysis(dense, n_modes=min(n_modes, len(geosncl_list)))
+        if not result["mode_series"]:
+            result.pop("mode_series")
+            return result, [], [], 1
+
+        # Unlike KLE (whose reconstructed mode is defined almost everywhere via
+        # weighted least squares), PCA's mode is only defined at the epochs
+        # where every stream overlapped — often a small, scattered fraction of
+        # the requested range with 10s of streams.  Downsampling by striding
+        # the *full* grid (as /api/kle does) can easily land every sampled
+        # point outside that fraction, making the chart look empty even
+        # though n_complete_epochs > 0.  So sample from the valid subset
+        # itself, and mark real gaps (not just "not sampled this time")
+        # with an explicit None so the chart doesn't draw a straight line
+        # across a stretch the network never fully covered.
+        valid_idx = np.where(~np.isnan(result["mode_series"][0]))[0]
+        factor = 1
+        if len(valid_idx) > max_points:
+            factor = max(1, len(valid_idx) // max_points)
+            valid_idx = valid_idx[::factor][:max_points]
+
+        gap_thresh = max(3 * factor, 3)
+        times_ms: list[int] = []
+        mode_series: list[list[float | None]] = [[] for _ in result["mode_series"]]
+        prev_idx: int | None = None
+        for idx in valid_idx.tolist():
+            if prev_idx is not None and idx - prev_idx > gap_thresh:
+                times_ms.append(start_ms + 1000 * ((prev_idx + idx) // 2))
+                for series in mode_series:
+                    series.append(None)
+            times_ms.append(start_ms + 1000 * idx)
+            for k, arr in enumerate(result["mode_series"]):
+                v = arr[idx]
+                mode_series[k].append(None if np.isnan(v) else float(v))
+            prev_idx = idx
+
+        result.pop("mode_series")
+        return result, mode_series, times_ms, factor
+
+    result, mode_series, times_ms, factor = await loop.run_in_executor(_executor, _compute)
+
+    result["modeTimes"] = times_ms
+    result["modeSeries"] = mode_series
+    result["modeDownsampleFactor"] = factor
+    result["component"] = component
+    result["start"] = start
+    result["end"] = end
+    _log.info(
+        "[pca] %d stream(s), %s, %s -> %s: %d complete epoch(s), mode 1 explains %.1f%%",
+        len(geosncl_list), component, start, end, result["n_complete_epochs"],
+        result["variance_explained_pct"][0] if result["variance_explained_pct"] else 0.0,
+    )
+    return JSONResponse(result)
+
+
+@app.get("/api/positions/common-mode-removed")
+async def api_positions_common_mode_removed(
+    geosncls: str = Query(..., description="Comma-separated geosncl codes (2 or more)"),
+    start: str = Query(...),
+    end: str = Query(...),
+    method: str = Query("kle", pattern="^(kle|pca)$"),
+    n_modes_removed: int = Query(1, ge=1, le=5),
+    max_points: int = Query(2000, ge=100, le=20000),
+    downsample: bool = Query(True),
+    outlier_m: float | None = Query(
+        None, gt=0,
+        description="Reject samples more than this many metres from each stream's own median before analysis",
+    ),
+) -> JSONResponse:
+    """Each selected stream's East/North/Up series with the leading common
+    mode(s) removed (independently per component), via either KLE
+    (kle.common_mode_removed) or classical PCA (pca.pca_common_mode_removed —
+    see analysis/pca.py for why PCA leaves epochs unmodified wherever the
+    whole network doesn't overlap).  Same response shape as /api/positions
+    so the frontend can plot it the same way."""
+    from earthscope_positions.analysis import kle
+    from earthscope_positions.analysis import pca as pca_mod
+
+    geosncl_list, start_dt, end_dt, err = _parse_analysis_request(geosncls, start, end)
+    if err is not None:
+        return err
+
+    start_ms = int(start_dt.timestamp() * 1000)
+    end_ms = int(end_dt.timestamp() * 1000)
+    components = ("east", "north", "up")
+
+    dense_by_comp = {
+        comp: await _load_dense_component(geosncl_list, comp, start_dt, end_dt, outlier_m=outlier_m)
+        for comp in components
+    }
+
+    loop = asyncio.get_event_loop()
+
+    def _decompose() -> tuple[dict[str, list[float]], dict[str, dict[str, np.ndarray]], dict[str, int]]:
+        variance_explained: dict[str, list[float]] = {}
+        residuals_by_comp: dict[str, dict[str, np.ndarray]] = {}
+        n_complete_epochs: dict[str, int] = {}
+        for comp in components:
+            dense = dense_by_comp[comp]
+            n_modes = min(n_modes_removed, len(geosncl_list))
+            if method == "pca":
+                pca_result = pca_mod.principal_component_analysis(dense, n_modes=n_modes)
+                variance_explained[comp] = pca_result["variance_explained_pct"]
+                residuals_by_comp[comp] = pca_mod.pca_common_mode_removed(dense, n_modes_removed=n_modes)
+                n_complete_epochs[comp] = pca_result["n_complete_epochs"]
+            else:
+                kle_result = kle.karhunen_loeve(dense, n_modes=n_modes)
+                variance_explained[comp] = kle_result["variance_explained_pct"]
+                residuals_by_comp[comp] = kle.common_mode_removed(dense, n_modes_removed=n_modes)
+        return variance_explained, residuals_by_comp, n_complete_epochs
+
+    variance_explained, residuals_by_comp, n_complete_epochs = await loop.run_in_executor(_executor, _decompose)
+
+    n_grid = max(0, (end_ms - start_ms) // 1000)
+    grid_times = (start_ms + 1000 * np.arange(n_grid)) if n_grid else np.array([], dtype=np.int64)
+
+    indices = np.arange(n_grid)
+    factor = 1
+    if downsample and n_grid > max_points:
+        factor = max(1, n_grid // max_points)
+        indices = indices[::factor][:max_points]
+
+    def _nullable(arr: np.ndarray) -> list[float | None]:
+        sub = arr[indices]
+        return [None if np.isnan(v) else float(v) for v in sub]
+
+    stations = [
+        {
+            "geosncl": g,
+            "times": grid_times[indices].tolist(),
+            "east":  _nullable(residuals_by_comp["east"][g]),
+            "north": _nullable(residuals_by_comp["north"][g]),
+            "up":    _nullable(residuals_by_comp["up"][g]),
+            "downsampleFactor": factor,
+        }
+        for g in geosncl_list
+    ]
+
+    response: dict = {
+        "stations": stations,
+        "nModesRemoved": n_modes_removed,
+        "method": method,
+        "varianceExplainedPct": variance_explained,
+    }
+    if method == "pca":
+        response["nCompleteEpochs"] = n_complete_epochs
+    return JSONResponse(response)
 
 
 # ── /api/fetch-missing ────────────────────────────────────────────────────────
@@ -1775,11 +2236,12 @@ def _safe_plots_path(rel: str) -> pathlib.Path | None:
 class _SavePlotBody(BaseModel):
     filename: str
     data_url: str  # "data:image/png;base64,...."
+    folder: str = "positions"  # slash-separated relative path under data/plots/, e.g. "coherence" or "positions/kle"
 
 
 @app.post("/api/plots/save")
 async def api_plots_save(body: _SavePlotBody) -> JSONResponse:
-    """Save a client-rendered PNG under data/plots/positions/ (shows in File Plots)."""
+    """Save a client-rendered PNG under data/plots/<folder>/ (shows in File Plots)."""
     import base64
 
     name = pathlib.Path(body.filename).name  # strip any directory components
@@ -1796,7 +2258,11 @@ async def api_plots_save(body: _SavePlotBody) -> JSONResponse:
     except Exception:
         return JSONResponse({"error": "Invalid image data"}, status_code=400)
 
-    out_dir = _plots_root() / "positions"
+    segments = [re.sub(r"[^A-Za-z0-9_-]", "", seg)[:40] for seg in body.folder.split("/")]
+    segments = [s for s in segments if s] or ["positions"]
+    out_dir = _plots_root()
+    for seg in segments:
+        out_dir = out_dir / seg
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / name
     out_path.write_bytes(raw)
@@ -2224,6 +2690,59 @@ def _ppsd_label_and_slug(
     return label, _ppsd_slugify(label)
 
 
+# ── PPSD common-mode removal ──────────────────────────────────────────────────
+#
+# The shared-noise source (clock/orbit products) is the same for every stream
+# processed by the same center with the same solution/software — i.e. exactly
+# the "by-center-solution" grouping, regardless of which *display* mode the
+# PPSDs are being rendered in.  So CMR is always computed at that (center,
+# sol_type) granularity, once per run, and the resulting residuals are then
+# merged however the requested display `mode` groups streams together.
+#
+# This can't reuse the per-file sparse PPSD cache (*_ppsd.arrow* sidecars) —
+# that cache holds the *raw* per-file histogram, reused across every possible
+# grouping; a CMR residual is a different signal depending on which subgroup
+# it was computed against, so writing it there would corrupt the raw cache
+# for every other (non-CMR) read.  What *is* still cached is the expensive
+# part — the raw arrow reads underlying the residual computation — via the
+# existing `_table_cache` used by `_load_filtered_table`/`_load_dense_component`.
+
+_PPSD_CMR_MIN_STREAMS = 2  # below this, a subgroup has no common mode to remove
+
+
+async def _compute_ppsd_cmr_residuals(
+    subgroup_members: dict[str, list[str]],
+    start_dt: dt.datetime, end_dt: dt.datetime,
+    n_modes_removed: int,
+    method: str,
+) -> dict[str, dict[str, dict[str, np.ndarray]]]:
+    """Common-mode-removed E/N/U residuals for every (center, sol_type)
+    subgroup with >= _PPSD_CMR_MIN_STREAMS members, over the full requested
+    range, via either KLE or classical PCA (*method*).  Subgroups with a
+    single member are omitted entirely — callers fall back to that member's
+    raw per-file cache instead.  A PCA subgroup that never has every member
+    overlapping simultaneously behaves the same way (pca_common_mode_removed
+    returns the residual unchanged), so it doesn't need special-casing here.
+
+    Returns {subgroup_key: {component: {geosncl: residual_array}}}.
+    """
+    from earthscope_positions.analysis import kle as kle_mod
+    from earthscope_positions.analysis import pca as pca_mod
+
+    out: dict[str, dict[str, dict[str, np.ndarray]]] = {}
+    for key, members in subgroup_members.items():
+        if len(members) < _PPSD_CMR_MIN_STREAMS:
+            continue
+        out[key] = {}
+        for comp in ("east", "north", "up"):
+            dense = await _load_dense_component(members, comp, start_dt, end_dt)
+            if method == "pca":
+                out[key][comp] = pca_mod.pca_common_mode_removed(dense, n_modes_removed=n_modes_removed)
+            else:
+                out[key][comp] = kle_mod.common_mode_removed(dense, n_modes_removed=n_modes_removed)
+    return out
+
+
 @app.get("/api/ppsd/run")
 async def api_ppsd_run(
     lists: list[str] = Query([]),
@@ -2234,6 +2753,9 @@ async def api_ppsd_run(
     sol_types: str = Query(""),  # comma-sep combined 2-char codes; empty = all
     sol_labels: str = Query(""),     # JSON {code: label} from the SPA enumeration
     center_labels: str = Query(""),  # JSON {code: label}
+    cmr: bool = Query(False, description="Remove common mode(s) before computing"),
+    cmr_method: str = Query("kle", pattern="^(kle|pca)$"),
+    n_modes_removed: int = Query(1, ge=1, le=10),
 ) -> StreamingResponse:
     def _sse(obj: dict) -> str:
         return f"data: {json.dumps(obj)}\n\n"
@@ -2299,11 +2821,15 @@ async def api_ppsd_run(
             yield _sse({"type": "done", "code": 1})
             return
 
-        # Build non-empty groups — skip combinations with zero files
+        # Build non-empty groups — skip combinations with zero files.  Each
+        # group also tracks its member geosncls (not just their files) so the
+        # CMR path below can route each stream to its (center, sol_type)
+        # residual independently of how this display mode merges them.
         if mode == "by-stream":
-            groups = [(gs, files) for gs, files in sorted(gs_files.items())]
+            groups = [(gs, files, [gs]) for gs, files in sorted(gs_files.items())]
         else:
             group_map: dict[str, list[pathlib.Path]] = {}
+            group_members: dict[str, list[str]] = {}
             skipped_geosncls: list[str] = []
             for gs, files in gs_files.items():
                 key = _ppsd_group_key(gs, mode)
@@ -2311,7 +2837,11 @@ async def api_ppsd_run(
                     skipped_geosncls.append(gs)
                     continue
                 group_map.setdefault(key, []).extend(files)
-            groups = [(k, sorted(v)) for k, v in sorted(group_map.items())]
+                group_members.setdefault(key, []).append(gs)
+            groups = [
+                (k, sorted(group_map[k]), sorted(group_members[k]))
+                for k in sorted(group_map)
+            ]
 
         n_groups = len(groups)
 
@@ -2322,45 +2852,147 @@ async def api_ppsd_run(
 
         from earthscope_positions.export import ppsd_writer
 
-        all_files = sorted({f for _, files in groups for f in files})
+        all_files = sorted({f for _, files, _ in groups for f in files})
         yield _sse({"type": "log", "msg":
-            f"{n_groups} group(s), {len(all_files)} file(s)  ({start} → {end})"})
+            f"{n_groups} group(s), {len(all_files)} file(s)  ({start} → {end})"
+            + (f"  · common-mode removed ({cmr_method.upper()})" if cmr else "")})
 
         loop = asyncio.get_event_loop()
         output_root = paths.plots_dir() / "ppsd"
         date_range = f"{start}_{end}"
         written_total = 0
 
-        for i, (key, files) in enumerate(groups):
+        # ── Common-mode removal precompute (once per run, shared by every
+        # display group — see _compute_ppsd_cmr_residuals for why the
+        # subgroup boundary is always by-center-solution) ──────────────────
+        cmr_residuals: dict[str, dict[str, dict[str, np.ndarray]]] = {}
+        if cmr:
+            subgroup_members: dict[str, list[str]] = {}
+            for gs in gs_files:
+                skey = _ppsd_group_key(gs, "by-center-solution")
+                if skey is not None:
+                    subgroup_members.setdefault(skey, []).append(gs)
+            n_multi = sum(1 for m in subgroup_members.values() if len(m) >= _PPSD_CMR_MIN_STREAMS)
+            n_solo = len(subgroup_members) - n_multi
+            yield _sse({"type": "log", "msg":
+                f"Computing {cmr_method.upper()} common mode over {n_multi} center+solution subgroup(s)"
+                + (f" ({n_solo} single-stream subgroup(s) use raw data — nothing to remove)" if n_solo else "")
+                + "…"})
+            start_analysis_dt = dt.datetime.combine(start_date, dt.time.min, tzinfo=_UTC)
+            end_analysis_dt = dt.datetime.combine(end_date + dt.timedelta(days=1), dt.time.min, tzinfo=_UTC)
+            cmr_residuals = await _compute_ppsd_cmr_residuals(
+                subgroup_members, start_analysis_dt, end_analysis_dt, n_modes_removed, cmr_method,
+            )
+
+        for i, (key, files, member_geosncls) in enumerate(groups):
             label, slug = _ppsd_label_and_slug(key, mode, sol_label_map, center_label_map)
+            if cmr:
+                # Distinguish common-mode-removed output from raw runs of the
+                # same group — otherwise they'd land in the same ppsd-<slug>/
+                # folder with only the date range telling them apart.
+                slug = f"{slug}-cmr-{cmr_method}-{n_modes_removed}"
+                label = f"{label} (CMR: {cmr_method.upper()}×{n_modes_removed})"
             title_prefix = "" if mode == "by-stream" else "Combined"
 
             yield _sse({"type": "progress",
                         "msg": f"({i + 1}/{n_groups}) : Generating {label}",
                         "current": i + 1, "total": n_groups})
 
-            # Load / compute caches for this group in parallel (20 workers)
-            futs = [
-                asyncio.ensure_future(loop.run_in_executor(_ppsd_pool, ppsd_writer.ensure_ppsd_cache, f))
-                for f in files
-            ]
-            n_loaded = 0
-            n_files = len(files)
-            for coro in asyncio.as_completed(futs):
-                try:
-                    await coro
-                except Exception as exc:
-                    yield _sse({"type": "error", "msg": f"  cache error: {exc}"})
-                n_loaded += 1
-                yield _sse({"type": "log", "msg": f"\tLoaded {n_loaded} / {n_files}."})
+            if not cmr:
+                # Unchanged raw path: per-file sparse cache, reused across runs.
+                futs = [
+                    asyncio.ensure_future(loop.run_in_executor(_ppsd_pool, ppsd_writer.ensure_ppsd_cache, f))
+                    for f in files
+                ]
+                n_loaded = 0
+                n_files = len(files)
+                for coro in asyncio.as_completed(futs):
+                    try:
+                        await coro
+                    except Exception as exc:
+                        yield _sse({"type": "error", "msg": f"  cache error: {exc}"})
+                    n_loaded += 1
+                    yield _sse({"type": "log", "msg": f"\tLoaded {n_loaded} / {n_files}."})
 
-            def _render(files=files, label=label, slug=slug, title_prefix=title_prefix):
-                from earthscope_positions.export import ppsd_writer as pw
-                return pw.write_ppsd_from_caches(
-                    files, output_root,
-                    label=label, mode=mode, date_range=date_range,
-                    slug=slug, title_prefix=title_prefix,
-                )
+                def _render(files=files, label=label, slug=slug, title_prefix=title_prefix):
+                    from earthscope_positions.export import ppsd_writer as pw
+                    return pw.write_ppsd_from_caches(
+                        files, output_root,
+                        label=label, mode=mode, date_range=date_range,
+                        slug=slug, title_prefix=title_prefix,
+                    )
+            else:
+                # CMR path: members whose (center, sol_type) subgroup had >= 2
+                # streams use the precomputed residual directly (bypassing the
+                # per-file cache — see _compute_ppsd_cmr_residuals); members in
+                # a single-stream subgroup have nothing to remove and fall
+                # back to the raw per-file cache, same as the non-CMR path.
+                cmr_members = [
+                    gs for gs in member_geosncls
+                    if _ppsd_group_key(gs, "by-center-solution") in cmr_residuals
+                ]
+                fallback_members = [gs for gs in member_geosncls if gs not in cmr_members]
+                fallback_files = [f for gs in fallback_members for f in gs_files.get(gs, [])]
+
+                if fallback_files:
+                    futs = [
+                        asyncio.ensure_future(loop.run_in_executor(_ppsd_pool, ppsd_writer.ensure_ppsd_cache, f))
+                        for f in fallback_files
+                    ]
+                    n_loaded = 0
+                    n_files_fb = len(fallback_files)
+                    for coro in asyncio.as_completed(futs):
+                        try:
+                            await coro
+                        except Exception as exc:
+                            yield _sse({"type": "error", "msg": f"  cache error: {exc}"})
+                        n_loaded += 1
+                        yield _sse({"type": "log", "msg": f"\tLoaded {n_loaded} / {n_files_fb} (raw fallback)."})
+
+                yield _sse({"type": "log", "msg":
+                    f"\t{len(cmr_members)} stream(s) common-mode removed, "
+                    f"{len(fallback_members)} using raw data."})
+
+                def _render(
+                    member_geosncls=member_geosncls, cmr_members=cmr_members,
+                    fallback_files=fallback_files, label=label, slug=slug,
+                    title_prefix=title_prefix,
+                ):
+                    from earthscope_positions.export import ppsd_writer as pw
+
+                    hist_e = np.zeros((pw.N_PERIOD_BINS, pw.N_POWER_BINS), dtype=np.int64)
+                    hist_n = np.zeros((pw.N_PERIOD_BINS, pw.N_POWER_BINS), dtype=np.int64)
+                    hist_u = np.zeros((pw.N_PERIOD_BINS, pw.N_POWER_BINS), dtype=np.int64)
+                    total_frames = 0
+
+                    for gs in cmr_members:
+                        skey = _ppsd_group_key(gs, "by-center-solution")
+                        for comp, hist in (("east", hist_e), ("north", hist_n), ("up", hist_u)):
+                            arr = cmr_residuals.get(skey, {}).get(comp, {}).get(gs)
+                            if arr is None:
+                                continue
+                            frames = pw.accumulate_ppsd(arr, hist)
+                            if comp == "east":
+                                total_frames += frames
+
+                    if fallback_files:
+                        tables = [t for f in fallback_files if (t := pw.load_ppsd_cache(f)) is not None]
+                        if tables:
+                            fb_e, fb_n, fb_u, fb_frames = pw.merge_sparse_tables(tables)
+                            hist_e += fb_e
+                            hist_n += fb_n
+                            hist_u += fb_u
+                            total_frames += fb_frames
+
+                    if total_frames == 0:
+                        return None
+
+                    n_files_total = sum(len(gs_files.get(gs, [])) for gs in member_geosncls)
+                    return pw.render_ppsd_from_histograms(
+                        hist_e, hist_n, hist_u, total_frames, n_files_total,
+                        output_root, label=label, mode=mode, date_range=date_range,
+                        slug=slug, title_prefix=title_prefix,
+                    )
 
             try:
                 p: pathlib.Path | None = await loop.run_in_executor(_executor, _render)

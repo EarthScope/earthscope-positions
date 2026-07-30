@@ -169,6 +169,67 @@ const HELP: Record<string, HelpEntry> = {
       <ul>
         <li>Charts below show frequency content per component (periods 5&nbsp;min to full-record length)</li>
         <li>Y-axis is in scientific notation (m²/Hz)</li>
+      </ul>
+      <div class="help-section-label">Coherence</div>
+      <ul>
+        <li>Select 2 or more streams, then click <strong>Coherence</strong> to see how much
+            signal each pair shares, as a function of period — quantifies "common-mode"
+            noise from shared processing software/clocks or nearby geography</li>
+        <li>Top plot: coherence vs. period, one line per pair (legend hidden past 40 pairs);
+            bottom plot: a density heatmap — for each period, the fraction of pairs
+            whose coherence falls in each 0.05-wide bin (color = pair density, not
+            any one pair's value) — hover either for exact values</li>
+        <li>No cap on stream count — coherence is pairwise (N² pairs), so very large
+            selections can take noticeably longer to compute and render</li>
+        <li>Always computed fresh from full-resolution data for exactly the current
+            selection — not the (possibly downsampled) chart cache — so it gives the
+            same result whether streams were added one at a time or via Select All</li>
+        <li>Defaults to the East component; switch via the radio buttons at the top</li>
+      </ul>
+      <div class="help-section-label">Karhunen-Loève decomposition</div>
+      <ul>
+        <li>Click <strong>Karhunen-Loève</strong> for a network PCA: each mode is a
+            signal shared across the selection, ranked by how much of the total
+            variance it explains, with a per-stream loading showing how strongly
+            (and in which direction) each one participates</li>
+        <li>East, North, and Up are decomposed independently and shown together —
+            one clustered bar per mode/stream per component, one line per component —
+            all using the same East/North/Up color throughout the popup</li>
+        <li>Pick a mode to see its own reconstructed time series (what the shared
+            signal actually looks like) alongside its spatial loadings, for all
+            three components at once</li>
+        <li>Builds its covariance matrix pairwise-complete, so every stream
+            contributes even where the network's gaps don't align — see
+            <strong>Principal Component Analysis</strong> for the exact-but-stricter
+            sibling method</li>
+        <li>Mode&nbsp;1 — the dominant common mode — is what <strong>Common mode</strong>
+            below can subtract</li>
+      </ul>
+      <div class="help-section-label">Principal Component Analysis (PCA)</div>
+      <ul>
+        <li>Click <strong>PCA</strong> for the classical sibling of Karhunen-Loève:
+            same variance-explained / mode-series / loadings layout — East, North, and
+            Up together, same colors — but built only from epochs where
+            <strong>every</strong> selected stream has simultaneous data — an exact
+            decomposition, at the cost of only speaking for the time span where the
+            whole network overlaps</li>
+        <li>If a component's streams never all overlap at once, that component
+            simply contributes no bars/line for it; if none of the three do, PCA has
+            nothing to decompose — use Karhunen-Loève instead for gappy,
+            loosely-overlapping networks</li>
+      </ul>
+      <div class="help-section-label">Common mode (None / PCA / KLE)</div>
+      <ul>
+        <li>Click <strong>Common mode: …</strong> to pick which method — if any —
+            removes the leading mode(s) before plotting a second East/North/Up set;
+            <strong>Modes to remove</strong> controls how many (1-5)</li>
+        <li>Computed independently per component, since the shared signal need not
+            look the same in East, North, and Up</li>
+        <li>Each stream keeps its own mean/offset — only the shared time-varying part
+            is removed, so it's a direct visual comparison against the originals</li>
+        <li>With PCA, any epoch where the network doesn't fully overlap is left as
+            raw data (no common-mode estimate exists there) — KLE instead estimates
+            through those gaps using whichever streams are available</li>
       </ul>`,
   },
   "/ppsd": {
@@ -189,10 +250,23 @@ const HELP: Record<string, HelpEntry> = {
         <li><strong>By Center × Solution</strong> — one plot per center+solution combination</li>
         <li><strong>By Stream</strong> — one plot per individual stream</li>
       </ul>
+      <div class="help-section-label">Common mode (None / PCA / KLE)</div>
+      <ul>
+        <li>Optionally remove the leading PCA or KLE common mode(s) before computing
+            each PSD — set <strong>Modes to remove</strong> when enabled</li>
+        <li>Always computed per processing-center + solution/software subgroup (the
+            shared source of clock/orbit corrections), regardless of which grouping
+            mode above is used for the final plots</li>
+        <li>Subgroups with only one stream have nothing to remove and use raw data;
+            with PCA, a subgroup also needs its streams to overlap simultaneously —
+            where they don't, raw data is used there too</li>
+      </ul>
       <div class="help-section-label">Performance</div>
       <ul>
         <li>Cache files are built on first run; subsequent runs on the same data are nearly instant</li>
         <li>Pre-compute caches offline with <code>es-pos process ppsd</code></li>
+        <li>Common-mode removal bypasses that cache (its result depends on which
+            streams are grouped together), so it's recomputed each run</li>
       </ul>`,
   },
   "/plots": {

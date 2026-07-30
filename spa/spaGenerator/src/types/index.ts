@@ -50,6 +50,96 @@ export interface PositionsResponse {
   stations: PositionTrace[];
 }
 
+// ─── Coherence ────────────────────────────────────────────────────────────────
+
+export interface CoherencePair {
+  a: string;
+  b: string;
+  /** Same length/order as CoherenceResponse.frequencies. */
+  coherence: number[];
+}
+
+export interface CoherenceResponse {
+  geosncls: string[];
+  /** Shared log-spaced frequency axis (Hz) for every pair. */
+  frequencies: number[];
+  n_valid: Record<string, number>;
+  n_total: number;
+  pairs_skipped: [string, string, string][];
+  pairs: CoherencePair[];
+  component: "east" | "north" | "up";
+  start: string;
+  end: string;
+}
+
+// ─── Karhunen-Loeve (network PCA) ───────────────────────────────────────────
+
+export interface KleResponse {
+  geosncls: string[];
+  means: Record<string, number>;
+  n_modes: number;
+  eigenvalues: number[];
+  variance_explained_pct: number[];
+  /** n_modes x geosncls.length — loadings[k][i] is stream i's participation in mode k. */
+  loadings: number[][];
+  min_pair_overlap: number;
+  /** Shared epoch-ms axis for every mode's reconstructed series below. */
+  modeTimes: number[];
+  /** n_modes x modeTimes.length — modeSeries[k] is mode k's reconstructed time series. */
+  modeSeries: (number | null)[][];
+  modeDownsampleFactor: number;
+  component: "east" | "north" | "up";
+  start: string;
+  end: string;
+}
+
+// ─── Classical PCA (network decomposition) ──────────────────────────────────
+//
+// Sibling of KLE: same shape, but built only from epochs where every stream
+// has simultaneous data (n_complete_epochs instead of min_pair_overlap) —
+// see analysis/pca.py for why that tradeoff exists.
+
+export interface PcaResponse {
+  geosncls: string[];
+  means: Record<string, number>;
+  n_modes: number;
+  eigenvalues: number[];
+  variance_explained_pct: number[];
+  /** n_modes x geosncls.length — loadings[k][i] is stream i's participation in mode k. */
+  loadings: number[][];
+  n_complete_epochs: number;
+  /** Shared epoch-ms axis for every mode's reconstructed series below. */
+  modeTimes: number[];
+  /** n_modes x modeTimes.length — NaN (null) outside the complete epochs. */
+  modeSeries: (number | null)[][];
+  modeDownsampleFactor: number;
+  component: "east" | "north" | "up";
+  start: string;
+  end: string;
+}
+
+export type CmrMethod = "none" | "pca" | "kle";
+
+// ─── Common-mode-removed positions ─────────────────────────────────────────
+
+export interface CommonModeRemovedTrace {
+  geosncl: string;
+  times: number[];
+  east: (number | null)[];
+  north: (number | null)[];
+  up: (number | null)[];
+  downsampleFactor: number;
+}
+
+export interface CommonModeRemovedResponse {
+  stations: CommonModeRemovedTrace[];
+  nModesRemoved: number;
+  method: "kle" | "pca";
+  varianceExplainedPct: { east: number[]; north: number[]; up: number[] };
+  /** Only present when method === "pca". */
+  nCompleteEpochs?: { east: number; north: number; up: number };
+}
+
 // ─── Fetch-missing SSE events ─────────────────────────────────────────────────
 
 export interface FetchEvent {
