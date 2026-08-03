@@ -8,8 +8,8 @@ Usage:
   es-pos stations get radial --latitude 37.5 --longitude -122.0 --distance 100 -o bay_area
   es-pos stations filter -i ShakeAlert -o ShakeAlert.clean --facility JPL
 
-  es-pos fetch get -i ShakeAlert.clean --start 2026-01-01 --end 2026-04-01
-  es-pos fetch concat data/arrow/P548.CI.LY_.20/202501/*.arrow -o merged.arrow
+  es-pos fetch --list ShakeAlert.clean --start 2026-01-01 --end 2026-04-01
+  es-pos fetch --retry --result error-422
 
   es-pos process completeness
   es-pos process completeness --overwrite --data-directory /custom/data
@@ -73,7 +73,7 @@ def _build_top_parser() -> tuple[
 Typical workflow:
   1.  es-pos stations get datasource --network-name SHAKE:ShakeAlert -o ShakeAlert
       (or use the Station Builder tab in the web UI)
-  2.  es-pos fetch get -i ShakeAlert --start 2026-01-01 --end 2026-04-01
+  2.  es-pos fetch --list ShakeAlert --start 2026-01-01 --end 2026-04-01
   3.  es-pos process completeness        (speeds up the web UI)
   4.  es-pos webserver                   (open http://localhost:8000)
 
@@ -258,7 +258,7 @@ Web UI tabs:
     (<data-dir>/coordinates.csv, seeded from resources/coordinates.csv).
     Click or rectangle-drag to select stations; filter by processing center
     and PPP solution type; save selections as stream lists for use with
-    'es-pos fetch get'.  Update/Edit Coordinates add or change stations.
+    'es-pos fetch'.  Update/Edit Coordinates add or change stations.
 
   File Plots
     Browse and display PNG/JPEG plots from ./data/plots/, including PPSD

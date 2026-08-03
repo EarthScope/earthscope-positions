@@ -1949,7 +1949,7 @@ async def _fetch_missing_events(
 
             cmd = [
                 sys.executable, "-m", "earthscope_positions.fetch.positions_fetch",
-                "get", "-i", tf_path,
+                "--list", tf_path,
                 "--start", day_str, "--end", next_str,
                 "--workers", str(workers),
                 *_data_dir_args(),

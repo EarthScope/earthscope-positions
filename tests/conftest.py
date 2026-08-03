@@ -72,18 +72,14 @@ def project_tree(tmp_path, monkeypatch):
 
 @pytest.fixture
 def fake_token(monkeypatch):
-    """Make ``_ensure_token()`` / ``_ensure_token_for_worker()`` return a dummy token.
+    """Make ``_ensure_token()`` return a dummy token.
 
-    Only ``positions_fetch`` owns a token helper now; station discovery goes
-    through the SDK client (faked separately), and the radial search imports
-    ``positions_fetch._ensure_token`` at call time — so patching it here covers
-    both the fetch path and radial search.  Worker threads re-check the token
-    per task via ``_ensure_token_for_worker`` (see its docstring), so that must
-    be patched too or a test would fall through to reading real credentials
-    from disk.
+    ``positions_fetch._ensure_token`` is only used by radial search now (the
+    GNSS-position fetch path goes through AsyncEarthScopeClient instead,
+    faked separately per test_fetch.py's ``_FakeClient``) — station_list's
+    radial search imports it at call time, so patching it here covers that.
     """
     monkeypatch.setattr(positions_fetch, "_ensure_token", lambda: "test-token")
-    monkeypatch.setattr(positions_fetch, "_ensure_token_for_worker", lambda: "test-token")
     return "test-token"
 
 
@@ -155,31 +151,13 @@ def positions_arrow_bytes() -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# Spoof #1 — the positions REST API (requests-based) via `responses`.
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def mock_positions_api():
-    """Intercept ``requests.get`` to the positions endpoint.
-
-    Yields a ``responses.RequestsMock`` already scoped to the fetch module's
-    ``requests`` object.  Register canned replies with::
-
-        rsps.get(positions_fetch._API_BASE, body=arrow_bytes, status=200,
-                 content_type="application/vnd.apache.arrow.stream")
-
-    Any un-registered request raises, so tests can never silently hit the real
-    API.  Import lazily so `responses` stays a test-only dependency.
-    """
-    import responses
-
-    with responses.RequestsMock() as rsps:
-        yield rsps
-
-
-# ---------------------------------------------------------------------------
-# Spoof #2 — the earthscope-sdk discovery service, via a fake.
+# Spoof — the earthscope-sdk discovery service, via a fake.
+#
+# (positions_fetch's own GNSS-position fetch path now goes through
+# AsyncEarthScopeClient.data._get_gnss_instantaneous_positions — see
+# test_fetch.py's _FakeClient for how that's mocked. Radial search still has
+# no SDK method and makes a direct `requests` call; test_stations.py mocks
+# that with `responses` directly rather than a shared fixture.)
 # ---------------------------------------------------------------------------
 
 

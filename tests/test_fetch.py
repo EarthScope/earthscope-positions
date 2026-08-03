@@ -1,15 +1,21 @@
-"""Tests for position-data download — the REST API is spoofed with `responses`.
-
-``positions_fetch`` calls ``requests.get(_API_BASE, ...)`` directly, so every
-test here registers a canned reply on the ``mock_positions_api`` fixture; any
-un-registered request would raise, guaranteeing no real network access.
+"""Tests for position-data download — the EarthScope SDK's async client is
+spoofed with a minimal fake (_FakeClient), since positions_fetch now calls
+AsyncEarthScopeClient.data._get_gnss_instantaneous_positions directly rather
+than making its own HTTP requests.
 """
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
+import io
+import sys
+from unittest.mock import AsyncMock
 
+import httpx
 import orjson
+import pyarrow as pa
 import pytest
+from earthscope_sdk.auth.error import UnauthenticatedError
 
 from earthscope_positions.fetch import positions_fetch
 from conftest import make_positions_arrow
@@ -17,6 +23,7 @@ from conftest import make_positions_arrow
 _UTC = dt.timezone.utc
 _GEOSNCL = "P123.CI.LY_.20"
 _EDID = "01ABCDEF0123456789ABCDEFGH"
+_POSITIONS_URL = "https://api.earthscope.org/beta/data-products/gnss/positions/instantaneous/v2"
 
 
 def _day():
@@ -24,29 +31,59 @@ def _day():
     return start, start + dt.timedelta(days=1)
 
 
-def _register(rsps, **kwargs):
-    """Register one reply for the positions endpoint."""
-    rsps.get(positions_fetch._API_BASE, **kwargs)
+def _positions_table(n_rows: int, edid: str = _EDID) -> pa.Table:
+    """Build a table shaped like what the SDK actually returns: the raw
+    position rows plus an "edid" column (added by its load_table_with_extra —
+    see _fetch_one_day, which must drop that column again before writing)."""
+    raw = make_positions_arrow(n_rows, as_stream=True)
+    tbl = pa.ipc.open_stream(io.BytesIO(raw)).read_all()
+    return tbl.append_column("edid", pa.array([edid] * n_rows, type=pa.string()))
+
+
+def _http_status_error(status_code: int, detail: str = "") -> httpx.HTTPStatusError:
+    request = httpx.Request("GET", _POSITIONS_URL)
+    response = httpx.Response(
+        status_code,
+        json={"detail": detail} if detail else None,
+        request=request,
+    )
+    return httpx.HTTPStatusError(f"{status_code} error", request=request, response=response)
+
+
+class _FakeDataAccess:
+    def __init__(self):
+        self._get_gnss_instantaneous_positions = AsyncMock()
+
+
+class _FakeClient:
+    """Stand-in for AsyncEarthScopeClient: supports `async with` and exposes
+    `.data._get_gnss_instantaneous_positions` as a configurable AsyncMock —
+    set `.return_value` to a pyarrow.Table, or `.side_effect` to an exception,
+    per test."""
+
+    def __init__(self):
+        self.data = _FakeDataAccess()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return False
 
 
 # ---------------------------------------------------------------------------
-# _fetch_one_day — the single unit that makes an API call
+# _fetch_one_day — the single unit that calls the SDK
 # ---------------------------------------------------------------------------
 
 
-def test_fetch_ok_writes_arrow_file(project_tree, mock_positions_api):
+def test_fetch_ok_writes_arrow_file(project_tree):
     day_start, day_end = _day()
-    _register(
-        mock_positions_api,
-        body=make_positions_arrow(50),
-        status=200,
-        content_type="application/vnd.apache.arrow.stream",
-    )
+    client = _FakeClient()
+    client.data._get_gnss_instantaneous_positions.return_value = _positions_table(50)
 
-    status = positions_fetch._fetch_one_day(
-        "test-token", _EDID, _GEOSNCL, day_start, day_end,
-        force=False, redownload=False,
-    )
+    status = asyncio.run(positions_fetch._fetch_one_day(
+        client, _EDID, _GEOSNCL, day_start, day_end, force=False, redownload=False,
+    ))
 
     assert status == "ok"
     out = positions_fetch._arrow_path(
@@ -55,43 +92,32 @@ def test_fetch_ok_writes_arrow_file(project_tree, mock_positions_api):
     assert out.exists()
     tbl = positions_fetch._read_arrow_bytes(out.read_bytes())
     assert tbl is not None and tbl.num_rows == 50
+    # The SDK's added "edid" column must not leak into the on-disk schema.
+    assert "edid" not in tbl.schema.names
 
 
-def test_fetch_sends_expected_request(project_tree, mock_positions_api):
+def test_fetch_calls_sdk_with_expected_args(project_tree):
     day_start, day_end = _day()
-    _register(mock_positions_api, body=make_positions_arrow(1), status=200)
+    client = _FakeClient()
+    client.data._get_gnss_instantaneous_positions.return_value = _positions_table(1)
 
-    positions_fetch._fetch_one_day(
-        "secret-token", _EDID, _GEOSNCL, day_start, day_end,
-        force=False, redownload=False,
+    asyncio.run(positions_fetch._fetch_one_day(
+        client, _EDID, _GEOSNCL, day_start, day_end, force=False, redownload=False,
+    ))
+
+    client.data._get_gnss_instantaneous_positions.assert_awaited_once_with(
+        stream_edid=_EDID, start_datetime=day_start, end_datetime=day_end,
     )
 
-    req = mock_positions_api.calls[0].request
-    assert f"stream_id={_EDID}" in req.url
-    assert "start_datetime=2026-01-15" in req.url
-    assert req.headers["authorization"] == "Bearer secret-token"
 
-
-def test_fetch_stream_format_decodes(project_tree, mock_positions_api):
-    """The endpoint sends Arrow *stream* format; decode path must handle it."""
+def test_fetch_200_empty_body_is_no_data(project_tree):
     day_start, day_end = _day()
-    _register(mock_positions_api, body=make_positions_arrow(5, as_stream=True), status=200)
+    client = _FakeClient()
+    client.data._get_gnss_instantaneous_positions.return_value = _positions_table(0)
 
-    status = positions_fetch._fetch_one_day(
-        "test-token", _EDID, _GEOSNCL, day_start, day_end,
-        force=False, redownload=False,
-    )
-    assert status == "ok"
-
-
-def test_fetch_200_empty_body_is_no_data(project_tree, mock_positions_api):
-    day_start, day_end = _day()
-    _register(mock_positions_api, body=b"", status=200)
-
-    status = positions_fetch._fetch_one_day(
-        "test-token", _EDID, _GEOSNCL, day_start, day_end,
-        force=False, redownload=False,
-    )
+    status = asyncio.run(positions_fetch._fetch_one_day(
+        client, _EDID, _GEOSNCL, day_start, day_end, force=False, redownload=False,
+    ))
 
     assert status == "no-data"
     # A no-data marker should now suppress the date.
@@ -99,25 +125,25 @@ def test_fetch_200_empty_body_is_no_data(project_tree, mock_positions_api):
     assert "2026-01-15" in positions_fetch._load_no_data(gdir)
 
 
-def test_fetch_404_is_no_data(project_tree, mock_positions_api):
+def test_fetch_404_is_no_data(project_tree):
     day_start, day_end = _day()
-    _register(mock_positions_api, json={"detail": "not found"}, status=404)
+    client = _FakeClient()
+    client.data._get_gnss_instantaneous_positions.side_effect = _http_status_error(404, "not found")
 
-    status = positions_fetch._fetch_one_day(
-        "test-token", _EDID, _GEOSNCL, day_start, day_end,
-        force=False, redownload=False,
-    )
+    status = asyncio.run(positions_fetch._fetch_one_day(
+        client, _EDID, _GEOSNCL, day_start, day_end, force=False, redownload=False,
+    ))
     assert status == "no-data"
 
 
-def test_fetch_422_records_error_marker(project_tree, mock_positions_api):
+def test_fetch_422_records_error_marker(project_tree):
     day_start, day_end = _day()
-    _register(mock_positions_api, json={"detail": "bad request"}, status=422)
+    client = _FakeClient()
+    client.data._get_gnss_instantaneous_positions.side_effect = _http_status_error(422, "bad request")
 
-    status = positions_fetch._fetch_one_day(
-        "test-token", _EDID, _GEOSNCL, day_start, day_end,
-        force=False, redownload=False,
-    )
+    status = asyncio.run(positions_fetch._fetch_one_day(
+        client, _EDID, _GEOSNCL, day_start, day_end, force=False, redownload=False,
+    ))
 
     # Returns "no-data" (won't retry automatically) but marker records the error
     assert status == "no-data"
@@ -129,88 +155,83 @@ def test_fetch_422_records_error_marker(project_tree, mock_positions_api):
     assert "2026-01-15" not in positions_fetch._load_no_data(gdir)
 
 
-def test_fetch_500_is_retryable_error(project_tree, mock_positions_api):
+def test_fetch_500_is_retryable_error(project_tree):
     day_start, day_end = _day()
-    _register(mock_positions_api, json={"detail": "boom"}, status=503)
+    client = _FakeClient()
+    client.data._get_gnss_instantaneous_positions.side_effect = _http_status_error(503, "boom")
 
-    status = positions_fetch._fetch_one_day(
-        "test-token", _EDID, _GEOSNCL, day_start, day_end,
-        force=False, redownload=False,
-    )
+    status = asyncio.run(positions_fetch._fetch_one_day(
+        client, _EDID, _GEOSNCL, day_start, day_end, force=False, redownload=False,
+    ))
     assert status == "error-503"
 
 
-# ---------------------------------------------------------------------------
-# _run_parallel — per-task token refresh (a long job must not run for hours on
-# a token that expired partway through; a 401 from that must not be reported
-# as a permanent failure when the stream may well have real data).
-# ---------------------------------------------------------------------------
-
-
-def test_401_is_retried_with_a_refreshed_token(project_tree, mock_positions_api, monkeypatch):
+def test_auth_failure_exits_process(project_tree):
+    """UnauthenticatedError means the SDK's own refresh failed — every other
+    request this run would fail identically, so this is fatal, not retryable."""
     day_start, day_end = _day()
-    tokens_used: list[str] = []
+    client = _FakeClient()
+    client.data._get_gnss_instantaneous_positions.side_effect = UnauthenticatedError("expired")
 
-    def fake_ensure_token_for_worker() -> str:
-        # Simulate the startup token having expired mid-run: the first check
-        # still returns the stale token (matching the API's 401 below); every
-        # check after that returns a freshly "refreshed" one.
-        tok = "stale-token" if not tokens_used else "refreshed-token"
-        tokens_used.append(tok)
-        return tok
-
-    monkeypatch.setattr(
-        positions_fetch, "_ensure_token_for_worker", fake_ensure_token_for_worker
-    )
-
-    _register(mock_positions_api, json={"detail": "unauthorized"}, status=401)
-    _register(mock_positions_api, body=make_positions_arrow(10), status=200)
-
-    progress = positions_fetch._Progress(1)
-    task = (
-        "startup-token", _EDID, _GEOSNCL, day_start, day_end,
-        False, False, positions_fetch._MAX_RETRIES,
-    )
-    positions_fetch._run_parallel([task], 1, progress)
-
-    # The retry succeeded once the token was refreshed — not a permanent failure.
-    assert progress.ok == 1
-    assert progress.failed == 0
-    assert len(tokens_used) >= 2
-    assert mock_positions_api.calls[-1].request.headers["authorization"] == "Bearer refreshed-token"
+    with pytest.raises(SystemExit):
+        asyncio.run(positions_fetch._fetch_one_day(
+            client, _EDID, _GEOSNCL, day_start, day_end, force=False, redownload=False,
+        ))
 
 
-def test_fetch_skips_when_file_exists(project_tree, mock_positions_api):
-    """Second fetch is served from cache — no API call registered, none made."""
+def test_fetch_skips_when_file_exists(project_tree):
+    """Second fetch is served from cache — the SDK is called only once."""
     day_start, day_end = _day()
-    _register(mock_positions_api, body=make_positions_arrow(3), status=200)
+    client = _FakeClient()
+    client.data._get_gnss_instantaneous_positions.return_value = _positions_table(3)
 
-    first = positions_fetch._fetch_one_day(
-        "test-token", _EDID, _GEOSNCL, day_start, day_end,
-        force=False, redownload=False,
-    )
+    first = asyncio.run(positions_fetch._fetch_one_day(
+        client, _EDID, _GEOSNCL, day_start, day_end, force=False, redownload=False,
+    ))
     assert first == "ok"
 
-    second = positions_fetch._fetch_one_day(
-        "test-token", _EDID, _GEOSNCL, day_start, day_end,
-        force=False, redownload=False,
-    )
+    second = asyncio.run(positions_fetch._fetch_one_day(
+        client, _EDID, _GEOSNCL, day_start, day_end, force=False, redownload=False,
+    ))
     assert second == "skipped"
-    assert len(mock_positions_api.calls) == 1  # only the first hit the API
+    assert client.data._get_gnss_instantaneous_positions.await_count == 1
 
 
-def test_no_data_cached_skips_api(project_tree, mock_positions_api):
-    """A cached no-data date is skipped without an API call."""
+def test_no_data_cached_skips_api(project_tree):
+    """A cached no-data date is skipped without calling the SDK."""
     day_start, day_end = _day()
     gdir = positions_fetch._geosncl_dir(_GEOSNCL)
     positions_fetch._add_no_data(gdir, "2026-01-15", "no-data")
 
-    status = positions_fetch._fetch_one_day(
-        "test-token", _EDID, _GEOSNCL, day_start, day_end,
-        force=False, redownload=False,
-    )
+    client = _FakeClient()
+    status = asyncio.run(positions_fetch._fetch_one_day(
+        client, _EDID, _GEOSNCL, day_start, day_end, force=False, redownload=False,
+    ))
     assert status == "no-data-cached"
-    assert len(mock_positions_api.calls) == 0
+    client.data._get_gnss_instantaneous_positions.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# _run_parallel — the outer retry net for transient failures the SDK's own
+# internal retries didn't resolve.
+# ---------------------------------------------------------------------------
+
+
+def test_run_parallel_retries_transient_errors(project_tree):
+    day_start, day_end = _day()
+    client = _FakeClient()
+    client.data._get_gnss_instantaneous_positions.side_effect = [
+        _http_status_error(503, "boom"),
+        _positions_table(10),
+    ]
+
+    progress = positions_fetch._Progress(1)
+    task = (_EDID, _GEOSNCL, day_start, day_end, False, False, positions_fetch._MAX_RETRIES)
+    asyncio.run(positions_fetch._run_parallel([task], 1, progress, client))
+
+    assert progress.ok == 1
+    assert progress.failed == 0
+    assert client.data._get_gnss_instantaneous_positions.await_count == 2
 
 
 # ---------------------------------------------------------------------------
@@ -218,15 +239,17 @@ def test_no_data_cached_skips_api(project_tree, mock_positions_api):
 # ---------------------------------------------------------------------------
 
 
-def test_cmd_get_end_to_end(project_tree, fake_token, mock_positions_api):
+def test_cmd_get_end_to_end(project_tree, monkeypatch):
     # A station list file the command will read.
     sl = project_tree / "data" / "stream-lists" / "mylist.jsonl"
     sl.write_bytes(orjson.dumps({"geosncl": _GEOSNCL, "edid": _EDID}) + b"\n")
 
-    _register(mock_positions_api, body=make_positions_arrow(20), status=200)
+    client = _FakeClient()
+    client.data._get_gnss_instantaneous_positions.return_value = _positions_table(20)
+    monkeypatch.setattr(positions_fetch, "_make_client", lambda: client)
 
     args = _Namespace(
-        input=[str(sl)],
+        list=[str(sl)],
         start="2026-01-15",
         end="2026-01-16",
         force=False,
@@ -241,7 +264,7 @@ def test_cmd_get_end_to_end(project_tree, fake_token, mock_positions_api):
         dt.datetime(2026, 1, 16, tzinfo=_UTC),
     )
     assert out.exists()
-    assert len(mock_positions_api.calls) == 1
+    assert client.data._get_gnss_instantaneous_positions.await_count == 1
 
 
 class _Namespace:
@@ -249,3 +272,66 @@ class _Namespace:
 
     def __init__(self, **kw):
         self.__dict__.update(kw)
+
+
+# ---------------------------------------------------------------------------
+# CLI parser — one flat command (no get/retry/concat subcommands), --list
+# instead of -i/--input, --retry instead of a "retry" subcommand.
+# ---------------------------------------------------------------------------
+
+
+def test_parser_list_mode_defaults():
+    ap = positions_fetch._build_parser()
+    args = ap.parse_args(["--list", "ShakeAlert", "--start", "2026-01-01"])
+    assert args.list == ["ShakeAlert"]
+    assert args.retry is False
+    assert args.workers == positions_fetch._DEFAULT_WORKERS
+
+
+def test_parser_list_can_repeat():
+    ap = positions_fetch._build_parser()
+    args = ap.parse_args(["--list", "a", "--list", "b"])
+    assert args.list == ["a", "b"]
+
+
+def test_parser_retry_mode():
+    ap = positions_fetch._build_parser()
+    args = ap.parse_args(["--retry", "--result", "error-422", "--dry-run"])
+    assert args.retry is True
+    assert args.result == "error-422"
+    assert args.dry_run is True
+    assert args.list is None
+
+
+def test_parser_no_longer_has_concat_subcommand():
+    ap = positions_fetch._build_parser()
+    with pytest.raises(SystemExit):
+        ap.parse_args(["concat", "foo.arrow", "-o", "out.arrow"])
+    # The underlying code is kept around for later, just not CLI-exposed.
+    assert hasattr(positions_fetch, "_cmd_concat")
+    assert hasattr(positions_fetch, "_concat_dedup")
+
+
+def test_main_requires_list_or_retry(project_tree, monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["es-pos-fetch"])
+    with pytest.raises(SystemExit) as exc:
+        positions_fetch.main()
+    assert exc.value.code == 2
+
+
+def test_main_dispatches_to_retry(project_tree, monkeypatch):
+    called = {}
+    monkeypatch.setattr(sys, "argv", ["es-pos-fetch", "--retry", "--dry-run"])
+    monkeypatch.setattr(positions_fetch, "_cmd_retry", lambda args: called.setdefault("retry", args))
+    monkeypatch.setattr(positions_fetch, "_cmd_get", lambda args: called.setdefault("get", args))
+    positions_fetch.main()
+    assert "retry" in called and "get" not in called
+
+
+def test_main_dispatches_to_get(project_tree, monkeypatch):
+    called = {}
+    monkeypatch.setattr(sys, "argv", ["es-pos-fetch", "--list", "ShakeAlert"])
+    monkeypatch.setattr(positions_fetch, "_cmd_retry", lambda args: called.setdefault("retry", args))
+    monkeypatch.setattr(positions_fetch, "_cmd_get", lambda args: called.setdefault("get", args))
+    positions_fetch.main()
+    assert "get" in called and "retry" not in called
