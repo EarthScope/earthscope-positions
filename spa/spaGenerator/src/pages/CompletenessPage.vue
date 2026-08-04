@@ -55,36 +55,45 @@
         label="From"
         dense
         outlined
-        style="width: 120px"
+        style="width: 136px"
         mask="####-##-##"
         placeholder="YYYY-MM-DD"
         @change="onFromChange"
-      />
+      >
+        <template #append>
+          <q-icon name="event" size="xs" class="cursor-pointer">
+            <q-popup-proxy ref="fromPopup" cover transition-show="scale" transition-hide="scale">
+              <q-date :model-value="null" range mask="YYYY-MM-DD" @update:model-value="onFromBoxSelect">
+                <div class="row items-center justify-end">
+                  <q-btn v-close-popup label="Close" color="primary" flat />
+                </div>
+              </q-date>
+            </q-popup-proxy>
+          </q-icon>
+        </template>
+      </q-input>
       <q-input
         v-model="endDate"
         label="To"
         dense
         outlined
-        style="width: 120px"
+        style="width: 136px"
         mask="####-##-##"
         placeholder="YYYY-MM-DD"
         @change="onToChange"
-      />
-      <!-- Single range calendar picker -->
-      <q-btn flat dense round icon="date_range" size="sm" class="self-center">
-        <q-popup-proxy ref="calendarProxy" cover transition-show="scale" transition-hide="scale">
-          <q-date
-            v-model="dateRange"
-            range
-            mask="YYYY-MM-DD"
-            @update:model-value="onRangeSelect"
-          >
-            <div class="row items-center justify-end">
-              <q-btn v-close-popup label="Close" color="primary" flat />
-            </div>
-          </q-date>
-        </q-popup-proxy>
-      </q-btn>
+      >
+        <template #append>
+          <q-icon name="event" size="xs" class="cursor-pointer">
+            <q-popup-proxy ref="toPopup" cover transition-show="scale" transition-hide="scale">
+              <q-date :model-value="null" range mask="YYYY-MM-DD" @update:model-value="onToBoxSelect">
+                <div class="row items-center justify-end">
+                  <q-btn v-close-popup label="Close" color="primary" flat />
+                </div>
+              </q-date>
+            </q-popup-proxy>
+          </q-icon>
+        </template>
+      </q-input>
 
       <!-- Quick-select windows -->
       <div class="row items-center q-gutter-xs">
@@ -335,7 +344,7 @@ import { getStreamLists, getCompleteness, openFetchMissingStream } from "../api"
 import type { CompletenessResponse, BucketData, FetchEvent } from "../types";
 import { useSharedControls } from "../composables/useSharedControls";
 import { useListDelete } from "../composables/useListDelete";
-import { createRangeSelectHandler } from "../utils/dateRangePicker";
+import { createBoxRangeSelectHandler } from "../utils/dateRangePicker";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -378,7 +387,7 @@ const loading = ref(false);
 
 // Stream list dropdown
 const listOptions = ref<{ label: string; value: string }[]>([]);
-const { selectedList, searchText, startDate, endDate, activeWindow, rangeDays, dateRange } = useSharedControls();
+const { selectedList, searchText, startDate, endDate, activeWindow, rangeDays } = useSharedControls();
 const { confirmDeleteList } = useListDelete(loadListOptions);
 
 // Pagination
@@ -491,19 +500,12 @@ function parseDateStr(s: string): Date | null {
   return isNaN(d.getTime()) ? null : d;
 }
 
-function _syncRange() {
-  if (startDate.value && endDate.value) {
-    dateRange.value = { from: startDate.value, to: endDate.value };
-  }
-}
-
 function onFromChange() {
   const from = parseDateStr(startDate.value);
   if (from) {
     const to = new Date(from.getTime() + rangeDays.value * 86_400_000);
     endDate.value = dateStr(to);
   }
-  _syncRange();
   activeWindow.value = null;
   page.value = 0;
   loadCompleteness();
@@ -515,27 +517,32 @@ function onToChange() {
   if (from && to && to > from) {
     rangeDays.value = Math.round((to.getTime() - from.getTime()) / 86_400_000);
   }
-  _syncRange();
   activeWindow.value = null;
   page.value = 0;
   loadCompleteness();
 }
 
-const onRangeSelect = createRangeSelectHandler(
-  (from, to) => { dateRange.value = { from, to }; },
-  (from, to) => {
-    dateRange.value = { from, to };
-    startDate.value = from;
-    endDate.value = to;
-    const fromD = parseDateStr(from);
-    const toD = parseDateStr(to);
-    if (fromD && toD && toD > fromD) {
-      rangeDays.value = Math.round((toD.getTime() - fromD.getTime()) / 86_400_000);
-    }
-    activeWindow.value = null;
-    page.value = 0;
-    loadCompleteness();
-  },
+function _afterRangeEdit() {
+  const fromD = parseDateStr(startDate.value);
+  const toD = parseDateStr(endDate.value);
+  if (fromD && toD && toD > fromD) {
+    rangeDays.value = Math.round((toD.getTime() - fromD.getTime()) / 86_400_000);
+  }
+  activeWindow.value = null;
+  page.value = 0;
+  loadCompleteness();
+}
+const fromPopup = ref<{ hide?: () => void } | null>(null);
+const toPopup   = ref<{ hide?: () => void } | null>(null);
+const onFromBoxSelect = createBoxRangeSelectHandler(
+  (date) => { startDate.value = date; _afterRangeEdit(); },
+  (from, to) => { startDate.value = from; endDate.value = to; _afterRangeEdit(); },
+  () => fromPopup.value?.hide?.(),
+);
+const onToBoxSelect = createBoxRangeSelectHandler(
+  (date) => { endDate.value = date; _afterRangeEdit(); },
+  (from, to) => { startDate.value = from; endDate.value = to; _afterRangeEdit(); },
+  () => toPopup.value?.hide?.(),
 );
 
 function applyWindow(w: { label: string; hours: number }) {
@@ -544,7 +551,6 @@ function applyWindow(w: { label: string; hours: number }) {
   startDate.value = dateStr(start);
   endDate.value = dateStr(end);
   rangeDays.value = Math.round(w.hours / 24);
-  _syncRange();
   activeWindow.value = w.label;
   page.value = 0;
   loadCompleteness();

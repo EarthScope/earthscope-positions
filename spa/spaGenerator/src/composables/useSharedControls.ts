@@ -6,10 +6,9 @@ const selectedLists = ref<string[]>([]);
 const searchText = ref("");
 const startDate = ref("");
 const endDate = ref("");
-const dateRange = ref<{ from: string; to: string } | null>(null);
 const rangeDays = ref(7);
 const activeWindow = ref<string | null>("7d");
 
 export function useSharedControls() {
-  return { selectedList, selectedLists, searchText, startDate, endDate, dateRange, rangeDays, activeWindow };
+  return { selectedList, selectedLists, searchText, startDate, endDate, rangeDays, activeWindow };
 }

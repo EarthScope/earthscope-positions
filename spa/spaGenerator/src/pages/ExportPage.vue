@@ -54,18 +54,33 @@
             <!-- Date range -->
             <div class="row q-gutter-xs">
               <q-input v-model="startDate" label="Start date" dense outlined class="col"
-                mask="####-##-##" placeholder="YYYY-MM-DD" :disable="running" />
+                mask="####-##-##" placeholder="YYYY-MM-DD" :disable="running">
+                <template #append>
+                  <q-icon name="event" size="xs" class="cursor-pointer">
+                    <q-popup-proxy ref="fromPopup" cover transition-show="scale" transition-hide="scale">
+                      <q-date :model-value="null" range mask="YYYY-MM-DD" @update:model-value="onFromBoxSelect">
+                        <div class="row items-center justify-end">
+                          <q-btn v-close-popup label="Close" color="primary" flat />
+                        </div>
+                      </q-date>
+                    </q-popup-proxy>
+                  </q-icon>
+                </template>
+              </q-input>
               <q-input v-model="endDate" label="End date" dense outlined class="col"
-                mask="####-##-##" placeholder="YYYY-MM-DD" :disable="running" />
-              <q-btn flat dense round icon="date_range" size="sm" class="self-center" :disable="running">
-                <q-popup-proxy cover transition-show="scale" transition-hide="scale">
-                  <q-date v-model="dateRange" range mask="YYYY-MM-DD" @update:model-value="onRangeSelect">
-                    <div class="row items-center justify-end">
-                      <q-btn v-close-popup label="Close" color="primary" flat />
-                    </div>
-                  </q-date>
-                </q-popup-proxy>
-              </q-btn>
+                mask="####-##-##" placeholder="YYYY-MM-DD" :disable="running">
+                <template #append>
+                  <q-icon name="event" size="xs" class="cursor-pointer">
+                    <q-popup-proxy ref="toPopup" cover transition-show="scale" transition-hide="scale">
+                      <q-date :model-value="null" range mask="YYYY-MM-DD" @update:model-value="onToBoxSelect">
+                        <div class="row items-center justify-end">
+                          <q-btn v-close-popup label="Close" color="primary" flat />
+                        </div>
+                      </q-date>
+                    </q-popup-proxy>
+                  </q-icon>
+                </template>
+              </q-input>
             </div>
 
             <q-toggle v-model="force" label="Overwrite existing files" dense :disable="running" />
@@ -154,7 +169,7 @@ import { useQuasar } from "quasar";
 import { getStreamLists, getExportSpec, saveExportSpec } from "../api";
 import { useExportJob } from "../composables/useExportJob";
 import type { ExportFormat } from "../composables/useExportJob";
-import { createRangeSelectHandler } from "../utils/dateRangePicker";
+import { createBoxRangeSelectHandler } from "../utils/dateRangePicker";
 
 const $q = useQuasar();
 
@@ -168,7 +183,6 @@ const {
 
 // View-local (not persisted)
 const listOptions = ref<{ label: string; value: string }[]>([]);
-const dateRange   = ref<{ from: string; to: string } | null>(null);
 const specLoading = ref(false);
 const specSaving  = ref(false);
 const specError   = ref("");
@@ -186,13 +200,17 @@ function specFileFor(f: ExportFormat): string {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────────
-const onRangeSelect = createRangeSelectHandler(
-  (from, to) => { dateRange.value = { from, to }; },
-  (from, to) => {
-    dateRange.value = { from, to };
-    startDate.value = from;
-    endDate.value = to;
-  },
+const fromPopup = ref<{ hide?: () => void } | null>(null);
+const toPopup   = ref<{ hide?: () => void } | null>(null);
+const onFromBoxSelect = createBoxRangeSelectHandler(
+  (date) => { startDate.value = date; },
+  (from, to) => { startDate.value = from; endDate.value = to; },
+  () => fromPopup.value?.hide?.(),
+);
+const onToBoxSelect = createBoxRangeSelectHandler(
+  (date) => { endDate.value = date; },
+  (from, to) => { startDate.value = from; endDate.value = to; },
+  () => toPopup.value?.hide?.(),
 );
 
 async function scrollLog() {

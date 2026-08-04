@@ -39,19 +39,34 @@
       >
         <template #prepend><q-icon name="search" size="xs" /></template>
       </q-input>
-      <q-input v-model="startDate" label="From" dense outlined style="width: 120px"
-        mask="####-##-##" placeholder="YYYY-MM-DD" @change="onFromChange" />
-      <q-input v-model="endDate" label="To" dense outlined style="width: 120px"
-        mask="####-##-##" placeholder="YYYY-MM-DD" @change="onToChange" />
-      <q-btn flat dense round icon="date_range" size="sm" class="self-center">
-        <q-popup-proxy cover transition-show="scale" transition-hide="scale">
-          <q-date v-model="dateRange" range mask="YYYY-MM-DD" @update:model-value="onRangeSelect">
-            <div class="row items-center justify-end">
-              <q-btn v-close-popup label="Close" color="primary" flat />
-            </div>
-          </q-date>
-        </q-popup-proxy>
-      </q-btn>
+      <q-input v-model="startDate" label="From" dense outlined style="width: 136px"
+        mask="####-##-##" placeholder="YYYY-MM-DD" @change="onFromChange">
+        <template #append>
+          <q-icon name="event" size="xs" class="cursor-pointer">
+            <q-popup-proxy ref="fromPopup" cover transition-show="scale" transition-hide="scale">
+              <q-date :model-value="null" range mask="YYYY-MM-DD" @update:model-value="onFromBoxSelect">
+                <div class="row items-center justify-end">
+                  <q-btn v-close-popup label="Close" color="primary" flat />
+                </div>
+              </q-date>
+            </q-popup-proxy>
+          </q-icon>
+        </template>
+      </q-input>
+      <q-input v-model="endDate" label="To" dense outlined style="width: 136px"
+        mask="####-##-##" placeholder="YYYY-MM-DD" @change="onToChange">
+        <template #append>
+          <q-icon name="event" size="xs" class="cursor-pointer">
+            <q-popup-proxy ref="toPopup" cover transition-show="scale" transition-hide="scale">
+              <q-date :model-value="null" range mask="YYYY-MM-DD" @update:model-value="onToBoxSelect">
+                <div class="row items-center justify-end">
+                  <q-btn v-close-popup label="Close" color="primary" flat />
+                </div>
+              </q-date>
+            </q-popup-proxy>
+          </q-icon>
+        </template>
+      </q-input>
       <div class="row items-center q-gutter-xs">
         <q-btn v-for="w in TIME_WINDOWS" :key="w.label" :label="w.label"
           :color="activeWindow === w.label ? 'primary' : 'grey-5'"
@@ -564,7 +579,7 @@ import type {
 } from "../types";
 import { useSharedControls } from "../composables/useSharedControls";
 import { useListDelete } from "../composables/useListDelete";
-import { createRangeSelectHandler } from "../utils/dateRangePicker";
+import { createBoxRangeSelectHandler } from "../utils/dateRangePicker";
 
 const $q = useQuasar();
 
@@ -608,7 +623,7 @@ const COLORS = [
 // ─── State ────────────────────────────────────────────────────────────────────
 
 const listOptions = ref<{ label: string; value: string }[]>([]);
-const { selectedList, searchText, startDate, endDate, dateRange, rangeDays, activeWindow } = useSharedControls();
+const { selectedList, searchText, startDate, endDate, rangeDays, activeWindow } = useSharedControls();
 const { confirmDeleteList } = useListDelete(loadListOptions);
 const stationsLoading = ref(false);
 
@@ -1600,7 +1615,6 @@ onMounted(async () => {
         startDate.value = dateStr(minDate);
         rangeDays.value = 7;
         activeWindow.value = "7d";
-        _syncRange();
       } else {
         applyWindow(TIME_WINDOWS.find(w => w.label === "7d")!);
       }
@@ -1646,36 +1660,39 @@ function dateStr(d: Date) { return d.toISOString().slice(0, 10); }
 function parseDateStr(s: string) {
   const d = new Date(s + "T00:00:00Z"); return isNaN(d.getTime()) ? null : d;
 }
-function _syncRange() {
-  if (startDate.value && endDate.value) dateRange.value = { from: startDate.value, to: endDate.value };
-}
-
 function applyWindow(w: { label: string; hours: number }) {
   const end = new Date(), start = new Date(end.getTime() - w.hours * 3_600_000);
   startDate.value = dateStr(start); endDate.value = dateStr(end);
-  rangeDays.value = Math.round(w.hours / 24); _syncRange();
+  rangeDays.value = Math.round(w.hours / 24);
   activeWindow.value = w.label;
   positionCache.value.clear(); scheduleLoad();
 }
 function onFromChange() {
   const from = parseDateStr(startDate.value);
   if (from) endDate.value = dateStr(new Date(from.getTime() + rangeDays.value * 86_400_000));
-  _syncRange(); activeWindow.value = null; positionCache.value.clear(); scheduleLoad();
+  activeWindow.value = null; positionCache.value.clear(); scheduleLoad();
 }
 function onToChange() {
   const from = parseDateStr(startDate.value), to = parseDateStr(endDate.value);
   if (from && to && to > from) rangeDays.value = Math.round((to.getTime() - from.getTime()) / 86_400_000);
-  _syncRange(); activeWindow.value = null; positionCache.value.clear(); scheduleLoad();
+  activeWindow.value = null; positionCache.value.clear(); scheduleLoad();
 }
-const onRangeSelect = createRangeSelectHandler(
-  (from, to) => { dateRange.value = { from, to }; },
-  (from, to) => {
-    dateRange.value = { from, to };
-    startDate.value = from; endDate.value = to;
-    const fromD = parseDateStr(from), toD = parseDateStr(to);
-    if (fromD && toD && toD > fromD) rangeDays.value = Math.round((toD.getTime() - fromD.getTime()) / 86_400_000);
-    activeWindow.value = null; positionCache.value.clear(); scheduleLoad();
-  },
+function _afterRangeEdit() {
+  const fromD = parseDateStr(startDate.value), toD = parseDateStr(endDate.value);
+  if (fromD && toD && toD > fromD) rangeDays.value = Math.round((toD.getTime() - fromD.getTime()) / 86_400_000);
+  activeWindow.value = null; positionCache.value.clear(); scheduleLoad();
+}
+const fromPopup = ref<{ hide?: () => void } | null>(null);
+const toPopup   = ref<{ hide?: () => void } | null>(null);
+const onFromBoxSelect = createBoxRangeSelectHandler(
+  (date) => { startDate.value = date; _afterRangeEdit(); },
+  (from, to) => { startDate.value = from; endDate.value = to; _afterRangeEdit(); },
+  () => fromPopup.value?.hide?.(),
+);
+const onToBoxSelect = createBoxRangeSelectHandler(
+  (date) => { endDate.value = date; _afterRangeEdit(); },
+  (from, to) => { startDate.value = from; endDate.value = to; _afterRangeEdit(); },
+  () => toPopup.value?.hide?.(),
 );
 
 // ─── Tree interaction ─────────────────────────────────────────────────────────

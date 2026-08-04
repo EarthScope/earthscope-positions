@@ -145,8 +145,9 @@ const HELP: Record<string, HelpEntry> = {
       <div class="help-section-label">Usage</div>
       <ul>
         <li>Select a stream list and date range, then click <strong>Load</strong></li>
-        <li>In the calendar picker, click one day to set the start, then click another to set
-            the end — or drag across days in one motion</li>
+        <li>Click the calendar icon inside the <strong>From</strong> or <strong>To</strong> box;
+            click a day, then click it again to set just that field, or click a different
+            day to set both at once</li>
         <li>Results are paginated; use the arrows to step through streams</li>
         <li>Click <strong>Fetch Missing</strong> to download data for streams that have never been tried</li>
         <li>The <em>Latency</em> heatmap below shows ingest delay in seconds</li>
@@ -159,8 +160,9 @@ const HELP: Record<string, HelpEntry> = {
       <div class="help-section-label">Controls</div>
       <ul>
         <li>Select a stream list and date range; use the search box to filter by stream name</li>
-        <li>In the calendar picker, click one day to set the start, then click another to set
-            the end — or drag across days in one motion</li>
+        <li>Click the calendar icon inside the <strong>From</strong> or <strong>To</strong> box;
+            click a day, then click it again to set just that field, or click a different
+            day to set both at once</li>
         <li><strong>Shift&nbsp;+&nbsp;drag</strong> on any chart to zoom a time range; <strong>right-click</strong> to reset zoom</li>
         <li><strong>Shift-click</strong> a legend entry to remove that stream from all plots</li>
         <li>All three position charts share the same x-axis when zooming</li>
@@ -239,8 +241,9 @@ const HELP: Record<string, HelpEntry> = {
       <div class="help-section-label">Setup</div>
       <ul>
         <li>Select one or more stream lists and a date range</li>
-        <li>In the calendar picker, click one day to set the start, then click another to set
-            the end — or drag across days in one motion</li>
+        <li>Click the calendar icon inside the <strong>Start date</strong> or <strong>End date</strong>
+            box; click a day, then click it again to set just that field, or click a different
+            day to set both at once</li>
         <li>Filter by processing center and stream type using the chips (all selected = no filter)</li>
       </ul>
       <div class="help-section-label">Grouping modes</div>
@@ -290,8 +293,9 @@ const HELP: Record<string, HelpEntry> = {
       <ul>
         <li>Pick a format (MiniSEED, or GeoJSON compact / full / both)</li>
         <li>Choose stream list(s) and a date range, then click <strong>Convert</strong></li>
-        <li>In the calendar picker, click one day to set the start, then click another to set
-            the end — or drag across days in one motion</li>
+        <li>Click the calendar icon inside the <strong>Start date</strong> or <strong>End date</strong>
+            box; click a day, then click it again to set just that field, or click a different
+            day to set both at once</li>
         <li>Enable <strong>Overwrite existing files</strong> to remake files that already exist</li>
       </ul>
       <div class="help-section-label">Output path template</div>
@@ -312,8 +316,11 @@ const HELP: Record<string, HelpEntry> = {
       <div class="help-section-label">Setup</div>
       <ul>
         <li>Configure the bootstrap server, topic name, stream lists, time range, and stream filters</li>
-        <li>In the calendar picker, click one day to set the start, then click another to set
-            the end — or drag across days in one motion</li>
+        <li>Click the calendar icon; click a day, then click it again to set both
+            <strong>Start date</strong> and <strong>Stop date</strong> to that day, or click a
+            different day to set differing start/stop dates</li>
+        <li>Use the <strong>Start time</strong> / <strong>Stop time</strong> boxes below to set
+            the time-of-day for each (defaults 00:00:00 / 01:00:00)</li>
         <li>Click <strong>Preload</strong> to check data availability before committing to a full replay</li>
       </ul>
       <div class="help-section-label">Timing</div>

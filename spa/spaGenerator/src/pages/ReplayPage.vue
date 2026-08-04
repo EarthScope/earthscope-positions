@@ -43,37 +43,61 @@
               </template>
             </q-select>
 
-            <!-- Date-time range -->
+            <!-- Date range -->
             <div class="row q-gutter-xs">
               <q-input
                 v-model="startDate"
-                label="Start"
+                label="Start date"
                 dense
                 outlined
                 class="col"
-                mask="####-##-##T##:##:##"
-                placeholder="YYYY-MM-DDTHH:MM:SS"
+                mask="####-##-##"
+                placeholder="YYYY-MM-DD"
                 :disable="isActive"
               />
               <q-input
                 v-model="stopDate"
-                label="Stop"
+                label="Stop date"
                 dense
                 outlined
                 class="col"
-                mask="####-##-##T##:##:##"
-                placeholder="YYYY-MM-DDTHH:MM:SS"
+                mask="####-##-##"
+                placeholder="YYYY-MM-DD"
                 :disable="isActive"
               />
               <q-btn flat dense round icon="date_range" size="sm" class="self-center" :disable="isActive">
-                <q-popup-proxy cover transition-show="scale" transition-hide="scale">
-                  <q-date v-model="dateRange" range mask="YYYY-MM-DD" @update:model-value="onRangeSelect">
+                <q-popup-proxy ref="dateRangePopup" cover transition-show="scale" transition-hide="scale">
+                  <q-date :model-value="null" range mask="YYYY-MM-DD" @update:model-value="onRangeSelect">
                     <div class="row items-center justify-end">
                       <q-btn v-close-popup label="Close" color="primary" flat />
                     </div>
                   </q-date>
                 </q-popup-proxy>
               </q-btn>
+            </div>
+
+            <!-- Time-of-day range -->
+            <div class="row q-gutter-xs">
+              <q-input
+                v-model="startTime"
+                label="Start time"
+                dense
+                outlined
+                class="col"
+                mask="##:##:##"
+                placeholder="HH:MM:SS"
+                :disable="isActive"
+              />
+              <q-input
+                v-model="stopTime"
+                label="Stop time"
+                dense
+                outlined
+                class="col"
+                mask="##:##:##"
+                placeholder="HH:MM:SS"
+                :disable="isActive"
+              />
             </div>
 
             <!-- Stream filters -->
@@ -574,7 +598,7 @@
         <q-card-section class="q-pt-sm">
           <div class="text-caption text-grey-7">
             Lists: <b>{{ selectedLists.join(", ") || "none selected" }}</b>
-            &nbsp;·&nbsp; {{ startDate.slice(0, 10) }} → {{ stopDate.slice(0, 10) }}
+            &nbsp;·&nbsp; {{ startDate }} → {{ stopDate }}
           </div>
           <div class="text-caption text-grey-6 q-mt-xs">
             Only the {{ replayState.missing_not_fetched?.length ?? 0 }} stream(s) with no prior fetch attempt will be downloaded.
@@ -644,7 +668,6 @@ import {
   PROC_CENTERS, STREAM_TYPE_CODES, solTypeLabel, sortSolTypes,
   defaultSelectedCenters, defaultSelectedStreamTypes,
 } from "../constants/streamTypes";
-import { createRangeSelectHandler } from "../utils/dateRangePicker";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -661,7 +684,8 @@ const selectedLists = ref<string[]>([]);
 
 const startDate = ref("");
 const stopDate  = ref("");
-const dateRange = ref<{ from: string; to: string } | null>(null);
+const startTime = ref("00:00:00");
+const stopTime  = ref("01:00:00");
 
 // Filters — populated from API; all selected by default (empty = all on backend)
 const availableCenters  = ref<string[]>([]);
@@ -723,9 +747,14 @@ const isRunning = computed(() =>
 
 const canPreload = computed(() =>
   selectedLists.value.length > 0
-  && startDate.value.length >= 16   // YYYY-MM-DDTHH:MM (16) or …:SS (19)
-  && stopDate.value.length >= 16
+  && startDate.value.length === 10
+  && stopDate.value.length === 10
+  && startTime.value.length === 8
+  && stopTime.value.length === 8
 );
+
+const startDateTime = computed(() => `${startDate.value}T${startTime.value}`);
+const stopDateTime  = computed(() => `${stopDate.value}T${stopTime.value}`);
 
 const progressFraction = computed(() => {
   const total = replayState.value.total_messages ?? 0;
@@ -823,18 +852,23 @@ function toggleItem(list: string[], item: string): void {
   else list.push(item);
 }
 
-const onRangeSelect = createRangeSelectHandler(
-  (from, to) => { dateRange.value = { from, to }; },
-  (from, to) => {
-    dateRange.value = { from, to };
-    // Preserve existing time component if already entered; otherwise default to
-    // 00:00:00 → 23:59:59 (seconds precision).
-    const existStart = startDate.value.slice(11) || "00:00:00";
-    const existStop  = stopDate.value.slice(11)  || "23:59:59";
-    startDate.value = from + "T" + existStart;
-    stopDate.value  = to   + "T" + existStop;
-  },
-);
+const dateRangePopup = ref<{ hide?: () => void } | null>(null);
+
+function onRangeSelect(val: { from: string; to: string } | string | null): void {
+  if (!val) return;
+  if (typeof val === "string") {
+    // Same day clicked twice — start and stop both land on that date.
+    startDate.value = val;
+    stopDate.value  = val;
+    dateRangePopup.value?.hide?.();
+    return;
+  }
+  // Two different days clicked — a genuine range.
+  if (!val.from || !val.to) return;
+  startDate.value = val.from;
+  stopDate.value  = val.to;
+  dateRangePopup.value?.hide?.();
+}
 
 async function copy(text: string) {
   try { await navigator.clipboard.writeText(text); } catch { /* ignore */ }
@@ -1057,8 +1091,8 @@ async function doPreload() {
     await replayPreload({
       stream_lists:     selectedLists.value,
       all_stations:     false,
-      start_time:       startDate.value,
-      stop_time:        stopDate.value,
+      start_time:       startDateTime.value,
+      stop_time:        stopDateTime.value,
       filter_centers:   filterCenters.value.length < availableCenters.value.length
                           ? filterCenters.value : [],
       filter_sol_types: filterSolTypes.value.length < availableSolTypes.value.length
@@ -1124,9 +1158,8 @@ function startFetch() {
   if (!selectedLists.value.length) return;
   fetchRunning.value = true;
   fetchLog.value = [];
-  // Snap datetimes to date-only (YYYY-MM-DD) for the fetch endpoint
-  const fetchStart = startDate.value.slice(0, 10);
-  const fetchEnd   = stopDate.value.slice(0, 10);
+  const fetchStart = startDate.value;
+  const fetchEnd   = stopDate.value;
   // Target only the streams that haven't been fetched at all
   const notFetched = replayState.value.missing_not_fetched ?? [];
   openFetchMissingStream(
@@ -1177,8 +1210,10 @@ onMounted(async () => {
       applyLatency.value    = s.config.apply_latency;
       selectByArrival.value = s.config.select_by_arrival ?? false;
       outputFormat.value    = s.config.output_format ?? "compact";
-      startDate.value       = s.config.start_time;
-      stopDate.value        = s.config.stop_time;
+      startDate.value       = s.config.start_time.slice(0, 10);
+      startTime.value       = s.config.start_time.slice(11) || "00:00:00";
+      stopDate.value        = s.config.stop_time.slice(0, 10);
+      stopTime.value        = s.config.stop_time.slice(11) || "01:00:00";
       selectedLists.value   = s.config.stream_lists ?? [];
     }
   } catch { /* server not ready yet */ }
