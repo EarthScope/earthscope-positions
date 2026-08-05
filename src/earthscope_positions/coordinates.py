@@ -26,8 +26,8 @@ the default.
 Editable copy
 -------------
 The default path is the **user-editable** copy in the data directory
-(``<data-dir>/coordinates.csv``), seeded on first use from the bundled
-``resources/coordinates.csv``.  Helpers here manage that copy:
+(``<data-dir>/resources/coordinates.csv``), seeded on first use from the
+bundled ``resources/coordinates.csv``.  Helpers here manage that copy:
 
     read_text()                current CSV text (seeding first)
     validate_and_normalize()   parse + validate uploaded/edited CSV text
@@ -41,17 +41,10 @@ from __future__ import annotations
 import csv
 import io
 import pathlib
-import shutil
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Iterable
 
-
-# Bundled seed: <project_root>/resources/coordinates.csv
-_RESOURCES_CSV = (
-    pathlib.Path(__file__).resolve().parents[2]
-    / "resources" / "coordinates.csv"
-)
 
 # CSV schema for the editable coordinates file.
 _HEADER = ["station", "latitude", "longitude", "height", "source"]
@@ -60,7 +53,8 @@ _DEFAULT_SOURCE = "user"
 
 
 def data_csv_path() -> pathlib.Path:
-    """The editable data-directory coordinates CSV (``<data-dir>/coordinates.csv``)."""
+    """The editable data-directory coordinates CSV
+    (``<data-dir>/resources/coordinates.csv``)."""
     from earthscope_positions import paths  # local import avoids any import cycle
     return paths.coordinates_file()
 
@@ -68,13 +62,11 @@ def data_csv_path() -> pathlib.Path:
 def ensure_data_csv() -> pathlib.Path:
     """Return the editable data-dir CSV, seeding it from the bundled resources
     copy on first use so the user always has an editable file to start from."""
-    dst = data_csv_path()
+    from earthscope_positions import paths
+    dst = paths.ensure_resource("coordinates.csv")
     if not dst.exists():
         dst.parent.mkdir(parents=True, exist_ok=True)
-        if _RESOURCES_CSV.exists():
-            shutil.copyfile(_RESOURCES_CSV, dst)
-        else:
-            dst.write_text(",".join(_HEADER) + "\n", encoding="utf-8")
+        dst.write_text(",".join(_HEADER) + "\n", encoding="utf-8")
     return dst
 
 

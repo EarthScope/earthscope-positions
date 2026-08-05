@@ -1685,12 +1685,12 @@ function _afterRangeEdit() {
 const fromPopup = ref<{ hide?: () => void } | null>(null);
 const toPopup   = ref<{ hide?: () => void } | null>(null);
 const onFromBoxSelect = createBoxRangeSelectHandler(
-  (date) => { startDate.value = date; _afterRangeEdit(); },
+  (date) => { startDate.value = date; if (!endDate.value) endDate.value = date; _afterRangeEdit(); },
   (from, to) => { startDate.value = from; endDate.value = to; _afterRangeEdit(); },
   () => fromPopup.value?.hide?.(),
 );
 const onToBoxSelect = createBoxRangeSelectHandler(
-  (date) => { endDate.value = date; _afterRangeEdit(); },
+  (date) => { endDate.value = date; if (!startDate.value) startDate.value = date; _afterRangeEdit(); },
   (from, to) => { startDate.value = from; endDate.value = to; _afterRangeEdit(); },
   () => toPopup.value?.hide?.(),
 );

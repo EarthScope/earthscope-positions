@@ -1,1 +1,0 @@
-import{r as t}from"./index-BQfYz076.js";const s=t("all"),e=t([]),n=t(""),o=t(""),c=t(""),r=t(7),a=t("7d");function i(){return{selectedList:s,selectedLists:e,searchText:n,startDate:o,endDate:c,rangeDays:r,activeWindow:a}}export{i as u};

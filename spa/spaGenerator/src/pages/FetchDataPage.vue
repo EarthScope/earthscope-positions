@@ -231,12 +231,12 @@ function toggleItem(list: string[], item: string): void {
 const fromPopup = ref<{ hide?: () => void } | null>(null);
 const toPopup   = ref<{ hide?: () => void } | null>(null);
 const onFromBoxSelect = createBoxRangeSelectHandler(
-  (date) => { startDate.value = date; },
+  (date) => { startDate.value = date; if (!endDate.value) endDate.value = date; },
   (from, to) => { startDate.value = from; endDate.value = to; },
   () => fromPopup.value?.hide?.(),
 );
 const onToBoxSelect = createBoxRangeSelectHandler(
-  (date) => { endDate.value = date; },
+  (date) => { endDate.value = date; if (!startDate.value) startDate.value = date; },
   (from, to) => { startDate.value = from; endDate.value = to; },
   () => toPopup.value?.hide?.(),
 );

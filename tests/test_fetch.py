@@ -145,8 +145,11 @@ def test_fetch_422_records_error_marker(project_tree):
         client, _EDID, _GEOSNCL, day_start, day_end, force=False, redownload=False,
     ))
 
-    # Returns "no-data" (won't retry automatically) but marker records the error
-    assert status == "no-data"
+    # Returns "rejected-422" — distinct from "no-data" so a malformed request
+    # (e.g. a stream list missing edid) stays visible instead of reading as
+    # an absence of data — but won't retry automatically, and the marker
+    # still records the error.
+    assert status == "rejected-422"
     gdir = positions_fetch._geosncl_dir(_GEOSNCL)
     marker = gdir / positions_fetch._NO_DATA_FILE
     rec = orjson.loads(marker.read_text().splitlines()[-1])
@@ -265,6 +268,41 @@ def test_cmd_get_end_to_end(project_tree, monkeypatch):
     )
     assert out.exists()
     assert client.data._get_gnss_instantaneous_positions.await_count == 1
+
+
+def test_cmd_get_backfills_missing_edid(project_tree, monkeypatch):
+    """A stream list saved with only {"geosncl": ...} (no edid — e.g. from a
+    web-UI-built list, before the fix to api_save_stream_list) must not send
+    the geosncl string as stream_id: it 422s on the real API. _cmd_get should
+    backfill the real edid from any other stream-list file that has it."""
+    # The broken list: geosncl only, no edid.
+    broken = project_tree / "data" / "stream-lists" / "SCGN-ALL.jsonl"
+    broken.write_bytes(orjson.dumps({"geosncl": _GEOSNCL}) + b"\n")
+    # A separate, already-correct list (mirrors all-streams.jsonl) providing
+    # the real edid for the same geosncl.
+    reference = project_tree / "data" / "stream-lists" / "all-streams.jsonl"
+    reference.write_bytes(orjson.dumps({"geosncl": _GEOSNCL, "edid": _EDID}) + b"\n")
+
+    client = _FakeClient()
+    client.data._get_gnss_instantaneous_positions.return_value = _positions_table(20)
+    monkeypatch.setattr(positions_fetch, "_make_client", lambda: client)
+
+    args = _Namespace(
+        list=[str(broken)],
+        start="2026-01-15",
+        end="2026-01-16",
+        force=False,
+        redownload=False,
+        workers=1,
+    )
+    positions_fetch._cmd_get(args)
+
+    # The SDK must have been called with the real EDID, not the geosncl string.
+    client.data._get_gnss_instantaneous_positions.assert_awaited_once_with(
+        stream_edid=_EDID,
+        start_datetime=dt.datetime(2026, 1, 15, tzinfo=_UTC),
+        end_datetime=dt.datetime(2026, 1, 16, tzinfo=_UTC),
+    )
 
 
 class _Namespace:

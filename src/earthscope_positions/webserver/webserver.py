@@ -100,12 +100,14 @@ def run_startup_preflight() -> None:
 
     1. Verify a valid JWT (the user has logged in at some point) — abort startup
        if not, since every discovery/fetch call needs it.
-    2. Seed the editable coordinates.csv from bundled resources if absent.
+    2. Seed the editable coordinates.csv and export path-spec TOMLs from
+       bundled resources (into <data-directory>/resources/) if absent.
     3. Preload the always-available default lists (all-streams / all-stations /
        shake-alert streams+stations) if any are missing.
 
-    JWT failure is fatal (``SystemExit``); a preload/coordinate failure is logged
-    and tolerated so a transient API/VPN hiccup doesn't block the whole server.
+    JWT failure is fatal (``SystemExit``); a preload/resource-seed failure is
+    logged and tolerated so a transient API hiccup doesn't block the whole
+    server.
     """
     # 1) JWT / login check — fatal if missing or unrefreshable.
     print("Pre-flight: checking EarthScope login …", file=sys.stderr)
@@ -121,13 +123,21 @@ def run_startup_preflight() -> None:
             "Log in with:  es user login   then restart the server."
         )
 
-    # 2) Seed the editable coordinates file (copies resources → data dir if absent).
+    # 2) Seed the editable resources — coordinates.csv and the export path-spec
+    #    TOMLs — from the bundled copies if absent.
     try:
         from earthscope_positions import coordinates as _coords
         p = _coords.ensure_data_csv()
         print(f"  coords   : {p}", file=sys.stderr)
     except Exception as exc:
         print(f"  coords   : seed failed ({exc})", file=sys.stderr)
+
+    try:
+        for name in ("geojson_path_spec.toml", "miniseed_path_spec.toml"):
+            paths.ensure_resource(name)
+        print(f"  specs    : {paths.resources_dir()}", file=sys.stderr)
+    except Exception as exc:
+        print(f"  specs    : seed failed ({exc})", file=sys.stderr)
 
     # 3) Preload default lists (created only if missing).
     try:
@@ -143,8 +153,12 @@ def run_startup_preflight() -> None:
 
 
 def _project_root() -> pathlib.Path:
-    # Code-relative root (for locating the built SPA), independent of the data dir.
-    return pathlib.Path(__file__).parent.parent.parent.parent
+    # For locating the built SPA/README, independent of the data dir. CWD-based
+    # (nearest ancestor with pyproject.toml) rather than __file__-based: a real
+    # (non-editable) `pip install .` copies the code into site-packages, far
+    # from the checkout's spa/spaBuild — this only works if run with the repo
+    # checkout as CWD (e.g. the Docker image's WORKDIR), same as paths.py.
+    return paths.project_root()
 
 
 def _data_dir() -> pathlib.Path:
@@ -1135,7 +1149,21 @@ async def api_save_stream_list(name: str, body: _SaveListBody) -> dict:
     d = _stream_lists_dir()
     d.mkdir(parents=True, exist_ok=True)
     path = d / f"{name}.jsonl"
-    lines = "\n".join(json.dumps({"geosncl": g}) for g in sorted(body.geosncls)) + "\n"
+    # Include edid when known (via the same geosncl -> edid map "Fetch
+    # Missing" uses) so the saved file works directly with `es-pos fetch
+    # --list` too, not just the web UI's own fetch button — without it, the
+    # API is queried with the geosncl string as stream_id (a ULID param) and
+    # 422s on every request, which reads as "no-data" everywhere it's not
+    # explicitly checked for.
+    edid_map = _geosncl_edid_map()
+    lines = (
+        "\n".join(
+            json.dumps({"geosncl": g, "edid": edid_map[g]}) if g in edid_map
+            else json.dumps({"geosncl": g})
+            for g in sorted(body.geosncls)
+        )
+        + "\n"
+    )
     path.write_text(lines)
     _log.info("[stream-lists] saved %r (%d stations)", name, len(body.geosncls))
     return {"name": name, "count": len(body.geosncls)}
@@ -1873,8 +1901,16 @@ def _geosncl_edid_map() -> dict[str, str]:
     """Map geosncl -> edid across every station-list file.
 
     The positions API is queried by EDID (``stream_id``), so the fetch subprocess
-    needs each stream's edid — not just its geosncl — or every request comes back
-    empty ("no-data").
+    needs each stream's edid — not just its geosncl — or every request 422s
+    (the API expects a ULID; the raw geosncl string doesn't parse as one).
+
+    Only records with a genuine ``edid`` field contribute — no falling back
+    to the geosncl itself for either side. That fallback used to let a
+    stream list saved without edid "poison" the map with a bogus self-mapped
+    entry (geosncl -> geosncl); since this scans files in alphabetical order
+    and uses setdefault, whichever file came first alphabetically won
+    regardless of whether it actually had a real edid — silently blocking a
+    later, correct file from ever filling in the right value.
     """
     d = _stream_lists_dir()
     mapping: dict[str, str] = {}
@@ -1885,8 +1921,8 @@ def _geosncl_edid_map() -> dict[str, str]:
             continue
         try:
             for rec in _read_stream_list_file(path):
-                gs = rec.get("geosncl") or rec.get("edid", "")
-                eid = rec.get("edid") or rec.get("geosncl", "")
+                gs = rec.get("geosncl", "")
+                eid = rec.get("edid", "")
                 if gs and eid:
                     mapping.setdefault(gs, eid)
         except Exception:
@@ -2113,8 +2149,10 @@ _EXPORT_SPEC_FILES = {
 
 
 def _export_spec_path(fmt: str) -> pathlib.Path | None:
+    """The editable path-spec TOML for *fmt*, seeding it from the bundled
+    template (into <data-directory>/resources/) if it doesn't exist yet."""
     name = _EXPORT_SPEC_FILES.get(fmt)
-    return (_project_root() / name) if name else None
+    return paths.ensure_resource(name) if name else None
 
 
 @app.get("/api/export/spec")

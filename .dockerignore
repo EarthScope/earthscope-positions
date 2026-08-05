@@ -1,0 +1,41 @@
+# Data — never baked into the image; mounted in at runtime instead (see run.sh).
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg-info*
+.pytest_cache/
+dist/
+build/
+.eggs/
+
+# The image builds its own venv from scratch — never copy the host's.
+venv/
+.venv/
+venv*/
+env/
+
+# SPA dev artifacts (spa/spaBuild, the compiled output the webserver actually
+# serves, is NOT excluded here — it must be copied).
+spa/spaGenerator/node_modules/
+spa/spaGenerator/.vite/
+
+# IDE / OS
+.vscode/
+.DS_Store
+*.swp
+*.swo
+
+# Secrets / tokens — never bake credentials into the image.
+.env
+.env.*
+*.token
+
+# Claude
+.claude/
+
+# Docker itself
+Dockerfile
+.dockerignore

@@ -18,7 +18,7 @@ FDSN Source Identifier (MiniSEED 3):
   FDSN:{network}_{station}_{location}_{band}_{source}_{subsource}
   e.g.  FDSN:PW_DEEJ_00_L_Y_E
 
-Path layout is controlled by miniseed_path_spec.toml in the working directory
+Path layout is controlled by <data-directory>/resources/miniseed_path_spec.toml
 (or pass --spec to override).
 """
 from __future__ import annotations

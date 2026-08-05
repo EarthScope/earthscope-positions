@@ -23,6 +23,7 @@ import datetime as dt
 import io
 import os
 import pathlib
+import random
 import subprocess
 import sys
 import time
@@ -44,7 +45,13 @@ from earthscope_positions import paths
 # Constants
 # ---------------------------------------------------------------------------
 
-_TOKENS_PATH = pathlib.Path.home() / ".earthscope" / "default" / "tokens.json"
+# ES_PROFILE selects the named profile — same env var the earthscope-sdk
+# itself reads (via SdkSettings.profile_name) to pick which profile's tokens
+# AsyncEarthScopeClient uses, so this stays consistent with it rather than
+# always reading the "default" profile regardless of what's actually active.
+_TOKENS_PATH = (
+    pathlib.Path.home() / ".earthscope" / os.environ.get("ES_PROFILE", "default") / "tokens.json"
+)
 _REFRESH_MARGIN = 60  # seconds before expiry to trigger refresh
 
 _LOCK_TTL = 120  # lock expiry in seconds (2 minutes)
@@ -55,6 +62,7 @@ _LOCK_FILE = ".lock"
 _TS_FMT = "%Y%m%dT%H%M%SZ"  # compact UTC timestamp for filenames
 _ERROR_LOG_NAME = "positions_errors.jsonl"  # under the base data directory
 _MAX_RETRIES = 2  # tasks are re-queued up to this many times on transient errors
+_RETRY_BASE_DELAY = 2.0  # seconds; exponential backoff base before each retry
 _DEFAULT_WORKERS = 20
 
 _UTC = dt.timezone.utc
@@ -388,8 +396,13 @@ async def _fetch_one_day(
         'ok'             — data downloaded and written
         'skipped'        — arrow file already exists (cache hit)
         'no-data-cached' — day is in no_data.json (skipped without API call)
-        'no-data'        — API returned no rows (incl. 404); no_data.json updated
-        'error-NNN'      — HTTP error code NNN
+        'no-data'        — API returned no rows or a genuine 404; no_data.json updated
+        'rejected-NNN'   — API rejected the request (400/422, e.g. a malformed
+                            stream_id); permanent, not retried, but distinct
+                            from 'no-data' so it stays visible instead of
+                            reading as an absence of data
+        'error-NNN'      — other HTTP error code NNN (transient — retried, see
+                            _run_parallel)
     """
     gdir = _geosncl_dir(geosncl)
     date_str = day_start.strftime("%Y-%m-%d")
@@ -426,12 +439,21 @@ async def _fetch_one_day(
             _add_no_data(gdir, date_str, "no-data")
             return "no-data"
         if status in (400, 422):
-            # API rejected the request (stream may not exist for this date/center).
-            # Permanent client error — record so we stop retrying, but flag as error.
+            # API rejected the request (e.g. a stream list missing edid sends
+            # the geosncl as stream_id, which the API expects as a ULID and
+            # 422s on). Permanent client error — record so it stops retrying
+            # (retrying an identically-malformed request would just repeat
+            # the same 422 forever), but returning "no-data" here would hide
+            # that distinction: the marker file would correctly say
+            # "error-{status}", while every live view of this run (the
+            # progress tally, the per-line log) would show a plain
+            # "no-data" indistinguishable from streams that genuinely have
+            # none — exactly what made this class of bug so hard to notice.
             if redownload and out_path.exists():
                 out_path.unlink()
             _add_no_data(gdir, date_str, f"error-{status}")
-            return "no-data"
+            _log_error(geosncl, date_str, exc.response)
+            return f"rejected-{status}"
         # Transient errors (5xx, 429, …) the SDK's own internal retries didn't
         # resolve — do NOT record in no_data.json; leave the day eligible for
         # this module's own outer retry (see _run_parallel). Log for inspection.
@@ -476,7 +498,7 @@ class _Progress:
         self.ok = 0  # freshly downloaded
         self.cached = 0  # skipped — arrow file already present
         self.no_data = 0  # API returned nothing (new or previously known)
-        self.failed = 0  # HTTP / parse error
+        self.failed = 0  # HTTP / parse error (incl. rejected-NNN: a malformed request, not an absence of data)
         self._lock = threading.Lock()
         self._start = time.monotonic()
         self._last = "—"
@@ -499,7 +521,7 @@ class _Progress:
                 tag = "no-data"
             else:
                 self.failed += 1
-                tag = status  # e.g. "error-503"
+                tag = status  # e.g. "error-503" (transient) or "rejected-422" (permanent, bad request)
             self._last = f"{tag:<12} {label}  {day}"
             self._render()
 
@@ -528,6 +550,20 @@ class _Progress:
             print(f"\r{line:<140}", end="", file=sys.stderr, flush=True)
         else:
             print(line, file=sys.stderr, flush=True)
+
+    def log(self, message: str) -> None:
+        """Print *message* as its own line — for discrete events (a transient
+        HTTP error, a retry) that must stay visible rather than being folded
+        into (and instantly overwritten by) the running tally.
+
+        In a TTY, the in-place progress line has no trailing newline, so the
+        cursor sits mid-line; a leading newline moves off it first. Piped
+        output (the webserver's subprocess case) already prints one full line
+        per update, so no prefix is needed there.
+        """
+        with self._lock:
+            prefix = "\n" if self._is_tty else ""
+            print(f"{prefix}{message}", file=sys.stderr, flush=True)
 
     def finish(self) -> None:
         with self._lock:
@@ -590,10 +626,27 @@ async def _run_parallel(
 
         # Re-try transient failures the SDK's own internal retries didn't
         # resolve. (400/422/404 are already remapped to "no-data" inside
-        # _fetch_one_day, so only genuine transient errors land here.)
-        if status.startswith("error-") and retries_left > 0:
-            await run_one((edid, geosncl, ds, de, force, redownload, retries_left - 1))
-            return
+        # _fetch_one_day, so only genuine transient errors land here.) Back
+        # off first — a batch's worth of tasks retrying a busy gateway
+        # instantly is exactly how one 504 burst turns into another.
+        #
+        # Log the status (response code included) here, immediately, whether
+        # or not a retry follows — otherwise a transient error that a retry
+        # later resolves never shows up anywhere in the live log, even though
+        # it happened (it's still recorded in positions_errors.jsonl, but that
+        # file isn't what anyone's watching in real time).
+        if status.startswith("error-"):
+            if retries_left > 0:
+                attempt = _MAX_RETRIES - retries_left  # 0 on the first retry
+                delay = _RETRY_BASE_DELAY * (2**attempt) + random.uniform(0, _RETRY_BASE_DELAY)
+                progress.log(
+                    f"  {status:<12} {label}  {ds.date()}  "
+                    f"— retrying in {delay:.1f}s ({retries_left} attempt(s) left)"
+                )
+                await asyncio.sleep(delay)
+                await run_one((edid, geosncl, ds, de, force, redownload, retries_left - 1))
+                return
+            progress.log(f"  {status:<12} {label}  {ds.date()}  — giving up after {_MAX_RETRIES} retries")
 
         progress.update(status, label, ds.date())
 
@@ -684,6 +737,33 @@ def _cmd_get(args) -> None:
     if not stations:
         sys.exit("No stations found in the provided stream lists.")
 
+    # Backfill edid for any record that only has a geosncl — the API's
+    # stream_id query param needs the real EDID (a ULID); a request sent with
+    # the geosncl string instead gets a 422 from the server ("ulid: bad data
+    # size when unmarshaling"), which reads as "no-data" in the live progress
+    # line even though it's a malformed-request error, not an absence of
+    # data. Same fallback source _cmd_retry already uses.
+    missing = [r for r in stations if not r.get("edid")]
+    if missing:
+        edid_map = _build_edid_map(paths.arrow_dir())
+        backfilled = 0
+        for rec in missing:
+            eid = edid_map.get(rec.get("geosncl", ""))
+            if eid:
+                rec["edid"] = eid
+                backfilled += 1
+        if backfilled:
+            print(f"  (backfilled edid for {backfilled}/{len(missing)} stream(s) missing it)", file=sys.stderr)
+        still_missing = [r.get("geosncl", "?") for r in missing if not r.get("edid")]
+        if still_missing:
+            suffix = f" … and {len(still_missing) - 10} more" if len(still_missing) > 10 else ""
+            print(
+                f"  [warn] no edid found for {len(still_missing)} stream(s), "
+                f"will be requested by geosncl and likely 422: "
+                f"{', '.join(still_missing[:10])}{suffix}",
+                file=sys.stderr,
+            )
+
     day_segs = _day_ranges(start, end)
     n_tasks = len(stations) * len(day_segs)
     print(
@@ -746,7 +826,17 @@ def _retry_result_matches(result: str, pattern: str) -> bool:
 
 
 def _build_edid_map(data_dir: pathlib.Path) -> dict[str, str]:
-    """Scan all station-list JSONL files and return {geosncl: edid}."""
+    """Scan all stream-list JSONL files and return {geosncl: edid}.
+
+    Only records with a genuine ``edid`` field contribute — no falling back
+    to the geosncl itself for either side. That fallback used to let a
+    stream list saved without edid (e.g. before api_save_stream_list started
+    including it) "poison" the map with a bogus self-mapped entry
+    (geosncl -> geosncl); since this scans files in alphabetical order and
+    uses setdefault, whichever file came first alphabetically won regardless
+    of whether it actually had a real edid — silently blocking a later,
+    correct file from ever filling in the right value.
+    """
     mapping: dict[str, str] = {}
     sl_dir = paths.stream_lists_dir()
     search_dirs = [sl_dir, data_dir.parent / "stream-lists"]
@@ -759,8 +849,8 @@ def _build_edid_map(data_dir: pathlib.Path) -> dict[str, str]:
                     if not line.strip():
                         continue
                     rec = orjson.loads(line)
-                    gs = rec.get("geosncl") or rec.get("edid", "")
-                    eid = rec.get("edid") or rec.get("geosncl", "")
+                    gs = rec.get("geosncl", "")
+                    eid = rec.get("edid", "")
                     if gs and eid:
                         mapping.setdefault(gs, eid)
             except Exception:

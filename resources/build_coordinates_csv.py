@@ -3,14 +3,16 @@
 Merge three coordinate reference files into a single coordinates.csv.
 
 Priority (highest → lowest):
-  1. GAGE GPS IGS14 solutions      reference/coordinates/gage_gps.igs14.txt
-  2. ShakeAlert extended coords    reference/coordinates/station_coords_extended.dat
-  3. RealTimeDB                    reference/coordinates/rtdb.csv
+  1. GAGE GPS IGS14 solutions      resources/coordinates_generation/gage_gps.igs14.txt
+  2. ShakeAlert extended coords    resources/coordinates_generation/station_coords_extended.dat
+  3. RealTimeDB                    resources/coordinates_generation/rtdb.csv
 
 Any station appearing in a higher-priority source is kept and the lower-priority
 entry is discarded.  The output has no duplicate stations.
 
-Output: reference/coordinates/coordinates.csv
+Output: resources/coordinates.csv (the bundled template — see
+  earthscope_positions.paths.ensure_resource for how it's seeded into the
+  editable <data-directory>/resources/coordinates.csv copy)
   Columns: station, latitude, longitude, height, source
 """
 

@@ -411,7 +411,7 @@ Examples:
     )
     gj_p.add_argument(
         "--spec", metavar="TOML",
-        help="Path spec TOML file (default: ./geojson_path_spec.toml).",
+        help="Path spec TOML file (default: <data-directory>/resources/geojson_path_spec.toml).",
     )
     gj_p.add_argument(
         "--root", metavar="PATH",
@@ -443,7 +443,7 @@ Each input Arrow file produces 8 MiniSEED files (one per channel):
   LYL  Ingest latency         int32    milliseconds
 
 Output paths are controlled by the path-spec TOML file.  A default spec is
-written to miniseed_path_spec.toml in the working directory on first run.
+written to <data-directory>/resources/miniseed_path_spec.toml on first run.
 
 Data gaps (time jumps or null values) produce separate records within each file.
 
@@ -491,7 +491,7 @@ Examples:
     )
     ms_p.add_argument(
         "--spec", metavar="TOML",
-        help="Path spec TOML file (default: ./miniseed_path_spec.toml).",
+        help="Path spec TOML file (default: <data-directory>/resources/miniseed_path_spec.toml).",
     )
     ms_p.add_argument(
         "--root", metavar="PATH",
@@ -893,11 +893,12 @@ def _cmd_export_geojson(args: argparse.Namespace) -> None:
             f"{start} – {stop}."
         )
 
-    spec_path = pathlib.Path(args.spec) if args.spec else pathlib.Path("geojson_path_spec.toml")
+    spec_path = pathlib.Path(args.spec) if args.spec else paths.geojson_spec_file()
     if not spec_path.exists():
-        default_src = _project_root() / "geojson_path_spec.toml"
+        default_src = paths.bundled_resources_dir() / "geojson_path_spec.toml"
         if default_src.exists():
             import shutil
+            spec_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy(default_src, spec_path)
             print(f"Created default path spec: {spec_path}", file=sys.stderr)
         else:
@@ -959,11 +960,12 @@ def _cmd_export_miniseed(args: argparse.Namespace) -> None:
             f"{start} – {stop}."
         )
 
-    spec_path = pathlib.Path(args.spec) if args.spec else pathlib.Path("miniseed_path_spec.toml")
+    spec_path = pathlib.Path(args.spec) if args.spec else paths.miniseed_spec_file()
     if not spec_path.exists():
-        default_src = _project_root() / "miniseed_path_spec.toml"
+        default_src = paths.bundled_resources_dir() / "miniseed_path_spec.toml"
         if default_src.exists():
             import shutil
+            spec_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy(default_src, spec_path)
             print(f"Created default path spec: {spec_path}", file=sys.stderr)
         else:
