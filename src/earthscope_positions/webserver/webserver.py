@@ -2194,6 +2194,7 @@ async def api_export_run(
     start: str = Query(...),
     end: str = Query(...),
     gj_format: str = Query("both"),           # geojson only: compact | full | both
+    ms_version: int = Query(3),               # miniseed only: 3 (default) | 2
     force: bool = Query(False),
 ) -> StreamingResponse:
     """Run es-pos export <format> for the selected lists/date range, streaming logs."""
@@ -2209,6 +2210,11 @@ async def api_export_run(
             yield _sse({"type": "error", "msg": "Invalid date format. Use YYYY-MM-DD."})
             yield _sse({"type": "done", "code": 1})
             return
+        if format == "miniseed" and ms_version not in (2, 3):
+            yield _sse({"type": "error",
+                        "msg": f"Invalid MiniSEED version: {ms_version} (use 2 or 3)."})
+            yield _sse({"type": "done", "code": 1})
+            return
         sel = [l for l in lists if l and l != "all"]
         if not sel:
             yield _sse({"type": "error", "msg": "Select at least one station list."})
@@ -2221,6 +2227,8 @@ async def api_export_run(
         cmd += ["--start-time", start, "--stop-time", end, *_data_dir_args()]
         if format == "geojson":
             cmd += ["--format", gj_format]
+        if format == "miniseed":
+            cmd += ["--format-version", str(ms_version)]
         if force:
             cmd += ["--force"]
 

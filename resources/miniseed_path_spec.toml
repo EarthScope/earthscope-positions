@@ -34,9 +34,12 @@
 #
 # ── FDSN Source Identifier ────────────────────────────────────────────────────
 #
-# Each MiniSEED 3 record uses the identifier:
+# Each record uses the identifier:
 #   FDSN:{network}_{station}_{location}_{band}_{source}_{subsource}
 #   e.g.  FDSN:PW_DEEJ_00_L_Y_E
+#
+# For MiniSEED 2 output this is mapped back to classic SEED network/station/
+# location/channel codes by libmseed.
 #
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -56,10 +59,17 @@ filename = "{network}.{station}.{location}.{channel}.D.{year}.{julday}"
 extension = ".mseed"
 
 [encoding]
-# Maximum samples per MiniSEED record.
-# Each contiguous gap-free segment is chunked into records of this size.
-# 4096 samples = ~68 minutes at 1 Hz.  Increase for fewer, larger records.
-max_samples_per_record = 4096
+# MiniSEED format version: 3 (default) or 2.
+# 3 is the current FDSN standard.  2 is classic SEED, for older tooling that
+# cannot read version 3; it requires max_record_length to be a power of two.
+format_version = 3
+
+# Maximum record size in BYTES (not samples).
+# Each contiguous gap-free segment is packed into records of at most this size.
+# MiniSEED 3 records are variable length, so this is only an upper bound;
+# MiniSEED 2 records are fixed length and this MUST be a power of two
+# between 128 and 65536 (common values: 512, 4096).
+max_record_length = 4096
 
 # Gap threshold as a multiple of the nominal sample interval.
 # A time jump larger than (gap_factor × interval) starts a new record.

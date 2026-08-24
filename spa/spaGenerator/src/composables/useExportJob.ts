@@ -7,11 +7,14 @@ import type { FetchEvent } from "../types";
 // Replay pages.  Only one export runs at a time (guarded by `running`).
 
 export type ExportFormat = "miniseed" | "geojson";
+export type MiniseedVersion = 2 | 3;
 export interface ExportLogEntry { text: string; isError: boolean; isDone: boolean }
 
 // ── Config (persisted) ────────────────────────────────────────────────────────
 const format        = ref<ExportFormat>("miniseed");
 const gjFormat      = ref<"compact" | "full" | "both">("both");
+// MiniSEED 3 is the current FDSN standard and the default; 2 is classic SEED.
+const msVersion     = ref<MiniseedVersion>(3);
 const selectedLists = ref<string[]>([]);
 const startDate     = ref("");
 const endDate       = ref("");
@@ -45,6 +48,7 @@ function start() {
       start: startDate.value,
       end: endDate.value,
       gj_format: gjFormat.value,
+      ms_version: msVersion.value,
       force: force.value,
     },
     (evt: FetchEvent) => {
@@ -71,7 +75,7 @@ function cancel() {
 
 export function useExportJob() {
   return {
-    format, gjFormat, selectedLists, startDate, endDate, force,
+    format, gjFormat, msVersion, selectedLists, startDate, endDate, force,
     specContent, specFileName, specFormatLoaded,
     logs, running, done, exitCode,
     start, cancel,

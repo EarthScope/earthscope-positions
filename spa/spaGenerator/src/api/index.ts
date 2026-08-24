@@ -291,6 +291,7 @@ export function openExportStream(
     start: string;
     end: string;
     gj_format?: "compact" | "full" | "both";
+    ms_version?: 2 | 3;
     force?: boolean;
   },
   onEvent: (e: FetchEvent) => void,
@@ -301,6 +302,7 @@ export function openExportStream(
   q.set("start", params.start);
   q.set("end", params.end);
   if (params.gj_format) q.set("gj_format", params.gj_format);
+  if (params.ms_version) q.set("ms_version", String(params.ms_version));
   if (params.force) q.set("force", "true");
 
   const controller = new AbortController();

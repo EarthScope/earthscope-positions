@@ -25,6 +25,21 @@
               ]"
             />
 
+            <!-- MiniSEED format version -->
+            <template v-if="format === 'miniseed'">
+              <div class="text-caption text-grey-6 q-mt-xs">MiniSEED version</div>
+              <q-select
+                v-model="msVersion"
+                :options="msVersionOptions"
+                dense outlined emit-value map-options
+                :disable="running"
+              />
+              <div v-if="msVersion === 2" class="text-caption text-orange-8">
+                MiniSEED 2 requires <code>max_record_length</code> in the path
+                spec to be a power of two (512, 1024, 2048, 4096&hellip;).
+              </div>
+            </template>
+
             <!-- GeoJSON sub-format -->
             <template v-if="format === 'geojson'">
               <div class="text-caption text-grey-6 q-mt-xs">GeoJSON variant</div>
@@ -175,13 +190,17 @@ const $q = useQuasar();
 
 // Persisted across navigation (config + editor + running job with live logs).
 const {
-  format, gjFormat, selectedLists, startDate, endDate, force,
+  format, gjFormat, msVersion, selectedLists, startDate, endDate, force,
   specContent, specFileName, specFormatLoaded,
   logs, running, done, exitCode,
   start, cancel,
 } = useExportJob();
 
 // View-local (not persisted)
+const msVersionOptions = [
+  { label: "MiniSEED 3 (default)",       value: 3 },
+  { label: "MiniSEED 2 (classic SEED)",  value: 2 },
+];
 const listOptions = ref<{ label: string; value: string }[]>([]);
 const specLoading = ref(false);
 const specSaving  = ref(false);

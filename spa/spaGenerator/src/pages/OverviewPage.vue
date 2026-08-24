@@ -72,8 +72,9 @@ const pages = [
     tips: [
       "Choose Include/Exclude Station Lists to control which stations' streams appear on the map.",
       "Click a station to toggle all its streams, or open its panel to toggle individual streams.",
-      "Use the Filter Streams chips (processing center / stream type) with Add matching /",
-      "Remove matching to bulk-adjust the current selection.",
+      "Use the Filter Streams chips (processing center / stream type) with Only matching /",
+      "Add matching / Remove matching to bulk-adjust the current selection.",
+      "Preview / edit before saving to trim the pending list before it is written.",
     ],
   },
   {

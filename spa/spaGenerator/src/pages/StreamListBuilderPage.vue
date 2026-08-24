@@ -138,12 +138,30 @@ const availableSolTypes = computed(() => {
   }
   return sortSolTypes([...s]);
 });
-watch(availableCenters,  (v) => { filterCenters.value  = defaultSelectedCenters(v); });
-watch(availableSolTypes, (v) => { filterSolTypes.value = defaultSelectedStreamTypes(v); });
+// The chip filters must always keep at least one selection, so `matchingStreams`
+// is never trivially empty.  The defaults are an intersection with a fixed
+// preference list, which can come back empty when a network uses none of the
+// preferred centers/types -- fall back to everything available rather than
+// leaving the user with an empty filter and no way to tell why.
+function withFallback(preferred: string[], available: string[]): string[] {
+  return preferred.length ? preferred : [...available];
+}
+watch(availableCenters, (v) => {
+  filterCenters.value = withFallback(defaultSelectedCenters(v), v);
+});
+watch(availableSolTypes, (v) => {
+  filterSolTypes.value = withFallback(defaultSelectedStreamTypes(v), v);
+});
 
-function toggleItem(list: string[], item: string): void {
+function toggleFilter(list: string[], item: string, label: string): void {
   const i = list.indexOf(item);
-  if (i >= 0) list.splice(i, 1); else list.push(item);
+  if (i < 0) { list.push(item); return; }
+  if (list.length === 1) {
+    $q.notify({ type: 'warning', timeout: 1500,
+                message: `At least one ${label} must stay selected.` });
+    return;
+  }
+  list.splice(i, 1);
 }
 
 const matchingStreams = computed(() => visibleStreamList.value.filter((gs) => {
@@ -152,6 +170,12 @@ const matchingStreams = computed(() => visibleStreamList.value.filter((gs) => {
   return filterCenters.value.includes(p[1]) && filterSolTypes.value.includes(p[3].slice(0, 2));
 }));
 
+// Replace the working set outright -- unlike add/remove, the result does not
+// depend on what was already selected.
+function setMatchingStreams() {
+  enabledStreams.value = new Set(matchingStreams.value);
+  updateAllMarkers();
+}
 function addMatchingStreams() {
   if (!matchingStreams.value.length) return;
   const s = new Set(enabledStreams.value);
@@ -202,15 +226,57 @@ async function loadStreamListOptions() {
 }
 
 // ── Save / manage stream lists ────────────────────────────────────────────────
+async function persistStreamList(name: string, geosncls: string[]): Promise<boolean> {
+  try {
+    // Posting geosncls (rather than raw JSONL) keeps the server-side edid
+    // enrichment, without which `es-pos fetch --list` 422s on every request.
+    await axios.post(`${STREAM_API}/${encodeURIComponent(name)}`, { geosncls });
+    $q.notify({ type: 'positive', message: `Saved stream list "${name}" (${geosncls.length} streams)` });
+    listName.value = '';
+    await loadStreamListOptions();
+    return true;
+  } catch { $q.notify({ type: 'negative', message: 'Save failed' }); return false; }
+}
+
 async function saveList() {
   const name = listName.value.trim();
   if (!name || enabledStreams.value.size === 0) return;
-  try {
-    await axios.post(`${STREAM_API}/${encodeURIComponent(name)}`, { geosncls: [...enabledStreams.value] });
-    $q.notify({ type: 'positive', message: `Saved stream list "${name}" (${enabledStreams.value.size} streams)` });
-    listName.value = '';
-    await loadStreamListOptions();
-  } catch { $q.notify({ type: 'negative', message: 'Save failed' }); }
+  await persistStreamList(name, [...enabledStreams.value]);
+}
+
+// ── Preview / edit the pending list before saving ────────────────────────────
+// Shows the selection as one geosncl per line.  The saved-list editor works on
+// raw JSONL because those files exist on disk already (with their edids); a
+// pending list has no file yet, so this edits the geosncls and lets the server
+// attach edids on save exactly as the plain Save button does.
+const pendingOpen  = ref(false);
+const pendingText  = ref('');
+const pendingSaving = ref(false);
+const pendingError = ref('');
+
+function parsePendingLines(text: string): string[] {
+  return [...new Set(text.split('\n').map(l => l.trim()).filter(Boolean))];
+}
+const pendingCount = computed(() => parsePendingLines(pendingText.value).length);
+
+function openSavePreview() {
+  pendingError.value = ''; pendingSaving.value = false;
+  pendingText.value = [...enabledStreams.value].sort().join('\n');
+  pendingOpen.value = true;
+}
+
+async function savePendingList() {
+  const name = listName.value.trim();
+  if (!name) { pendingError.value = 'Name is required.'; return; }
+  const geosncls = parsePendingLines(pendingText.value);
+  if (!geosncls.length) { pendingError.value = 'The list is empty.'; return; }
+  pendingSaving.value = true; pendingError.value = '';
+  // Keep the on-screen selection in step with what was actually saved, so the
+  // map and the "will be saved" count don't drift from the file.
+  enabledStreams.value = new Set(geosncls);
+  updateAllMarkers();
+  if (await persistStreamList(name, geosncls)) pendingOpen.value = false;
+  pendingSaving.value = false;
 }
 
 async function loadStreamListIntoSelection(name: string) {
@@ -356,7 +422,7 @@ onUnmounted(() => {
               clickable dense size="sm"
               :color="filterCenters.includes(c) ? 'primary' : 'grey-3'"
               :text-color="filterCenters.includes(c) ? 'white' : 'black'"
-              @click="toggleItem(filterCenters, c)"
+              @click="toggleFilter(filterCenters, c, 'processing center')"
             >{{ c }} {{ PROC_CENTERS[c] ?? '' }}</q-chip>
           </div>
           <div class="text-caption text-grey-6 q-mt-xs">Stream type</div>
@@ -367,15 +433,23 @@ onUnmounted(() => {
               clickable dense size="sm"
               :color="filterSolTypes.includes(code) ? 'primary' : 'grey-3'"
               :text-color="filterSolTypes.includes(code) ? 'white' : 'black'"
-              @click="toggleItem(filterSolTypes, code)"
+              @click="toggleFilter(filterSolTypes, code, 'stream type')"
             >{{ code }} {{ solTypeLabel(code) }}</q-chip>
           </div>
           <div class="text-caption text-grey-7 q-mt-xs">{{ matchingStreams.length }} stream(s) match</div>
           <div class="row items-center q-gutter-xs q-mt-xs">
+            <q-btn flat dense size="sm" label="Only matching" color="primary"
+                   :disable="matchingStreams.length === 0" @click="setMatchingStreams">
+              <q-tooltip>Replace the selection with exactly the matching streams</q-tooltip>
+            </q-btn>
             <q-btn flat dense size="sm" label="Add matching" color="positive"
-                   :disable="matchingStreams.length === 0" @click="addMatchingStreams" />
+                   :disable="matchingStreams.length === 0" @click="addMatchingStreams">
+              <q-tooltip>Add the matching streams to the current selection</q-tooltip>
+            </q-btn>
             <q-btn flat dense size="sm" label="Remove matching" color="negative"
-                   :disable="matchingStreams.length === 0" @click="removeMatchingStreams" />
+                   :disable="matchingStreams.length === 0" @click="removeMatchingStreams">
+              <q-tooltip>Remove the matching streams from the current selection</q-tooltip>
+            </q-btn>
           </div>
 
           <q-separator class="q-my-sm" />
@@ -383,8 +457,14 @@ onUnmounted(() => {
           <!-- Save stream list -->
           <div class="text-overline text-grey-7 q-mb-xs">Save Stream List</div>
           <q-input v-model="listName" label="List name" dense outlined class="q-mb-xs" clearable />
-          <q-btn class="full-width q-mb-sm" size="sm" color="positive" unelevated label="Save"
+          <div class="text-caption q-mb-xs" :class="streamCount ? 'text-grey-7' : 'text-grey-5'">
+            {{ streamCount }} stream(s) will be saved
+          </div>
+          <q-btn class="full-width q-mb-xs" size="sm" color="positive" unelevated label="Save"
                  :disable="!listName.trim() || streamCount === 0" @click="saveList" />
+          <q-btn class="full-width q-mb-sm" size="sm" color="primary" outline no-caps
+                 icon="edit_note" label="Preview / edit before saving"
+                 :disable="streamCount === 0" @click="openSavePreview" />
 
           <!-- Manage stream lists -->
           <div class="text-overline text-grey-7 q-mb-xs">Stream Lists</div>
@@ -471,6 +551,35 @@ onUnmounted(() => {
     </div>
 
     <!-- Edit stream list -->
+    <q-dialog v-model="pendingOpen" maximized>
+      <q-card class="column no-wrap">
+        <q-card-section class="row items-center q-py-sm bg-primary text-white">
+          <q-icon name="edit_note" class="q-mr-sm" />
+          <div class="text-subtitle1">Stream list to save</div>
+          <q-space />
+          <q-input v-model="listName" dense outlined dark label="List name" style="width:280px"
+                   :suffix="'.jsonl'" :disable="pendingSaving" />
+          <q-btn flat round dense icon="close" class="q-ml-sm" v-close-popup :disable="pendingSaving" />
+        </q-card-section>
+        <q-banner v-if="pendingError" dense class="bg-red-1 text-negative">{{ pendingError }}</q-banner>
+        <q-card-section class="q-py-xs text-caption text-grey-7">
+          One geosncl per line. Blank lines and duplicates are dropped. Saving also
+          updates the selection on the map to match what you edit here.
+        </q-card-section>
+        <q-card-section class="col q-pa-none" style="min-height:0">
+          <q-input v-model="pendingText" type="textarea" outlined class="edit-jsonl fit"
+                   input-class="edit-jsonl-input" :disable="pendingSaving" />
+        </q-card-section>
+        <q-separator />
+        <q-card-actions align="right" class="q-pa-md">
+          <div class="text-caption text-grey-6 q-mr-auto">{{ pendingCount }} stream(s) will be saved</div>
+          <q-btn flat no-caps label="Cancel" v-close-popup :disable="pendingSaving" />
+          <q-btn no-caps unelevated color="positive" label="Save" :loading="pendingSaving"
+                 :disable="!listName.trim() || pendingCount === 0" @click="savePendingList" />
+        </q-card-actions>
+      </q-card>
+    </q-dialog>
+
     <q-dialog v-model="editOpen" maximized>
       <q-card class="column no-wrap">
         <q-card-section class="row items-center q-py-sm bg-primary text-white">

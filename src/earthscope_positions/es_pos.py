@@ -428,9 +428,9 @@ Examples:
 
     ms_p = export_sub.add_parser(
         "miniseed",
-        help="Write Arrow files as MiniSEED 3.",
+        help="Write Arrow files as MiniSEED (version 3 by default, 2 optional).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        description="""Write GNSS position Arrow files as MiniSEED 3.
+        description="""Write GNSS position Arrow files as MiniSEED.
 
 Each input Arrow file produces 8 MiniSEED files (one per channel):
   LYE  East position          float64  metres
@@ -444,6 +444,10 @@ Each input Arrow file produces 8 MiniSEED files (one per channel):
 
 Output paths are controlled by the path-spec TOML file.  A default spec is
 written to <data-directory>/resources/miniseed_path_spec.toml on first run.
+
+Format version defaults to 3 (the current FDSN standard).  Pass
+--format-version 2 for classic SEED, for tooling that cannot read version 3;
+version 2 requires the spec's max_record_length to be a power of two.
 
 Data gaps (time jumps or null values) produce separate records within each file.
 
@@ -459,6 +463,7 @@ Examples:
   es-pos export miniseed -i ShakeAlert --start-time 2026-01-01 --duration 30d
   es-pos export miniseed --all --stop-time 2026-01-31 --duration 7d
   es-pos export miniseed -i ShakeAlert --start-time 2026-01-01 --duration 7d --root /archive/mseed
+  es-pos export miniseed -i ShakeAlert --start-time 2026-01-01 --duration 7d --format-version 2
 """,
     )
     ms_p.add_argument(
@@ -496,6 +501,13 @@ Examples:
     ms_p.add_argument(
         "--root", metavar="PATH",
         help="Override the output root directory from the spec.",
+    )
+    ms_p.add_argument(
+        "--format-version", type=int, choices=(2, 3), default=None,
+        help=(
+            "MiniSEED format version to write (default: the spec's "
+            "[encoding] format_version, which ships as 3)."
+        ),
     )
     ms_p.add_argument(
         "--quiet", "-q", action="store_true",
@@ -948,7 +960,8 @@ def _cmd_export_geojson(args: argparse.Namespace) -> None:
 
 def _cmd_export_miniseed(args: argparse.Namespace) -> None:
     from earthscope_positions.export.miniseed_writer import (
-        load_spec, write_arrow_to_miniseed, expected_out_paths as ms_expected_paths,
+        DEFAULT_FORMAT_VERSION, load_spec, write_arrow_to_miniseed,
+        expected_out_paths as ms_expected_paths,
     )
 
     start, stop = _resolve_export_date_range(args)
@@ -977,8 +990,14 @@ def _cmd_export_miniseed(args: argparse.Namespace) -> None:
     if args.root:
         spec["root"] = args.root
 
+    version = (
+        args.format_version
+        if args.format_version is not None
+        else int(spec["encoding"].get("format_version", DEFAULT_FORMAT_VERSION))
+    )
+
     print(
-        f"Exporting {len(arrow_files)} file(s)  [{start} – {stop}]",
+        f"Exporting {len(arrow_files)} file(s) as MiniSEED {version}  [{start} – {stop}]",
         file=sys.stderr,
     )
     total_written = 0
@@ -994,13 +1013,16 @@ def _cmd_export_miniseed(args: argparse.Namespace) -> None:
         if not args.quiet:
             print(f"[{i}/{len(arrow_files)}] {af}", file=sys.stderr)
         try:
-            written = write_arrow_to_miniseed(af, spec, verbose=not args.quiet)
+            written = write_arrow_to_miniseed(
+                af, spec, format_version=version, verbose=not args.quiet,
+            )
             total_written += len(written)
         except Exception as exc:
             print(f"  [error] {exc}", file=sys.stderr)
 
     suffix = f", {total_skipped} skipped" if total_skipped else ""
-    print(f"\nDone.  {total_written} MiniSEED file(s) written{suffix}.", file=sys.stderr)
+    print(f"\nDone.  {total_written} MiniSEED {version} file(s) written{suffix}.",
+          file=sys.stderr)
 
 
 def _cmd_webserver(args: argparse.Namespace) -> None:

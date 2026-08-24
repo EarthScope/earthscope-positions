@@ -102,13 +102,20 @@ const HELP: Record<string, HelpEntry> = {
       <div class="help-section-label">Filter Streams</div>
       <ul>
         <li>Chips list the processing centers and stream types present among the currently
-            visible stations' streams — click to include/exclude a chip from the filter</li>
+            visible stations' streams — click to include/exclude a chip from the filter.
+            At least one processing center and one stream type always stay selected</li>
+        <li><strong>Only matching</strong> replaces your working set with exactly the
+            matching streams, ignoring what was selected before</li>
         <li><strong>Add matching</strong> adds every stream matching the current chip
             selection to your working set; <strong>Remove matching</strong> removes them</li>
       </ul>
       <div class="help-section-label">Saving</div>
       <ul>
-        <li>Enter a name and <strong>Save</strong> to store the stream list</li>
+        <li>Enter a name and <strong>Save</strong> to store the stream list — the caption
+            above the button shows how many streams it will contain</li>
+        <li><strong>Preview / edit before saving</strong> opens the pending list as one
+            geosncl per line, so you can trim it before it is written. Saving from there
+            also updates the map selection to match</li>
       </ul>`,
   },
   "/fetch-data": {
@@ -292,6 +299,10 @@ const HELP: Record<string, HelpEntry> = {
       <div class="help-section-label">Convert</div>
       <ul>
         <li>Pick a format (MiniSEED, or GeoJSON compact / full / both)</li>
+        <li>For MiniSEED, pick the <strong>version</strong>: 3 (default, the current
+            FDSN standard) or 2 (classic SEED, for tooling that cannot read v3).
+            Version 2 needs <code>max_record_length</code> in the path spec to be a
+            power of two</li>
         <li>Choose stream list(s) and a date range, then click <strong>Convert</strong></li>
         <li>Click the calendar icon inside the <strong>Start date</strong> or <strong>End date</strong>
             box; click a day, then click it again to set just that field, or click a different
