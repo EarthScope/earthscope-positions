@@ -16,23 +16,6 @@ Download, store, process, visualize, and export GNSS PPP position data from the 
 
 ---
 
-## Quick start
-
-```bash
-es user login       # authenticate with EarthScope
-es-pos webserver    # → open http://localhost:8000
-```
-
-That is the whole setup. On first run the server picks a
-[data directory](#where-your-data-lives), seeds the default stream and station lists, and
-everything else — building lists, downloading data, processing, plotting, exporting,
-replaying — is available from the tabs in the browser.
-
-The CLI does the same jobs if you would rather script them; see the
-[CLI reference](#cli-reference).
-
----
-
 ## Installation
 
 Requires **Python ≥ 3.11**. (3.11 is the floor because the export path-spec
@@ -51,6 +34,37 @@ source venv/bin/activate
 ```
 
 The `es` and `es-pos` CLIs are now available in your virtual environment.
+
+---
+
+## Quick start
+
+Please follow the installation instructions and active the environment, then run the following commands to start the web server:
+
+```bash
+es user login       # authenticate with EarthScope
+es-pos webserver    # → open http://localhost:8000
+```
+
+That is the whole setup. On first run the server picks a
+[data directory](#where-your-data-lives), seeds the default stream and station lists, and
+everything else — building lists, downloading data, processing, plotting, exporting,
+replaying — is available from the tabs in the browser.
+
+The CLI does the same jobs if you would rather script them; see the
+[CLI reference](#cli-reference).
+
+---
+
+## Docker quick start
+
+```bash
+./es-pos-docker.sh build
+./es-pos-docker.sh run --detach
+docker logs -f earthscope-positions
+```
+
+Please note that this application scans the entire data directory for many requests.  On a Mac, the bind mounds make this request significantly slower than running the application outside of docker.  This is much less of an issue on Linux.
 
 ### The SPA
 

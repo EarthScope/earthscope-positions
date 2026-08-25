@@ -41,7 +41,7 @@
 # Newline-delimited JSON — one compact record per sample.
 # Files can be streamed/appended easily.
 
-root      = "data/geojson/compact"
+root      = "geojson/compact"
 directory = "{year}/{network}/{station}"
 filename  = "{geosncl}.{year}.{julday}"
 extension = ".compact.geojson.jsonl"
@@ -56,7 +56,7 @@ extension = ".compact.geojson.jsonl"
 # GeoJSON as JSONL — one GeoJSON Feature per line, one file per station-day.
 # Each Feature carries SNCL and sampleRate in its properties.
 
-root      = "data/geojson/full"
+root      = "geojson/full"
 directory = "{year}/{network}/{station}"
 filename  = "{geosncl}.{year}.{julday}"
 extension = ".full.geojson.jsonl"

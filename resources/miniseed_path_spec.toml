@@ -44,7 +44,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Root output directory (absolute or relative to working directory).
-root = "data/miniseed"
+root = "miniseed"
 
 # Sub-directory tree under root.
 # Classic SEED Day-Volume (SDS) layout shown below.

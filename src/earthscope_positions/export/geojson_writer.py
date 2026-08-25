@@ -25,6 +25,8 @@ import re
 import sys
 import tomllib
 
+from earthscope_positions import paths
+
 import orjson
 
 
@@ -57,7 +59,7 @@ def _parse_geosncl(geosncl: str) -> tuple[str, str, str, str]:
 
 _SPEC_DEFAULTS: dict = {
     "compact": {
-        "root":      "data/geojson/compact",
+        "root":      "geojson/compact",
         "directory": "{year}/{network}/{station}",
         "filename":  "{geosncl}.{year}.{julday}",
         "extension": ".compact.geojson.jsonl",
@@ -66,7 +68,7 @@ _SPEC_DEFAULTS: dict = {
         },
     },
     "full": {
-        "root":      "data/geojson/full",
+        "root":      "geojson/full",
         "directory": "{year}/{network}/{station}",
         "filename":  "{geosncl}.{year}.{julday}",
         "extension": ".full.geojson.jsonl",
@@ -97,7 +99,7 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 
 def _out_path(section: dict, variables: dict) -> pathlib.Path:
-    root      = pathlib.Path(section["root"])
+    root      = paths.resolve_export_root(section["root"])
     directory = section["directory"].format_map(variables)
     filename  = section["filename"].format_map(variables) + section["extension"]
     return root / directory / filename
@@ -220,11 +222,7 @@ def write_arrow_to_compact_json(
             n_written += 1
 
     if verbose:
-        try:
-            display = out.relative_to(pathlib.Path.cwd())
-        except ValueError:
-            display = out
-        print(f"  compact  {display}  ({n_written:,} records, {out.stat().st_size:,} B)")
+        print(f"  compact  {out}  ({n_written:,} records, {out.stat().st_size:,} B)")
 
     return out
 
@@ -327,11 +325,7 @@ def write_arrow_to_full_geojson(
             n_written += 1
 
     if verbose:
-        try:
-            display = out.relative_to(pathlib.Path.cwd())
-        except ValueError:
-            display = out
-        print(f"  full     {display}  ({n_written:,} features, {out.stat().st_size:,} B)")
+        print(f"  full     {out}  ({n_written:,} features, {out.stat().st_size:,} B)")
 
     return out
 

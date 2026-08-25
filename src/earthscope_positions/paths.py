@@ -569,6 +569,31 @@ def resources_dir() -> pathlib.Path:
     return base_dir() / "resources"
 
 
+#: Path specs written before the data directory moved used CWD-relative roots
+#: like "data/miniseed", back when the data directory itself was ./data.  That
+#: leading segment is now redundant -- and actively wrong, since it would nest
+#: the exports at <base>/data/miniseed.
+_LEGACY_ROOT_PREFIX = "data"
+
+
+def resolve_export_root(root: "str | os.PathLike[str]") -> pathlib.Path:
+    """Resolve an export path-spec ``root`` to an absolute directory.
+
+    An absolute root is honoured as-is.  A *relative* root is anchored to the
+    data directory, never the current working directory -- anchoring to the CWD
+    silently wrote exports next to wherever the command happened to be run
+    from, which inside a container meant the image's own filesystem rather than
+    the mounted data directory, so they vanished when it stopped.
+    """
+    path = pathlib.Path(root).expanduser()
+    if path.is_absolute():
+        return path
+    parts = path.parts
+    if parts and parts[0] == _LEGACY_ROOT_PREFIX:
+        parts = parts[1:]          # "data/miniseed" -> "miniseed"
+    return base_dir().joinpath(*parts) if parts else base_dir()
+
+
 def ensure_resource(name: str) -> pathlib.Path:
     """Return ``resources_dir()/<name>``, seeding it from the bundled
     ``resources/<name>`` template on first use.

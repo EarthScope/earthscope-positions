@@ -40,6 +40,8 @@ import pathlib
 import re
 import sys
 import tomllib
+
+from earthscope_positions import paths
 from typing import NamedTuple
 
 from pymseed import DataEncoding, MS3TraceList
@@ -197,7 +199,9 @@ def _check_record_length(max_record_length: int, format_version: int) -> int:
 # ---------------------------------------------------------------------------
 
 _SPEC_DEFAULTS: dict = {
-    "root":      "data/miniseed",
+    # Relative to the data directory (see paths.resolve_export_root), not the
+    # working directory.
+    "root":      "miniseed",
     "directory": "{year}/{network}/{station}/{channel}.D",
     "filename":  "{network}.{station}.{location}.{channel}.D.{year}.{julday}",
     "extension": ".ms",
@@ -240,7 +244,7 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 
 def _out_path(spec: dict, variables: dict) -> pathlib.Path:
-    root      = pathlib.Path(spec["root"])
+    root      = paths.resolve_export_root(spec["root"])
     directory = spec["directory"].format_map(variables)
     filename  = spec["filename"].format_map(variables) + spec["extension"]
     return root / directory / filename
@@ -389,11 +393,10 @@ def write_arrow_to_miniseed(
         written.append(out)
 
         if verbose:
-            try:
-                display = out.relative_to(pathlib.Path.cwd())
-            except ValueError:
-                display = out
-            print(f"  {channel}  {display}"
+            # Absolute: a CWD-relative path looked like it was written
+            # beside the command, which is what masked exports landing
+            # inside the container instead of on the mounted data dir.
+            print(f"  {channel}  {out}"
                   f"  ({out.stat().st_size:,} B, {n_rec} rec, "
                   f"{len(segments)} seg, v{version})")
 
