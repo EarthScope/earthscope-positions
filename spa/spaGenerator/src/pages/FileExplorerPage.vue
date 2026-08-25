@@ -98,6 +98,23 @@
                   <div class="text-caption">Rename and delete still work.</div>
                 </q-banner>
 
+                <!-- Plot the samples the file actually contains -->
+                <template v-if="summary.plottable && !summary.error">
+                  <div class="text-subtitle2 q-mb-xs">
+                    {{ summary.kind === 'miniseed' ? 'Waveform' : 'Time series' }}
+                  </div>
+                  <div v-if="plotFailed" class="text-caption text-orange-9 q-mb-md">
+                    Could not plot this file — the summary below still applies.
+                  </div>
+                  <img
+                    v-else
+                    :src="plotUrl" :alt="`Waveform of ${selectedPath}`"
+                    class="q-mb-md"
+                    style="max-width: 100%; height: auto; border: 1px solid #e0e0e0; border-radius: 4px"
+                    @error="plotFailed = true"
+                  />
+                </template>
+
                 <div class="text-subtitle2 q-mb-xs">{{ kindLabel(summary.kind) }}</div>
                 <q-markup-table v-if="summary.rows?.length" flat bordered dense
                                 class="q-mb-md" style="max-width: 560px">
@@ -184,9 +201,15 @@
                   </q-markup-table>
                 </template>
 
-                <!-- JSONL / CSV: first lines -->
+                <!-- JSONL / CSV / GeoJSON: first lines -->
                 <template v-if="summary.sample?.length">
-                  <div class="text-subtitle2 q-mb-xs">First {{ summary.sample.length }} line(s)</div>
+                  <div class="text-subtitle2 q-mb-xs">
+                    First {{ summary.sample.length }} line(s)
+                    <span v-if="summary.sample_total && summary.sample_total > summary.sample.length"
+                          class="text-caption text-grey-6">
+                      of {{ summary.sample_total.toLocaleString() }}
+                    </span>
+                  </div>
                   <pre class="sample-block">{{ summary.sample.join('\n') }}</pre>
                 </template>
               </template>
@@ -291,6 +314,8 @@ interface Summary {
   settings?: { key: string; value: string }[];
   stations?: string[];
   sample?: string[];
+  sample_total?: number;
+  plottable?: boolean;
   error?: string;
 }
 
@@ -306,6 +331,13 @@ const summaryLoading = ref(false);
 
 const downloadUrl = computed(() =>
   selectedPath.value ? `/api/files/download?path=${encodeURIComponent(selectedPath.value)}` : "");
+
+// Server-rendered: a station-day at 1 Hz is 86,400 samples per channel, far
+// more than is worth shipping to the browser for a preview.
+const plotUrl = computed(() =>
+  selectedPath.value ? `/api/files/plot?path=${encodeURIComponent(selectedPath.value)}` : "");
+const plotFailed = ref(false);
+watch(selectedPath, () => { plotFailed.value = false; });
 
 // ── Presentation helpers ─────────────────────────────────────────────────────
 const KIND_ICONS: Record<string, string> = {

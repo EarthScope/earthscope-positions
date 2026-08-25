@@ -47,9 +47,12 @@ filename  = "{geosncl}.{year}.{julday}"
 extension = ".compact.geojson.jsonl"
 
 [compact.options]
-# Round position and error values to this many decimal places.
-# Omit or set to null for full float64 precision.  6 = sub-millimetre.
-# round_decimals = 6
+# Round position and error values (metres) to this many decimal places.
+# 3 = millimetres, the finest resolution meaningful for GNSS PPP output and the
+# maximum this writer will emit — a larger value here is capped at 3.
+# Writing raw float64 leaks binary-representation noise into the JSON
+# (0.037 arriving as 0.037000000000000005), which is not extra precision.
+round_decimals = 3
 
 
 [full]
@@ -62,6 +65,6 @@ filename  = "{geosncl}.{year}.{julday}"
 extension = ".full.geojson.jsonl"
 
 [full.options]
-# Round position and error values to this many decimal places.
-# null = full precision.  6 = sub-millimetre (0.000001 m).
-round_decimals = 6
+# Round position and error values (metres) to this many decimal places.
+# 3 = millimetres; larger values are capped at 3.  See the compact section above.
+round_decimals = 3

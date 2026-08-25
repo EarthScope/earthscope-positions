@@ -1,1 +1,0 @@
-import{i as u,bm as o}from"./index-Br14BcrD.js";function i(t,r,n){return n<=r?r:Math.min(n,Math.max(r,t))}function f(t,r,n){if(n<=r)return r;const e=n-r+1;let a=r+(t-r)%e;return a<r&&(a=e+a),a===0?0:a}function c(t,r=2,n="0"){if(t==null)return t;const e=String(t);return e.length>=r?e:new Array(r-e.length+1).join(n)+e}function l(){return u(o)}export{i as b,f as n,c as p,l as u};

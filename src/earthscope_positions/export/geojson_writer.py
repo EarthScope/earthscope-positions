@@ -54,6 +54,54 @@ def _parse_geosncl(geosncl: str) -> tuple[str, str, str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Value rounding
+# ---------------------------------------------------------------------------
+
+#: Positions and uncertainties are metres, so 3 decimals is millimetre
+#: resolution -- the finest that is meaningful for GNSS PPP output.  Writing
+#: raw float64 leaks binary-representation artifacts into the JSON
+#: (0.037 arriving as 0.037000000000000005), which is noise, not precision.
+MAX_DECIMALS = 3
+
+_warned_precision = False
+
+
+def _round_decimals(configured: "int | None") -> int:
+    """Decimal places to use, capped at millimetre resolution.
+
+    A spec asking for more than :data:`MAX_DECIMALS` is honoured up to the cap
+    and reported once -- silently ignoring a setting someone deliberately wrote
+    is worse than telling them it was clamped.
+    """
+    global _warned_precision
+    if configured is None:
+        return MAX_DECIMALS
+    try:
+        value = int(configured)
+    except (TypeError, ValueError):
+        return MAX_DECIMALS
+    if value > MAX_DECIMALS:
+        if not _warned_precision:
+            print(f"[warn] round_decimals={value} exceeds millimetre resolution; "
+                  f"capped at {MAX_DECIMALS}.", file=sys.stderr)
+            _warned_precision = True
+        return MAX_DECIMALS
+    return max(0, value)
+
+
+def _make_rounder(configured: "int | None"):
+    """Return a rounding function for coordinate/error values."""
+    digits = _round_decimals(configured)
+
+    def _round(v: "float | None") -> "float | None":
+        # round() once, on the value as read -- rounding an already-rounded
+        # value is what produces the trailing-digit noise this exists to stop.
+        return None if v is None else round(float(v), digits)
+
+    return _round
+
+
+# ---------------------------------------------------------------------------
 # Path spec (TOML)
 # ---------------------------------------------------------------------------
 
@@ -64,7 +112,8 @@ _SPEC_DEFAULTS: dict = {
         "filename":  "{geosncl}.{year}.{julday}",
         "extension": ".compact.geojson.jsonl",
         "options": {
-            "round_decimals": None,   # None = full precision; set to e.g. 6 for cleaner output
+            # Millimetres.  Capped at MAX_DECIMALS regardless of the spec.
+            "round_decimals": MAX_DECIMALS,
         },
     },
     "full": {
@@ -73,7 +122,8 @@ _SPEC_DEFAULTS: dict = {
         "filename":  "{geosncl}.{year}.{julday}",
         "extension": ".full.geojson.jsonl",
         "options": {
-            "round_decimals":  6,
+            # Millimetres.  Capped at MAX_DECIMALS regardless of the spec.
+            "round_decimals":  MAX_DECIMALS,
         },
     },
 }
@@ -186,12 +236,7 @@ def write_arrow_to_compact_json(
 
     section = spec["compact"]
     opts_c  = section.get("options", {})
-    rd_c    = opts_c.get("round_decimals", None)
-
-    def _rc(v: float | None) -> float | None:
-        if v is None or rd_c is None:
-            return v
-        return round(v, rd_c)
+    _rc = _make_rounder(opts_c.get("round_decimals"))
 
     pvars = _path_vars(geosncl, station, network, location, chan_base, valid_times[0])
     out = _out_path(section, pvars)
@@ -268,12 +313,7 @@ def write_arrow_to_full_geojson(
     q_col:  list[int | None]   = table.column("qChannel").to_pylist()
 
     opts    = spec["full"].get("options", {})
-    rd      = opts.get("round_decimals", None)
-
-    def _r(v: float | None) -> float | None:
-        if v is None or rd is None:
-            return v
-        return round(v, rd)
+    _r      = _make_rounder(opts.get("round_decimals"))
 
     # First pass: collect valid samples so the per-feature sampleRate can be
     # computed before we write.

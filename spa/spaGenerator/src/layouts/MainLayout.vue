@@ -307,12 +307,24 @@ const HELP: Record<string, HelpEntry> = {
       </ul>
       <div class="help-section-label">What you get per file</div>
       <ul>
-        <li><strong>.arrow</strong> — row and column counts, first/last sample, span,
-            nominal rate, and the column schema with null counts</li>
-        <li><strong>MiniSEED</strong> — records, samples, channels, format version,
-            encoding, time span, and a per-source-ID sample count</li>
+        <li><strong>.arrow</strong> — a time-series plot of every numeric column,
+            plus row and column counts, first/last sample, span, nominal rate, and the
+            column schema with null counts</li>
+        <li><strong>.completeness.arrow</strong> — completeness ratio per time bucket
+            (pinned to 0–1 so a healthy flat line reads as complete), sample vs expected
+            counts, and mean ingest latency / processing delay</li>
+        <li><strong>_ppsd.arrow</strong> — the three-panel East/North/Up probabilistic
+            power spectral density, rendered exactly as <code>es-pos export ppsd</code>
+            draws it</li>
+        <li><strong>MiniSEED</strong> — a plot of the samples in the file,
+            plus records, samples, channels, format version, encoding, time span, and a
+            per-source-ID sample count</li>
+        <li>All plots show gaps as breaks rather than interpolating across them, and
+            long series are reduced to a min/max envelope per pixel bucket so spikes
+            survive the downsampling</li>
         <li><strong>GeoJSON</strong> — shape (FeatureCollection or NDJSON), feature and
-            station counts, time range, and the lat/lon bounds</li>
+            station counts, time range, the lat/lon bounds, the first 25 lines, and a
+            time-series plot of the ENU components, uncertainties and quality</li>
         <li><strong>.jsonl</strong> — whether it is a stream or station list, entry
             counts, the fields present, and the first few lines</li>
         <li><strong>Images</strong> — displayed as before</li>

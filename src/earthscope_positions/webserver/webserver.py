@@ -51,7 +51,7 @@ import pyarrow.compute as pc
 import pyarrow.ipc as ipc
 
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -2803,6 +2803,25 @@ def _summarize_miniseed(target: pathlib.Path) -> dict:
     return {"rows": rows, "channels": channels}
 
 
+#: Lines of a GeoJSON file shown in the preview.  These are usually NDJSON --
+#: one feature per line -- so a couple of dozen lines is a genuinely useful
+#: look at the data rather than just the opening brace.
+_GEOJSON_SAMPLE_LINES = 25
+
+#: A single-line FeatureCollection can be megabytes on one line; truncate so the
+#: preview stays renderable.
+_SAMPLE_LINE_MAX_CHARS = 2000
+
+
+def _sample_lines(text: str, limit: int) -> list[str]:
+    """First *limit* lines, each clipped to a sane width."""
+    out: list[str] = []
+    for line in text.splitlines()[:limit]:
+        out.append(line if len(line) <= _SAMPLE_LINE_MAX_CHARS
+                   else line[:_SAMPLE_LINE_MAX_CHARS] + f"… ({len(line):,} chars)")
+    return out
+
+
 def _summarize_geojson(target: pathlib.Path) -> dict:
     """Summarize a GeoJSON file: either a FeatureCollection or NDJSON features."""
     text = target.read_text(encoding="utf-8", errors="replace")
@@ -2857,7 +2876,9 @@ def _summarize_geojson(target: pathlib.Path) -> dict:
             except (TypeError, ValueError):
                 pass
 
-    rows = [("Shape", shape), ("Features", f"{len(features):,}")]
+    total_lines = text.count("\n") + (0 if text.endswith("\n") or not text else 1)
+    rows = [("Shape", shape), ("Features", f"{len(features):,}"),
+            ("Lines", f"{total_lines:,}")]
     if stations:
         rows.append(("Stations", f"{len(stations):,}"))
     if times:
@@ -2866,7 +2887,12 @@ def _summarize_geojson(target: pathlib.Path) -> dict:
     if lats and lons:
         rows.append(("Latitude range", f"{min(lats):.5f} … {max(lats):.5f}"))
         rows.append(("Longitude range", f"{min(lons):.5f} … {max(lons):.5f}"))
-    return {"rows": rows, "stations": sorted(stations)[:200]}
+    return {
+        "rows": rows,
+        "stations": sorted(stations)[:200],
+        "sample": _sample_lines(text, _GEOJSON_SAMPLE_LINES),
+        "sample_total": total_lines,
+    }
 
 
 def _summarize_jsonl(target: pathlib.Path) -> dict:
@@ -3044,6 +3070,10 @@ async def api_files_summary(path: str) -> JSONResponse:
         "kind": kind,
         "size": stat.st_size,
         "mtime": stat.st_mtime,
+        # Whether /api/files/plot will produce something for this file, so the
+        # UI does not request a plot it is going to be refused.
+        "plottable": kind in ("miniseed", "geojson")
+                     or (kind == "arrow" and _is_plottable_arrow(target)),
         "editable": kind in ("jsonl", "geojson", "text", "csv", "toml")
                     and target.suffix.lower() in _TEXT_EDIT_SUFFIXES
                     and stat.st_size <= _MAX_EDIT_BYTES,
@@ -3159,6 +3189,379 @@ async def api_files_delete(path: str) -> JSONResponse:
     target.unlink()
     _log.info("[files] deleted %s", path)
     return JSONResponse({"ok": True, "path": path})
+
+
+#: Channel subsource -> (human label, unit).  Matches the export mapping in
+#: earthscope_positions.export.miniseed_writer.CHANNELS.
+_MSEED_CHANNEL_LABELS = {
+    "E": ("East", "m"), "N": ("North", "m"), "Z": ("Up", "m"),
+    "1": ("East uncertainty", "m"), "2": ("North uncertainty", "m"),
+    "3": ("Up uncertainty", "m"),
+    "Q": ("Quality", ""), "L": ("Ingest latency", "ms"),
+}
+
+#: Points drawn per trace.  Beyond this the series is reduced to a min/max
+#: envelope per bucket -- plain striding would drop spikes entirely, which for
+#: a data-quality preview is the one thing that must not happen.
+_PLOT_MAX_POINTS = 4000
+
+
+def _arrow_plot_kind(target: pathlib.Path) -> str:
+    """Which renderer an Arrow file needs.
+
+    Three different shapes live behind the same extension: raw positions and
+    completeness are both time series (different time columns), while PPSD is a
+    2D period/power histogram and is not a time series at all.
+    """
+    name = target.name
+    if "_ppsd" in name:
+        return "ppsd"
+    if ".completeness" in name:
+        return "completeness"
+    return "positions"
+
+
+def _is_plottable_arrow(target: pathlib.Path) -> bool:
+    return True   # every Arrow shape has a renderer; see _arrow_plot_kind
+
+
+#: Time column by Arrow shape -- positions are per-sample, completeness is
+#: bucketed.
+_ARROW_TIME_COLUMNS = ("time", "bucket_start_ms")
+
+
+#: Column -> (label, unit) for the position schema.  Anything not listed is
+#: still plotted, just without a friendly name.
+_ARROW_COLUMN_LABELS = {
+    "east": ("East", "m"), "north": ("North", "m"), "up": ("Up", "m"),
+    "sigEE": ("East uncertainty", "m"), "sigNN": ("North uncertainty", "m"),
+    "sigUU": ("Up uncertainty", "m"),
+    "qChannel": ("Quality", ""), "ingestLatency": ("Ingest latency", "ms"),
+    "processingDelay": ("Processing delay", "ms"),
+    # completeness
+    "completeness": ("Completeness", "fraction"),
+    "row_count": ("Samples in bucket", ""),
+    "expected_count": ("Expected in bucket", ""),
+    "mean_ingest_latency_s": ("Mean ingest latency", "s"),
+    "mean_processing_delay_s": ("Mean processing delay", "s"),
+}
+
+#: Columns whose natural range is 0..1 -- pinned so a healthy flat line at 1.0
+#: reads as "complete" instead of being autoscaled into a noisy hairline.
+_UNIT_RANGE_COLUMNS = {"completeness"}
+
+
+def _arrow_series(target: pathlib.Path) -> dict:
+    """Every numeric column of a position Arrow file, keyed by column name.
+
+    Times are epoch milliseconds; they are converted to nanoseconds so all the
+    plot sources share one unit.
+    """
+    table = ipc.open_stream(target).read_all()
+    time_col = next((c for c in _ARROW_TIME_COLUMNS if c in table.column_names), None)
+    if time_col is None or table.num_rows == 0:
+        return {}
+    times_ms = table.column(time_col).to_pylist()
+    series: dict[str, dict] = {}
+    for name in table.column_names:
+        if name == time_col:
+            continue
+        field = table.schema.field(name)
+        if not (pa.types.is_integer(field.type) or pa.types.is_floating(field.type)):
+            continue
+        values = table.column(name).to_pylist()
+        t_out: list[float] = []
+        v_out: list[float] = []
+        for t, v in zip(times_ms, values):
+            if t is None:
+                continue
+            t_out.append(t * 1e6)
+            # None becomes NaN so a missing sample shows as a break rather than
+            # being closed over by the line.
+            v_out.append(float("nan") if v is None else float(v))
+        if t_out:
+            series[name] = {"t": t_out, "v": v_out}
+    return series
+
+
+def _feature_time_ns(value) -> "float | None":
+    """A GeoJSON feature's time as epoch nanoseconds.
+
+    The exporters write epoch milliseconds, but hand-written or third-party
+    GeoJSON commonly carries an ISO-8601 string, so accept both rather than
+    failing the whole plot on the first such record.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value) * 1e6
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:                                  # numeric string
+            return float(text) * 1e6
+        except ValueError:
+            pass
+        try:
+            parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        return parsed.timestamp() * 1e9
+    return None
+
+
+def _geojson_series(target: pathlib.Path) -> dict:
+    """Numeric series from an exported GeoJSON file.
+
+    Handles both shapes this tool writes: the compact record
+    (``coor``/``err`` arrays) and the full Feature (ENU in ``geometry`` with
+    errors in ``properties``).  Both are flattened to the same named columns so
+    the two exports of the same data plot identically.
+    """
+    enu = ("East", "North", "Up")
+    err = ("East uncertainty", "North uncertainty", "Up uncertainty")
+    series: dict[str, dict] = {}
+
+    def add(name: str, t_ms, value) -> None:
+        ns = _feature_time_ns(t_ms)
+        if ns is None or value is None:
+            return
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return
+        entry = series.setdefault(name, {"t": [], "v": []})
+        entry["t"].append(ns)
+        entry["v"].append(v)
+
+    for line in target.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+
+        props = rec.get("properties") if isinstance(rec.get("properties"), dict) else {}
+        t = rec.get("time", props.get("time"))
+
+        coords = (rec.get("geometry") or {}).get("coordinates") if props else rec.get("coor")
+        if isinstance(coords, list):
+            for name, value in zip(enu, coords):
+                add(name, t, value)
+
+        if props:
+            for name, key in zip(err, ("EError", "NError", "UError")):
+                add(name, t, props.get(key))
+            add("Quality", t, props.get("quality"))
+        else:
+            errs = rec.get("err")
+            if isinstance(errs, list):
+                for name, value in zip(err, errs):
+                    add(name, t, value)
+            add("Quality", t, rec.get("Q"))
+    return series
+
+
+def _mseed_series(target: pathlib.Path) -> dict:
+    """Read one MiniSEED file into per-source-id time/value arrays.
+
+    A gap between records becomes a NaN break so the plot shows it as a gap
+    instead of interpolating a straight line across missing data.
+    """
+    from pymseed import MS3Record
+
+    series: dict[str, dict] = {}
+    for rec in MS3Record.from_file(str(target), unpack_data=True):
+        samples = list(rec.datasamples)
+        if not samples:
+            continue
+        rate = rec.samprate or 1.0
+        step_ns = 1e9 / rate if rate else 1e9
+        start_ns = rec.starttime
+        entry = series.setdefault(rec.sourceid, {"t": [], "v": [], "end_ns": None})
+        # Insert a break when this record does not continue the previous one
+        # (allow one sample interval of slack for rounding).
+        if entry["end_ns"] is not None and start_ns - entry["end_ns"] > 1.5 * step_ns:
+            entry["t"].append(entry["end_ns"] + step_ns)
+            entry["v"].append(float("nan"))
+        for i, value in enumerate(samples):
+            entry["t"].append(start_ns + i * step_ns)
+            entry["v"].append(float(value))
+        entry["end_ns"] = start_ns + (len(samples) - 1) * step_ns
+    return series
+
+
+def _decimate_minmax(times: list, values: list, max_points: int):
+    """Reduce a series to at most *max_points* while preserving extremes."""
+    n = len(values)
+    if n <= max_points:
+        return times, values
+    bucket = max(2, n // (max_points // 2))
+    out_t: list = []
+    out_v: list = []
+    for start in range(0, n, bucket):
+        chunk_v = values[start:start + bucket]
+        chunk_t = times[start:start + bucket]
+        finite = [(t, v) for t, v in zip(chunk_t, chunk_v) if v == v]   # drop NaN
+        if not finite:
+            out_t.append(chunk_t[0])
+            out_v.append(float("nan"))
+            continue
+        lo = min(finite, key=lambda p: p[1])
+        hi = max(finite, key=lambda p: p[1])
+        for point in sorted((lo, hi), key=lambda p: p[0]):
+            out_t.append(point[0])
+            out_v.append(point[1])
+    return out_t, out_v
+
+
+def _plot_label(kind: str, key: str) -> tuple[str, str]:
+    """(title, unit) for one panel."""
+    if kind == "miniseed":
+        subsource = key.rsplit("_", 1)[-1] if "_" in key else ""
+        label, unit = _MSEED_CHANNEL_LABELS.get(subsource, ("", ""))
+        return (f"{key}" + (f" — {label}" if label else ""), unit)
+    if kind == "arrow":
+        label, unit = _ARROW_COLUMN_LABELS.get(key, (key, ""))
+        return (label if label == key else f"{key} — {label}", unit)
+    unit = "m" if ("East" in key or "North" in key or "Up" in key) else ""
+    return (key, unit)
+
+
+#: Panel order for the flattened position columns, so the ENU components come
+#: first and in the conventional order rather than alphabetically.
+_PANEL_ORDER = [
+    # positions
+    "east", "north", "up", "sigEE", "sigNN", "sigUU",
+    "qChannel", "ingestLatency", "processingDelay",
+    # geojson (flattened)
+    "East", "North", "Up",
+    "East uncertainty", "North uncertainty", "Up uncertainty", "Quality",
+    # completeness -- the ratio first, then its two inputs, then the timings
+    "completeness", "row_count", "expected_count",
+    "mean_ingest_latency_s", "mean_processing_delay_s",
+]
+
+
+def _ordered_keys(keys) -> list[str]:
+    known = [k for k in _PANEL_ORDER if k in keys]
+    return known + sorted(k for k in keys if k not in _PANEL_ORDER)
+
+
+@app.get("/api/files/plot", response_model=None)
+async def api_files_plot(path: str, width: int = 1100, height: int = 200) -> Response:
+    """Render a data file's samples as a PNG, one panel per channel/column.
+
+    Server-rendered rather than shipped to the browser as points: a station-day
+    at 1 Hz is 86,400 samples per column, and the explorer already displays
+    images.
+    """
+    target = _safe_files_path(path)
+    if target is None or not target.exists() or not target.is_file():
+        return JSONResponse({"error": "Not found", "path": path}, status_code=404)
+
+    kind = _file_kind(target)
+    if kind not in ("miniseed", "arrow", "geojson"):
+        return JSONResponse(
+            {"error": f"No plot for {kind} files"}, status_code=400)
+
+    def _render_ppsd() -> bytes:
+        """Reuse the project's own PPSD rendering so the axes, period scaling
+        and colormap match the PNGs `es-pos export ppsd` produces."""
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from earthscope_positions.export import ppsd_writer as pw
+
+        table = ipc.open_stream(target).read_all()
+        hist_e, hist_n, hist_u, total_frames = pw.merge_sparse_tables([table])
+        if total_frames == 0:
+            raise ValueError("no PPSD frames in file")
+
+        cmap = pw.ppsd_colormap()
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        fig.patch.set_facecolor("white")
+        for ax, hist, comp in zip(axes, (hist_e, hist_n, hist_u), ("East", "North", "Up")):
+            pw.plot_ppsd_panel(ax, hist, f"{comp}  ({total_frames} frames)", cmap)
+        fig.suptitle(target.name, fontsize=9)
+        fig.tight_layout()
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight")
+        plt.close(fig)
+        return buf.getvalue()
+
+    def _render() -> bytes:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.dates as mdates
+        import matplotlib.pyplot as plt
+
+        if kind == "miniseed":
+            series = _mseed_series(target)
+        elif kind == "arrow":
+            series = _arrow_series(target)
+        else:
+            series = _geojson_series(target)
+        if not series:
+            raise ValueError("no plottable samples in file")
+
+        keys = _ordered_keys(series.keys())
+        n_axes = len(keys)
+        fig, axes = plt.subplots(
+            n_axes, 1, sharex=True,
+            figsize=(max(4, width / 100), max(1.6, height / 100) * n_axes),
+            dpi=100, squeeze=False,
+        )
+        for ax, key in zip(axes[:, 0], keys):
+            entry = series[key]
+            times, values = _decimate_minmax(entry["t"], entry["v"], _PLOT_MAX_POINTS)
+            stamps = [dt.datetime.fromtimestamp(t / 1e9, tz=dt.timezone.utc) for t in times]
+            title, unit = _plot_label(kind, key)
+
+            ax.plot(stamps, values, linewidth=0.7, color="#1565C0")
+            if key in _UNIT_RANGE_COLUMNS:
+                ax.set_ylim(-0.02, 1.02)
+            ax.set_title(title, fontsize=9, loc="left")
+            ax.set_ylabel(unit or "value", fontsize=8)
+            ax.grid(True, alpha=0.25, linewidth=0.5)
+            ax.tick_params(labelsize=8)
+            # In the title bar, not inside the axes -- over a full-width trace
+            # an in-axes annotation lands on top of the data.
+            n_real = sum(1 for v in entry["v"] if v == v)
+            n_gaps = sum(1 for v in entry["v"] if v != v)
+            note = f"{n_real:,} samples"
+            if len(entry["v"]) > _PLOT_MAX_POINTS:
+                note += " (min/max reduced)"
+            if n_gaps:
+                note += f" · {n_gaps} gap(s)"
+            ax.set_title(note, fontsize=7, loc="right", color="#777")
+
+        axes[-1, 0].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+        axes[-1, 0].set_xlabel(f"UTC — {target.name}", fontsize=8)
+        fig.tight_layout()
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight")
+        plt.close(fig)
+        return buf.getvalue()
+
+    renderer = (_render_ppsd
+                if kind == "arrow" and _arrow_plot_kind(target) == "ppsd"
+                else _render)
+    try:
+        png = await asyncio.get_event_loop().run_in_executor(None, renderer)
+    except Exception as exc:
+        return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=500)
+    return Response(content=png, media_type="image/png",
+                    headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/api/files/download", response_model=None)

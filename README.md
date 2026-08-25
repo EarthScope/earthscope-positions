@@ -393,7 +393,7 @@ The web UI has these tabs:
 | **Completeness & Latency** | Heat-map of data completeness and ingest latency per station per day. Completeness is generated on-demand if not pre-computed. Includes a Fetch button that runs `es-pos fetch` for the selected list/range. |
 | **Positions** | Interactive ENU time-series plots with power spectra (linear-frequency axis, down to 5-minute noise). Select stations from a saved list, set a date range, overlay multiple stations. |
 | **Export** | Convert downloaded Arrow position data into MiniSEED or GeoJSON. Pick the format, the **MiniSEED version** (3 by default, or 2), stream list(s) and a date range. The path-spec TOML controlling output directory structure and filenames is editable in-page (**Save spec**, then **Convert** with overwrite to regenerate under the new layout). |
-| **File Explorer** | File browser rooted at the **data directory** — the Arrow tree, stream/station lists, exports and plots in one place. Selecting a file shows a type-aware summary: `.arrow` (rows, columns, time span, schema), MiniSEED (records, samples, channels, format, encoding), GeoJSON (features, stations, lat/lon bounds), `.jsonl` (stream vs station list, entry counts, first lines); images render inline. Text files can be edited in place (JSONL validated line-by-line), and any file renamed or deleted. |
+| **File Explorer** | File browser rooted at the **data directory** — the Arrow tree, stream/station lists, exports and plots in one place. Selecting a file shows a type-aware summary: `.arrow` (a time-series plot of every numeric column, plus rows, columns, time span, schema; `.completeness` arrays plot per-bucket completeness and latency, and `_ppsd` arrays render the three-panel PPSD), MiniSEED (a waveform plot, plus records, channels, format, encoding), GeoJSON (a time-series plot, features, stations, lat/lon bounds, first 25 lines), `.jsonl` (stream vs station list, entry counts, first lines); images render inline. Text files can be edited in place (JSONL validated line-by-line), and any file renamed or deleted. |
 | **Replay** | Configure and run a Kafka replay from the browser. Shows preload summary, a live status log, and a **delivery check** (a consumer reads the topic back from the latest offset, reporting messages written vs. read, one-for-one matches, mean added round-trip latency, and a warning/error if echoes lag ≥ 2 s / 5 s). State persists server-side — closing and reopening the browser reconnects to the same replay. |
 
 ### `es-pos export miniseed`
@@ -926,6 +926,12 @@ The `[encoding]` section also holds `format_version` (3 or 2), `max_record_lengt
 > 4096-byte record length applies. Delete the stale key to silence the warning.
 
 ### GeoJSON path spec (`<data-directory>/resources/geojson_path_spec.toml`)
+
+`round_decimals` caps the precision of positions and uncertainties. Values are metres, so
+**3 = millimetres**, which is the finest resolution meaningful for GNSS PPP output and the
+maximum this writer emits — a larger value in the spec is clamped to 3 with a warning.
+Writing raw float64 leaks binary-representation noise into the JSON
+(`0.037` arriving as `0.037000000000000005`), which is not extra precision.
 
 Controls output naming for `es-pos export geojson` (separate sections for compact and full formats).
 
