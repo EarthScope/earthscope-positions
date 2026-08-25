@@ -101,9 +101,91 @@ def test_save_station_list_structured(client):
 
 # ── subprocess data-dir propagation ───────────────────────────────────────────
 
-def test_data_dir_args(monkeypatch, tmp_path):
-    import earthscope_positions.webserver.webserver as w
-    paths.set_base_dir(str(tmp_path))
-    # Arrow root is always <base>/arrow, so only --data-directory is propagated.
-    assert w._data_dir_args() == ["--data-directory", str(tmp_path)]
-    assert paths.arrow_dir() == tmp_path / "arrow"
+def test_child_env_propagates_data_dir(monkeypatch, tmp_path):
+    from earthscope_positions.webserver import webserver as w
+    paths.set_configured_data_dir(tmp_path)
+    # There is no --data-directory flag any more; the server hands its resolved
+    # directory to child processes through the environment instead.
+    env = w._child_env()
+    assert env[paths.ENV_VAR] == str(tmp_path.resolve())
+    assert "PATH" in env, "must extend os.environ, not replace it"
+
+# ---------------------------------------------------------------------------
+# Loading a network leaves a saved station list behind
+# ---------------------------------------------------------------------------
+
+def test_network_station_list_creates_and_caches(project_tree, monkeypatch):
+    """First load queries the API and saves; the second reads the file back."""
+    calls = []
+
+    def _fake_network_stations(network):
+        calls.append(network)
+        return ["P143", "BEPK"]
+
+    monkeypatch.setattr(station_list, "network_stations", _fake_network_stations)
+
+    name, stations, cached = station_list.network_station_list("SHAKE:ShakeAlert")
+    assert name == "shake-shakealert"
+    assert stations == ["BEPK", "P143"]
+    assert cached is False
+    assert (paths.station_lists_dir() / "shake-shakealert.jsonl").exists()
+    assert calls == ["SHAKE:ShakeAlert"]
+
+    name2, stations2, cached2 = station_list.network_station_list("SHAKE:ShakeAlert")
+    assert (name2, stations2, cached2) == (name, stations, True)
+    assert calls == ["SHAKE:ShakeAlert"], "cached load must not re-query the API"
+
+
+def test_network_station_list_refresh_requeries(project_tree, monkeypatch):
+    calls = []
+
+    def _fake(network):
+        calls.append(network)
+        return ["P143"] if len(calls) == 1 else ["P143", "P157"]
+
+    monkeypatch.setattr(station_list, "network_stations", _fake)
+    station_list.network_station_list("RTDB:PBO")
+    _, stations, cached = station_list.network_station_list("RTDB:PBO", refresh=True)
+    assert cached is False
+    assert stations == ["P143", "P157"]
+    assert len(calls) == 2
+
+
+def test_cached_load_preserves_hand_edits(project_tree, monkeypatch):
+    """A user who edits the saved list must not have it silently overwritten."""
+    monkeypatch.setattr(station_list, "network_stations", lambda n: ["P143", "P157"])
+    name, _, _ = station_list.network_station_list("RTDB:PBO")
+    station_list.save_station_list(name, ["P143"])          # user removes one
+    _, stations, cached = station_list.network_station_list("RTDB:PBO")
+    assert cached is True
+    assert stations == ["P143"]
+
+
+def test_read_station_list_skips_malformed_lines(project_tree):
+    path = paths.station_lists_dir() / "messy.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"station":"P143"}\nnot json\n\n{"station":"p157"}\n{"nope":1}\n')
+    assert station_list.read_station_list("messy") == ["P143", "P157"]
+
+
+def test_read_station_list_missing_is_empty(project_tree):
+    assert station_list.read_station_list("nope") == []
+
+
+def test_network_stations_endpoint_saves_and_reports(client, project_tree, monkeypatch):
+    monkeypatch.setattr(station_list, "network_stations", lambda n: ["P143", "BEPK"])
+
+    r = client.get("/api/station-builder/network-stations",
+                   params={"network": "SHAKE:ShakeAlert"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["name"] == "shake-shakealert"
+    assert body["stations"] == ["BEPK", "P143"]
+    assert body["cached"] is False
+
+    # The saved list must now show up in the station-list listing.
+    assert "shake-shakealert" in client.get("/api/station-lists").json()["lists"]
+
+    again = client.get("/api/station-builder/network-stations",
+                       params={"network": "SHAKE:ShakeAlert"}).json()
+    assert again["cached"] is True

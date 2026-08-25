@@ -35,6 +35,144 @@
 
     <q-separator class="q-mb-lg" />
 
+    <!-- ── Data directory (read-only mirror of `es-pos config show`) ────── -->
+    <div class="text-h6 text-weight-medium q-mb-sm">Data directory</div>
+    <q-card flat bordered class="q-mb-lg">
+      <q-card-section v-if="cfgLoading" class="text-caption text-grey-5">Loading…</q-card-section>
+      <q-card-section v-else-if="!cfg" class="text-caption text-negative">
+        Could not read the data-directory configuration.
+      </q-card-section>
+      <template v-else>
+        <q-card-section class="q-pb-none">
+          <div class="row items-baseline no-wrap q-gutter-sm">
+            <q-icon name="folder" size="20px" color="primary" />
+            <div class="text-subtitle1 text-weight-medium" style="word-break: break-all">
+              {{ cfg.data_directory }}
+            </div>
+            <q-badge v-if="!cfg.exists" color="orange-8" label="not created yet" />
+          </div>
+          <div class="text-caption text-grey-7 q-mt-xs">
+            Set by {{ cfg.source_label }}
+            <q-badge v-if="cfg.in_docker" color="blue-grey-6" class="q-ml-sm" label="in Docker" />
+          </div>
+
+          <!-- Inside a container the path above is the container path, which does
+               not exist on the host; show what it is actually mounted from. -->
+          <div v-if="cfg.in_docker" class="q-mt-sm">
+            <q-markup-table flat dense class="cfg-table" style="max-width: 720px">
+              <tbody>
+                <tr>
+                  <td class="text-grey-7" style="width: 34%">Inside the container</td>
+                  <td><code>{{ cfg.data_directory }}</code></td>
+                </tr>
+                <tr>
+                  <td class="text-grey-7">Mounted from the host</td>
+                  <td>
+                    <code v-if="cfg.host_data_directory">{{ cfg.host_data_directory }}</code>
+                    <span v-else class="text-orange-9">
+                      not reported — started without <code>es-pos-docker.sh run</code>?
+                    </span>
+                  </td>
+                </tr>
+              </tbody>
+            </q-markup-table>
+            <div class="text-caption text-grey-6 q-mt-xs">
+              Change the host side with
+              <code>./es-pos-docker.sh run --data-dir PATH</code>; with no flag it uses the
+              same directory the host CLI would.
+            </div>
+          </div>
+        </q-card-section>
+
+        <q-card-section class="q-pt-sm">
+          <q-markup-table flat dense class="cfg-table" style="max-width: 720px">
+            <tbody>
+              <tr>
+                <td class="text-grey-7" style="width: 34%">Config file</td>
+                <td>
+                  {{ cfg.config_file }}
+                  <span v-if="!cfg.config_file_exists" class="text-grey-5"> (not created yet)</span>
+                </td>
+              </tr>
+              <tr>
+                <td class="text-grey-7">Configured directory</td>
+                <td>{{ cfg.configured_data_directory ?? "(not set)" }}</td>
+              </tr>
+              <tr>
+                <td class="text-grey-7">{{ cfg.env_var }}</td>
+                <td>{{ cfg.env_value ?? "(not set)" }}</td>
+              </tr>
+            </tbody>
+          </q-markup-table>
+
+          <q-banner v-if="cfg.mismatch" dense class="bg-orange-1 text-orange-9 q-mt-sm">
+            {{ cfg.env_var }} is overriding the configured directory for this server.
+            <div class="text-caption">
+              Files written here will not be where <code>{{ cfg.config_file }}</code> points.
+            </div>
+          </q-banner>
+        </q-card-section>
+
+        <q-card-section class="q-pt-none">
+          <div class="text-subtitle2 q-mb-xs">Contents</div>
+          <q-markup-table flat bordered dense style="max-width: 720px">
+            <thead>
+              <tr>
+                <th class="text-left">Sub-directory</th>
+                <th class="text-left">Path</th>
+                <th class="text-right">Entries</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="d in cfg.subdirectories" :key="d.name">
+                <td>{{ d.name }}</td>
+                <td class="text-grey-7" style="word-break: break-all">{{ d.path }}</td>
+                <td class="text-right">
+                  <span v-if="d.entries != null">{{ d.entries.toLocaleString() }}</span>
+                  <span v-else class="text-grey-5">—</span>
+                </td>
+              </tr>
+            </tbody>
+          </q-markup-table>
+        </q-card-section>
+
+        <q-card-section v-if="cfg.known_data_directories.length > 1" class="q-pt-none">
+          <div class="text-subtitle2 q-mb-xs">Other known data directories</div>
+          <q-list dense bordered class="rounded-borders" style="max-width: 720px">
+            <q-item v-for="d in cfg.known_data_directories" :key="d.path" dense>
+              <q-item-section avatar style="min-width: 26px">
+                <q-icon :name="d.active ? 'radio_button_checked' : 'radio_button_unchecked'"
+                        :color="d.active ? 'primary' : 'grey-5'" size="16px" />
+              </q-item-section>
+              <q-item-section>
+                <q-item-label class="text-caption" style="word-break: break-all">{{ d.path }}</q-item-label>
+              </q-item-section>
+              <q-item-section v-if="!d.exists" side>
+                <q-badge color="grey-5" label="missing" />
+              </q-item-section>
+            </q-item>
+          </q-list>
+        </q-card-section>
+
+        <q-card-section class="q-pt-none">
+          <q-banner dense class="bg-blue-grey-1 text-blue-grey-9">
+            <template #avatar><q-icon name="terminal" color="blue-grey-7" /></template>
+            <div class="text-body2">Switching directories is a command-line operation.</div>
+            <div class="text-caption q-mt-xs">
+              The server resolves its data directory once at startup and every open tab is
+              backed by it, so it deliberately cannot be changed from the browser. Use the
+              CLI, then restart <code>es-pos webserver</code>:
+            </div>
+            <pre class="cfg-cmd">es-pos config show
+es-pos config list-data-dirs
+es-pos config use-data-dir 2
+es-pos config set-data-dir /path/to/data
+es-pos config move-data-dir /new/path</pre>
+          </q-banner>
+        </q-card-section>
+      </template>
+    </q-card>
+
     <!-- ── README ───────────────────────────────────────────────────────── -->
     <div class="text-h6 text-weight-medium q-mb-sm">README</div>
     <div v-if="readmeHtml" class="readme-body" v-html="readmeHtml" />
@@ -46,6 +184,39 @@
 <script setup lang="ts">
 import { ref, onMounted } from "vue";
 import { marked } from "marked";
+import axios from "axios";
+
+interface DataDirConfig {
+  data_directory: string;
+  exists: boolean;
+  source: string;
+  source_label: string;
+  config_file: string;
+  config_file_exists: boolean;
+  configured_data_directory: string | null;
+  env_var: string;
+  env_value: string | null;
+  mismatch: boolean;
+  in_docker: boolean;
+  host_data_directory: string | null;
+  known_data_directories: { path: string; active: boolean; exists: boolean }[];
+  subdirectories: { name: string; path: string; exists: boolean; entries: number | null }[];
+}
+
+// Read-only by design: the server resolves its data directory once at startup,
+// so switching it is `es-pos config use-data-dir` + a restart, not a click.
+const cfg = ref<DataDirConfig | null>(null);
+const cfgLoading = ref(true);
+
+async function loadConfig() {
+  try {
+    cfg.value = (await axios.get<DataDirConfig>("/api/config/data-directory")).data;
+  } catch {
+    cfg.value = null;
+  } finally {
+    cfgLoading.value = false;
+  }
+}
 
 const pages = [
   {
@@ -72,7 +243,7 @@ const pages = [
     tips: [
       "Choose Include/Exclude Station Lists to control which stations' streams appear on the map.",
       "Click a station to toggle all its streams, or open its panel to toggle individual streams.",
-      "Use the Filter Streams chips (processing center / stream type) with Only matching /",
+      "Use the Select Streams chips (processing center / stream type) or a regex with Only /",
       "Add matching / Remove matching to bulk-adjust the current selection.",
       "Preview / edit before saving to trim the pending list before it is written.",
     ],
@@ -129,12 +300,12 @@ const pages = [
       "\"By Processing Center\" groups all streams from a center into a single 3-panel PNG.",
       "\"By Stream\" produces one PNG per geosncl — useful for comparing individual streams.",
       "Common mode (None/PCA/KLE) can remove shared clock/orbit noise per center+solution subgroup before computing.",
-      "Output PNGs are organized under data/plots/ppsd/<mode>/ and are viewable in File Plots.",
+      "Output PNGs are organized under data/plots/ppsd/<mode>/ and are viewable in File Explorer.",
     ],
   },
   {
     route: "/plots",
-    label: "File Plots",
+    label: "File Explorer",
     icon: "folder_open",
     color: "green",
     description:
@@ -177,6 +348,7 @@ const readmeHtml = ref("");
 const loadingReadme = ref(false);
 
 onMounted(async () => {
+  loadConfig();
   loadingReadme.value = true;
   try {
     const res = await fetch("/api/readme");
@@ -193,6 +365,12 @@ onMounted(async () => {
 </script>
 
 <style scoped>
+.cfg-table td { padding-left: 0; word-break: break-all; }
+.cfg-cmd {
+  font-family: monospace; font-size: 11.5px; line-height: 1.6;
+  background: rgba(0, 0, 0, 0.05); border-radius: 4px;
+  padding: 8px 10px; margin: 8px 0 0; overflow-x: auto; white-space: pre;
+}
 .page-card {
   transition: box-shadow 0.15s ease;
 }

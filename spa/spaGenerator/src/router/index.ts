@@ -22,7 +22,7 @@ const router = createRouter({
         },
         {
           path: "plots",
-          component: () => import("../pages/PlotsPage.vue"),
+          component: () => import("../pages/FileExplorerPage.vue"),
         },
         {
           path: "station-list-builder",

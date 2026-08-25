@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "earthscope-positions"
 description = "Pull GNSS position data from the EarthScope API and store it locally"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.11"
 authors = [{name = "Charlie Sievers", email = "charlie.sievers@earthscope.org"}]
 license = {text = "MIT"}
 dynamic = ["version"]
@@ -49,8 +49,10 @@ test = [
 ]
 
 [project.scripts]
+# Deliberately the only console script: `inspect` used to be a second one, but a
+# bare `inspect` executable on PATH is far too generic a name to claim.  The same
+# functionality is `es-pos inspect`.
 es-pos = "earthscope_positions.es_pos:main"
-inspect = "earthscope_positions.arrow_inspect:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

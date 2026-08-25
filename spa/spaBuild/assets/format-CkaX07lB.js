@@ -1,1 +1,0 @@
-function a(n,t,e){return e<=t?t:Math.min(e,Math.max(t,n))}function u(n,t,e){if(e<=t)return t;const r=e-t+1;let o=t+(n-t)%r;return o<t&&(o=r+o),o===0?0:o}function l(n,t=2,e="0"){if(n==null)return n;const r=String(n);return r.length>=t?r:new Array(t-r.length+1).join(e)+r}export{a as b,u as n,l as p};

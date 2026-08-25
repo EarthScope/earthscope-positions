@@ -46,11 +46,15 @@ Commands:
             --image TAG            Image to run (default: earthscope-positions:latest)
 
   run     Run the web server in Docker. Mounts a data directory (so downloaded
-          data persists across container runs) and ~/.earthscope (so `es user
+          data persists across container runs, and the container sees the same
+          tree as the host CLI) and ~/.earthscope (so `es user
           login` done on the host, or via `login` above, is visible inside the
           container — no separate login needed at `run` time).
-            --data-dir PATH        Host directory mounted at /app/data, the default
-                                    data directory (default: ./data next to this script)
+            --data-dir PATH        Host directory mounted at /data inside the container.
+                                    Default: the same directory the host CLI would use —
+                                    $ES_POS_DATA_DIRECTORY, else data_directory from
+                                    ~/.earthscope-positions.json, else ~/earthscope-positions.
+                                    The banner prints which of those it used.
             --earthscope-dir PATH  Host directory mounted at /root/.earthscope, holding
                                     EarthScope login credentials (default: ~/.earthscope)
             --profile NAME         Named profile to read credentials from
@@ -157,8 +161,60 @@ cmd_login() {
         "${login_args[@]}"
 }
 
+# Where the data directory lives *inside* the container.  Fixed and baked into
+# the image (see the Dockerfile's ES_POS_DATA_DIRECTORY); only the host side of
+# the mount varies.  /data rather than /app/data so the data is not tangled up
+# with the code install, and so an unmounted container still has a valid path.
+CONTAINER_DATA_DIR=/data
+
+# Host directory to mount there.  Follows the same order the CLI itself uses, so
+# `docker run` lands on the same tree `es-pos` would use on the host:
+#   1. $ES_POS_DATA_DIRECTORY
+#   2. data_directory in ~/.earthscope-positions.json
+#   3. ~/earthscope-positions   (the built-in default)
+#
+# Sets RESOLVED_DATA_DIR and RESOLVED_DATA_ORIGIN.  The origin is recorded as it
+# is decided rather than inferred afterwards -- a config file that happens to
+# hold the same path as the built-in default is still the config file, and the
+# banner should say so.
+resolve_host_data_dir() {
+    RESOLVED_DATA_DIR=""
+    RESOLVED_DATA_ORIGIN=""
+
+    if [[ -n "${ES_POS_DATA_DIRECTORY:-}" ]]; then
+        RESOLVED_DATA_DIR="$ES_POS_DATA_DIRECTORY"
+        RESOLVED_DATA_ORIGIN="\$ES_POS_DATA_DIRECTORY"
+        return
+    fi
+
+    local config="${ES_POS_CONFIG_FILE:-$HOME/.earthscope-positions.json}"
+    if [[ -f "$config" ]]; then
+        local configured=""
+        if command -v python3 >/dev/null 2>&1; then
+            configured="$(python3 -c 'import json,sys
+try:
+    with open(sys.argv[1]) as fh:
+        print(json.load(fh).get("data_directory", "") or "")
+except Exception:
+    pass' "$config" 2>/dev/null)"
+        else
+            # No python3 on PATH: a single-key grep is enough for this file.
+            configured="$(sed -n 's/.*"data_directory"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+                          "$config" 2>/dev/null | head -1)"
+        fi
+        if [[ -n "$configured" ]]; then
+            RESOLVED_DATA_DIR="$configured"
+            RESOLVED_DATA_ORIGIN="$config"
+            return
+        fi
+    fi
+
+    RESOLVED_DATA_DIR="$HOME/earthscope-positions"
+    RESOLVED_DATA_ORIGIN="built-in default"
+}
+
 cmd_run() {
-    local data_dir="$(pwd)/data"
+    local data_dir=""
     local earthscope_dir="$HOME/.earthscope"
     local profile=""
     local port=8000
@@ -192,6 +248,12 @@ cmd_run() {
         esac
     done
 
+    local data_dir_source="--data-dir"
+    if [[ -z "$data_dir" ]]; then
+        resolve_host_data_dir
+        data_dir="$RESOLVED_DATA_DIR"
+        data_dir_source="$RESOLVED_DATA_ORIGIN"
+    fi
     mkdir -p "$data_dir"
     if [[ ! -d "$earthscope_dir" ]]; then
         echo "warning: $earthscope_dir does not exist yet." >&2
@@ -199,7 +261,7 @@ cmd_run() {
     fi
 
     echo "Starting $image  ->  http://${hostname_arg}:${port}"
-    echo "  data:        $data_dir  ->  /app/data"
+    echo "  data:        $data_dir  ->  $CONTAINER_DATA_DIR   (from $data_dir_source)"
     echo "  credentials: $earthscope_dir  ->  /root/.earthscope"
     echo "  profile:     ${profile:-default}"
 
@@ -219,13 +281,14 @@ cmd_run() {
         -e ES_POS_PORT="$port" \
         -e ES_POS_HOSTNAME="$hostname_arg" \
         -e ES_PROFILE="${profile:-default}" \
-        -v "$data_dir:/app/data" \
+        -e ES_POS_HOST_DATA_DIRECTORY="$data_dir" \
+        -v "$data_dir:$CONTAINER_DATA_DIR" \
         -v "$earthscope_dir:/root/.earthscope" \
         "$image"
 }
 
 cmd_cli() {
-    local data_dir="$(pwd)/data"
+    local data_dir=""
     local earthscope_dir="$HOME/.earthscope"
     local profile=""
     local image="earthscope-positions:latest"
@@ -250,6 +313,12 @@ cmd_cli() {
         esac
     done
 
+    local data_dir_source="--data-dir"
+    if [[ -z "$data_dir" ]]; then
+        resolve_host_data_dir
+        data_dir="$RESOLVED_DATA_DIR"
+        data_dir_source="$RESOLVED_DATA_ORIGIN"
+    fi
     mkdir -p "$data_dir"
     if [[ ! -d "$earthscope_dir" ]]; then
         echo "warning: $earthscope_dir does not exist yet." >&2
@@ -257,7 +326,7 @@ cmd_cli() {
     fi
 
     echo "Starting interactive CLI shell in $image"
-    echo "  data:        $data_dir  ->  /app/data"
+    echo "  data:        $data_dir  ->  $CONTAINER_DATA_DIR   (from $data_dir_source)"
     echo "  credentials: $earthscope_dir  ->  /root/.earthscope"
     echo "  profile:     ${profile:-default}"
 
@@ -266,7 +335,8 @@ cmd_cli() {
     docker run --rm -it \
         --name "$container_name" \
         -e ES_PROFILE="${profile:-default}" \
-        -v "$data_dir:/app/data" \
+        -e ES_POS_HOST_DATA_DIRECTORY="$data_dir" \
+        -v "$data_dir:$CONTAINER_DATA_DIR" \
         -v "$earthscope_dir:/root/.earthscope" \
         "$image" \
         cli
@@ -298,8 +368,11 @@ cmd_entrypoint() {
 
     # --host 0.0.0.0 so the port mapped by `run` (docker run -p) is actually
     # reachable; --port/--hostname come from env vars (set by `run`) so they
-    # can be changed without rebuilding the image. --data-directory is left at
-    # its default (./data relative to WORKDIR /app), which `run` bind-mounts.
+    # can be changed without rebuilding the image. The data directory comes
+    # from ES_POS_DATA_DIRECTORY=/data, set in the Dockerfile, which `run`
+    # bind-mounts -- that env var is the only per-invocation override there is.
+    # ES_POS_HOST_DATA_DIRECTORY (also set by `run`) carries the host side of
+    # that mount purely so the Overview page can display it.
     exec es-pos webserver \
         --host 0.0.0.0 \
         --port "${ES_POS_PORT:-8000}" \

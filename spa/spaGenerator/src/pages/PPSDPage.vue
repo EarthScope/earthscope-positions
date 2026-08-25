@@ -218,7 +218,7 @@
               flat
               color="primary"
               icon="folder_open"
-              label="View in File Plots"
+              label="View in File Explorer"
               to="/plots"
             />
 
@@ -289,7 +289,7 @@
               <q-item-section>
                 <q-item-label class="text-caption">
                   <router-link
-                    :to="{ path: '/plots', query: { path: f.path } }"
+                    :to="{ path: '/plots', query: { path: `plots/${f.path}` } }"
                     class="plot-link"
                   >{{ f.label }}</router-link>
                 </q-item-label>

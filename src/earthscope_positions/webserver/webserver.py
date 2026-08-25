@@ -29,9 +29,11 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import functools
 import io
 import json
 import logging
+import os
 import pathlib
 import re
 import sys
@@ -173,11 +175,17 @@ def _station_lists_dir() -> pathlib.Path:
     return paths.station_lists_dir()
 
 
-def _data_dir_args() -> list[str]:
-    """CLI flag that propagates THIS server's resolved data directory to a child
-    process, so subprocesses honour ``--data-directory`` instead of falling back
-    to the default ``./data`` (the Arrow root is always ``<base>/arrow``)."""
-    return ["--data-directory", str(paths.base_dir())]
+def _child_env() -> dict[str, str]:
+    """Environment for a child ``es-pos`` process.
+
+    Propagates THIS server's resolved data directory so subprocesses land in
+    the same tree rather than re-resolving and possibly picking a different
+    one.  There is no ``--data-directory`` flag any more; the environment
+    variable is the supported override, and passing it this way also carries
+    the "already warned about a config mismatch" marker so children do not
+    repeat that notice into the UI log on every run.
+    """
+    return {**os.environ, paths.ENV_VAR: str(paths.base_dir())}
 
 
 def _spa_dir() -> pathlib.Path:
@@ -325,6 +333,39 @@ def _list_stream_list_names() -> list[str]:
     if not d.exists():
         return []
     return sorted(p.stem for p in d.glob("*.jsonl"))
+
+
+def _stream_validation():
+    """The stream-list validation helpers (imported lazily to avoid a cycle)."""
+    from earthscope_positions.stations import station_list as _sl
+    return _sl
+
+
+def _is_protected_list(name: str) -> bool:
+    """all-streams is generated and is the membership reference for every other
+    list, so it is not editable, renameable, or deletable from the UI."""
+    return name.strip().lower() == _stream_validation().ALL_STREAMS_LIST
+
+
+def _valid_stream_records(records: list[dict]) -> tuple[list[dict], list[str]]:
+    """Split records into (usable, reasons-for-the-rest).
+
+    Lists written before validation existed -- notably the NCEDC partner lists,
+    which recorded bare {"geosncl": ...} for unmatched streams -- contain
+    entries with no edid.  Those cannot be fetched, so they are dropped on read
+    and counted, rather than being handed downstream to fail later.
+    """
+    sl = _stream_validation()
+    good: list[dict] = []
+    reasons: list[str] = []
+    for rec in records:
+        problem = sl.validate_stream_record(rec)
+        if problem is None:
+            good.append(rec)
+        else:
+            label = (rec.get("geosncl") or rec.get("edid") or "?") if isinstance(rec, dict) else "?"
+            reasons.append(f"{label}: {problem}")
+    return good, reasons
 
 
 def _read_stream_list_file(path: pathlib.Path) -> list[dict]:
@@ -830,6 +871,12 @@ async def api_status() -> dict:
 
 # ── /api/stream-lists ───────────────────────────────────────────────────────
 
+@app.get("/api/stream-lists/protected")
+async def api_stream_lists_protected() -> dict:
+    """Names the UI must not offer edit/rename/delete for."""
+    return {"protected": [_stream_validation().ALL_STREAMS_LIST]}
+
+
 @app.get("/api/stream-lists")
 async def api_stream_lists() -> dict:
     return {"lists": _list_stream_list_names()}
@@ -869,6 +916,42 @@ async def api_stream_lists_filter_options(
 
 
 _NCEDC_METADATA_URL = "https://ncedc.org/outgoing/gps/ShakeAlert/metadata/"
+
+#: Authoritative ShakeAlert monument coordinates, published alongside the
+#: per-network chanfiles.  Not to be confused with merged_chanfile_coord.dat.
+_NCEDC_COORDS_FILE = "station_coords_extended.dat"
+
+
+def _shakealert_coords_to_csv(text: str) -> tuple[str, int, int]:
+    """Convert station_coords_extended.dat into coordinates CSV text.
+
+    Whitespace-separated, ``#``-commented; columns 0-3 are
+    ``station latitude longitude ellipsoidal_height`` and the rest (ECEF XYZ,
+    epoch, network, status) is not used here.  Returns
+    ``(csv_text, rows_parsed, rows_skipped)``.
+    """
+    out = ["station,latitude,longitude,height,source"]
+    parsed = skipped = 0
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) < 4:
+            skipped += 1
+            continue
+        station = parts[0].strip().upper()
+        try:
+            lat, lon, height = float(parts[1]), float(parts[2]), float(parts[3])
+        except ValueError:
+            skipped += 1
+            continue
+        if not station:
+            skipped += 1
+            continue
+        out.append(f"{station},{lat},{lon},{height},shakealert")
+        parsed += 1
+    return "\n".join(out) + "\n", parsed, skipped
 
 # NOTE: the old streaming /api/stream-lists/{shakealert-datasource,all-streams}
 # endpoints were removed — those lists are now preloaded at server startup
@@ -918,9 +1001,27 @@ async def api_station_builder_load_network(network: str = Query(...)) -> JSONRes
     })
 
 
+#: NCEDC is served through a TLS-inspecting proxy on the EarthScope network,
+#: so its chain terminates in a self-signed root Python does not trust and the
+#: fetch fails with CERTIFICATE_VERIFY_FAILED.  Verification is disabled for
+#: *these* fetches only -- a module-local context, never the process-wide
+#: default -- so nothing else in the app loses certificate checking.  Set
+#: ES_POS_VERIFY_NCEDC_TLS=1 to restore verification.
+def _ncedc_ssl_context():
+    import os
+    import ssl
+
+    if os.environ.get("ES_POS_VERIFY_NCEDC_TLS", "").strip() not in ("", "0", "false"):
+        return None                      # None => urlopen uses the default checks
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
 def _fetch_url_sync(url: str) -> bytes:
     import urllib.request
-    with urllib.request.urlopen(url, timeout=30) as r:
+    with urllib.request.urlopen(url, timeout=30, context=_ncedc_ssl_context()) as r:
         return r.read()
 
 
@@ -941,7 +1042,14 @@ async def api_update_active_from_ncedc() -> StreamingResponse:
             yield _sse({"type": "done", "code": 1})
             return
 
-        chanfile_codes = sorted(set(re.findall(r'chanfile_(\w+)\.dat', html_bytes.decode(errors="replace"))))
+        # The lookbehind matters: the index also lists merged_chanfile_coord.dat,
+        # and an unanchored `chanfile_(\w+)\.dat` matches inside it, yielding a
+        # bogus "coord" network and a 404 on chanfile_coord.dat.  Only filenames
+        # that actually start with chanfile_ are partner networks.
+        chanfile_codes = sorted(set(re.findall(
+            r'(?<![A-Za-z0-9_-])chanfile_(\w+)\.dat',
+            html_bytes.decode(errors="replace"),
+        )))
         if not chanfile_codes:
             yield _sse({"type": "error", "msg": "No chanfile_XX.dat files found."})
             yield _sse({"type": "done", "code": 1})
@@ -964,6 +1072,15 @@ async def api_update_active_from_ncedc() -> StreamingResponse:
             except Exception:
                 pass
         yield _sse({"type": "log", "msg": f"  {len(all_records)} unique stream(s) in existing lists."})
+
+        # Membership reference: a stream absent from all-streams cannot be
+        # fetched, so it is skipped rather than written as a partial record.
+        known_geosncls = _stream_validation().all_stream_geosncls()
+        yield _sse({"type": "log",
+                    "msg": f"  {len(known_geosncls)} stream(s) in all-streams "
+                           f"(membership reference)."
+                           if known_geosncls else
+                           "  all-streams is empty — membership check skipped."})
 
         created: list[str] = []
 
@@ -992,15 +1109,27 @@ async def api_update_active_from_ncedc() -> StreamingResponse:
 
             yield _sse({"type": "log", "msg": f"  {len(geosncls)} unique stream(s) in chanfile."})
 
+            # Only complete records go in.  Writing a bare {"geosncl": ...} for
+            # an unmatched stream produced lists whose entries had no edid, could
+            # not be fetched, and failed silently as "no data" later on.
+            sl = _stream_validation()
             records: list[dict] = []
-            found = 0
+            unmatched: list[str] = []
             for gs in sorted(geosncls):
-                if gs in all_records:
-                    records.append(all_records[gs])
-                    found += 1
+                rec = all_records.get(gs)
+                in_all = (not known_geosncls) or gs in known_geosncls
+                if rec is not None and in_all and sl.validate_stream_record(rec) is None:
+                    records.append(rec)
                 else:
-                    records.append({"geosncl": gs})
-            yield _sse({"type": "log", "msg": f"  {found}/{len(geosncls)} matched in existing lists."})
+                    unmatched.append(gs)
+            yield _sse({"type": "log",
+                        "msg": f"  {len(records)}/{len(geosncls)} matched in existing lists."})
+            if unmatched:
+                sample = ", ".join(unmatched[:5])
+                more = f" (+{len(unmatched) - 5} more)" if len(unmatched) > 5 else ""
+                yield _sse({"type": "log",
+                            "msg": f"  Skipped {len(unmatched)} stream(s) with no complete "
+                                   f"record in all-streams: {sample}{more}"})
 
             list_name = f"{center.lower()}-active"
             d.mkdir(parents=True, exist_ok=True)
@@ -1011,6 +1140,31 @@ async def api_update_active_from_ncedc() -> StreamingResponse:
             )
             created.append(list_name)
             yield _sse({"type": "log", "msg": f"  → Saved {list_name}.jsonl ({len(records)} stream(s))"})
+
+        # ── Station coordinates ────────────────────────────────────────────
+        # The same directory publishes the authoritative ShakeAlert monument
+        # coordinates.  Merging them here keeps the map in step with the stream
+        # lists that were just rebuilt from it.
+        yield _sse({"type": "log", "msg": f"\nDownloading {_NCEDC_COORDS_FILE}…"})
+        try:
+            coord_bytes = await loop.run_in_executor(
+                None, _fetch_url_sync, _NCEDC_METADATA_URL + _NCEDC_COORDS_FILE)
+            csv_text, n_rows, n_bad = _shakealert_coords_to_csv(
+                coord_bytes.decode(errors="replace"))
+            if not n_rows:
+                yield _sse({"type": "error", "msg": "  No coordinate rows parsed; skipped."})
+            else:
+                total, added, updated = await loop.run_in_executor(
+                    None, _coords_mod.merge_upload, csv_text)
+                _reload_coords()
+                skipped = f", {n_bad} unparseable row(s)" if n_bad else ""
+                yield _sse({"type": "log",
+                            "msg": f"  {n_rows} coordinate(s) read{skipped}; "
+                                   f"+{added} new, {updated} updated ({total} total)."})
+        except Exception as exc:
+            # Coordinates are a bonus here -- a failure must not undo the stream
+            # lists that were already written.
+            yield _sse({"type": "error", "msg": f"  Coordinate update failed: {exc}"})
 
         yield _sse({"type": "done", "code": 0,
                     "msg": f"Done. Created/updated: {', '.join(created)}. Reload the page to see new lists."})
@@ -1035,12 +1189,19 @@ async def api_get_stream_list(name: str) -> JSONResponse:
             return JSONResponse({"error": "Not found"}, status_code=404)
     try:
         records = _read_stream_list_file(path)
-        geosncls = [
-            rec.get("geosncl") or rec.get("edid", "")
-            for rec in records
-            if rec.get("geosncl") or rec.get("edid")
-        ]
-        return JSONResponse({"name": name, "geosncls": sorted(set(g for g in geosncls if g))})
+        usable, reasons = _valid_stream_records(records)
+        geosncls = sorted({str(r["geosncl"]) for r in usable if r.get("geosncl")})
+        if reasons:
+            _log.warning("[stream-lists] %r: dropped %d incomplete record(s)",
+                         name, len(reasons))
+        return JSONResponse({
+            "name": name,
+            "geosncls": geosncls,
+            "total": len(records),
+            "filtered": len(reasons),
+            "filtered_reasons": reasons[:20],
+            "protected": _is_protected_list(name),
+        })
     except Exception as exc:
         return JSONResponse({"error": str(exc)}, status_code=500)
 
@@ -1050,6 +1211,10 @@ async def api_delete_stream_list(name: str) -> JSONResponse:
     name = name.strip()
     if not name or ".." in name or "/" in name or "\\" in name:
         return JSONResponse({"error": "Invalid list name"}, status_code=400)
+    if _is_protected_list(name):
+        return JSONResponse(
+            {"error": f"'{name}' is generated and is the reference every other stream list is validated against; it cannot be changed here. Rebuild it by deleting it and restarting the server."},
+            status_code=403)
     d = _stream_lists_dir()
     for suffix in (".jsonl", ".json"):
         path = d / f"{name}{suffix}"
@@ -1074,6 +1239,12 @@ async def api_rename_stream_list(name: str, body: _RenameListBody) -> JSONRespon
     new = body.new_name.strip()
     if _bad_list_name(name) or _bad_list_name(new):
         return JSONResponse({"error": "Invalid list name"}, status_code=400)
+    if _is_protected_list(name) or _is_protected_list(new):
+        return JSONResponse(
+            {"error": f"'{_stream_validation().ALL_STREAMS_LIST}' is generated and is the "
+                      f"reference every other stream list is validated against; it cannot "
+                      f"be renamed or overwritten here."},
+            status_code=403)
     d = _stream_lists_dir()
     src = None
     for suffix in (".jsonl", ".json"):
@@ -1113,22 +1284,32 @@ class _RawListBody(BaseModel):
 
 @app.post("/api/stream-lists/{name}/raw", response_model=None)
 async def api_save_stream_list_raw(name: str, body: _RawListBody) -> JSONResponse:
-    """Save raw JSONL text to a list (used by the editor's Save / Save As).
+    """Save raw JSONL text to a stream list (the editor's Save / Save As).
 
-    Validates that every non-empty line is valid JSON so the file can't be
-    corrupted; writes to ``<name>.jsonl``.
+    Every non-empty line must be a complete stream record --
+    ``{"geosncl", "edid", "facility", "software"}`` -- and must appear in
+    all-streams.  A partial record cannot be fetched, so it is rejected at the
+    point of writing rather than discovered later as a silent no-data result.
     """
     name = name.strip()
     if _bad_list_name(name):
         return JSONResponse({"error": "Invalid list name"}, status_code=400)
-    for i, line in enumerate(body.content.splitlines(), start=1):
-        s = line.strip()
-        if not s:
-            continue
-        try:
-            json.loads(s)
-        except Exception as exc:
-            return JSONResponse({"error": f"Invalid JSON on line {i}: {exc}"}, status_code=400)
+    if _is_protected_list(name):
+        return JSONResponse(
+            {"error": f"'{name}' is generated and cannot be edited. It is the reference "
+                      f"every other stream list is validated against."},
+            status_code=403)
+
+    sl = _stream_validation()
+    errors = sl.validate_stream_list_text(body.content, sl.all_stream_geosncls() or None)
+    if errors:
+        shown = errors[:15]
+        more = f"\n… and {len(errors) - len(shown)} more problem(s)" if len(errors) > len(shown) else ""
+        return JSONResponse(
+            {"error": "Stream list validation failed:\n" + "\n".join(shown) + more,
+             "errors": errors},
+            status_code=400)
+
     d = _stream_lists_dir()
     d.mkdir(parents=True, exist_ok=True)
     content = body.content if body.content.endswith("\n") else body.content + "\n"
@@ -1155,18 +1336,38 @@ async def api_save_stream_list(name: str, body: _SaveListBody) -> dict:
     # API is queried with the geosncl string as stream_id (a ULID param) and
     # 422s on every request, which reads as "no-data" everywhere it's not
     # explicitly checked for.
+    # Write COMPLETE records.  Emitting {"geosncl": g} (or geosncl+edid only)
+    # for anything unresolved is what produced lists that later failed
+    # validation and could not be fetched -- facility/software come from the
+    # all-streams superset, which is the reference every list is checked
+    # against, with the edid map as a fallback for streams it predates.
+    sl = _stream_validation()
+    reference = {
+        str(r["geosncl"]): r for r in sl.read_stream_list_records(sl.ALL_STREAMS_LIST)
+        if r.get("geosncl")
+    }
     edid_map = _geosncl_edid_map()
-    lines = (
-        "\n".join(
-            json.dumps({"geosncl": g, "edid": edid_map[g]}) if g in edid_map
-            else json.dumps({"geosncl": g})
-            for g in sorted(body.geosncls)
-        )
-        + "\n"
-    )
-    path.write_text(lines)
-    _log.info("[stream-lists] saved %r (%d stations)", name, len(body.geosncls))
-    return {"name": name, "count": len(body.geosncls)}
+
+    records: list[dict] = []
+    skipped: list[str] = []
+    for g in sorted(set(body.geosncls)):
+        rec = reference.get(g)
+        if rec is None and g in edid_map:
+            rec = {"geosncl": g, "edid": edid_map[g]}
+        if rec is None or sl.validate_stream_record(rec) is not None:
+            skipped.append(g)
+            continue
+        records.append({f: rec[f] for f in sl.STREAM_RECORD_FIELDS})
+
+    if skipped:
+        _log.warning("[stream-lists] %r: skipped %d incomplete stream(s): %s",
+                     name, len(skipped), ", ".join(skipped[:5]))
+
+    path.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+    _log.info("[stream-lists] saved %r (%d streams, %d skipped)",
+              name, len(records), len(skipped))
+    return {"name": name, "count": len(records),
+            "skipped": len(skipped), "skipped_geosncls": skipped[:20]}
 
 
 # ── /api/station-lists (station-code lists — Station List Builder) ────────────────
@@ -1308,18 +1509,35 @@ async def api_save_station_list(name: str, body: _SaveStationListBody) -> dict:
 
 
 @app.get("/api/station-builder/network-stations")
-async def api_station_builder_network_stations(network: str = Query(...)) -> JSONResponse:
-    """Return the station codes in a network (station names only, not the
-    individual streams) — used by the Station List Builder's Load Network."""
+async def api_station_builder_network_stations(
+    network: str = Query(...),
+    refresh: bool = Query(False),
+) -> JSONResponse:
+    """Station codes in a network, saving them as a station list on first use.
+
+    Loading a network leaves behind a reusable station list named after it
+    rather than only an in-memory selection.  Once that list exists it is read
+    from disk instead of re-querying the API — a full network query is slow,
+    and re-fetching would silently discard any hand-edits to the list.  Pass
+    ``refresh=true`` to re-query and overwrite on purpose.
+    """
     if not network.strip():
         return JSONResponse({"error": "network is required"}, status_code=400)
     loop = asyncio.get_event_loop()
     try:
-        from earthscope_positions.stations.station_list import network_stations
-        stations = await loop.run_in_executor(None, network_stations, network)
+        from earthscope_positions.stations.station_list import network_station_list
+        name, stations, cached = await loop.run_in_executor(
+            None, functools.partial(network_station_list, network, refresh=refresh),
+        )
     except Exception as exc:
         return JSONResponse({"error": str(exc)}, status_code=502)
-    return JSONResponse({"network": network, "stations": stations, "count": len(stations)})
+    return JSONResponse({
+        "network": network,
+        "name": name,
+        "stations": stations,
+        "count": len(stations),
+        "cached": cached,
+    })
 
 
 # ── /api/stations ────────────────────────────────────────────────────────────
@@ -1953,17 +2171,27 @@ async def _fetch_missing_events(
     unique_gs = len({g for gs in by_day.values() for g in gs})
     already_done = len(requested) - unique_gs
 
+    # Everything asked for, cached or not.  Cache hits are filtered out below
+    # and never reach the fetch subprocess, so without carrying these counts
+    # forward a mostly-cached run reads as a small fresh download and the
+    # caching looks broken.
+    n_days = (end_date - start_date).days + 1
+    requested_pairs = len(requested) * n_days
+    cached_pairs = requested_pairs - total_pairs
+
     if not by_day:
         yield _sse({"type": "log", "current": 0, "total": 0, "msg":
-            f"{len(requested)} station(s) — all data already present or previously attempted."})
+            f"{len(requested)} stream(s) × {n_days} day(s) = {requested_pairs} pair(s) — "
+            f"all already present or previously attempted; nothing to fetch."})
         yield _sse({"type": "done", "code": 0, "current": 0, "total": 0})
         return
 
     sorted_days = sorted(by_day.keys())
 
     yield _sse({"type": "log", "current": 0, "total": len(sorted_days), "msg":
-        f"{len(requested)} station(s): {already_done} complete, "
-        f"{unique_gs} stream(s) × {len(by_day)} day(s) = {total_pairs} pair(s) to fetch"})
+        f"{len(requested)} stream(s) × {n_days} day(s) = {requested_pairs} pair(s): "
+        f"{cached_pairs} already cached, {total_pairs} to fetch "
+        f"({unique_gs} stream(s) over {len(by_day)} day(s); {already_done} stream(s) complete)"})
 
     tf_path: str | None = None
     proc: asyncio.subprocess.Process | None = None
@@ -1975,8 +2203,13 @@ async def _fetch_missing_events(
             day_str = day.isoformat()
             next_str = (day + dt.timedelta(days=1)).isoformat()
 
+            # Pairs for this day that were already satisfied, so the subprocess
+            # can report totals for the whole day rather than just its misses.
+            day_precached = len(requested) - len(day_gs)
+
             yield _sse({"type": "log", "current": i + 1, "total": len(sorted_days), "msg":
-                f"[{i + 1}/{len(sorted_days)}] {day_str} — {len(day_gs)} stream(s)"})
+                f"[{i + 1}/{len(sorted_days)}] {day_str} — {len(day_gs)} to fetch, "
+                f"{day_precached} cached, {len(requested)} total"})
 
             with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as tf:
                 for g in day_gs:
@@ -1988,13 +2221,14 @@ async def _fetch_missing_events(
                 "--list", tf_path,
                 "--start", day_str, "--end", next_str,
                 "--workers", str(workers),
-                *_data_dir_args(),
+                "--precached", str(day_precached),
             ]
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 cwd=str(_project_root()),
+                env=_child_env(),
             )
             async for raw in proc.stdout:  # type: ignore[union-attr]
                 line = raw.decode(errors="replace").rstrip()
@@ -2224,7 +2458,7 @@ async def api_export_run(
         cmd = [sys.executable, "-m", "earthscope_positions.es_pos", "export", format]
         for l in sel:
             cmd += ["-i", l]
-        cmd += ["--start-time", start, "--stop-time", end, *_data_dir_args()]
+        cmd += ["--start-time", start, "--stop-time", end]
         if format == "geojson":
             cmd += ["--format", gj_format]
         if format == "miniseed":
@@ -2238,6 +2472,7 @@ async def api_export_run(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             cwd=str(_project_root()),
+            env=_child_env(),
         )
         try:
             async for raw in proc.stdout:  # type: ignore[union-attr]
@@ -2351,6 +2586,591 @@ async def api_plots_img(path: str) -> FileResponse | JSONResponse:
     return FileResponse(target, media_type=media)
 
 
+# ── /api/config (read-only mirror of `es-pos config show`) ───────────────────
+
+@app.get("/api/config/data-directory")
+async def api_config_data_directory() -> JSONResponse:
+    """The resolved data directory and how it was decided.
+
+    Distinct from /api/config, which reports the server's own host/port.
+
+    Read-only on purpose.  Switching directories mid-session would leave every
+    open tab pointing at a tree that no longer backs them, and the running
+    server caches its resolution per process — so the switch belongs to
+    `es-pos config use-data-dir`, before the server starts.
+    """
+    resolved = paths.base_dir()
+    source = paths.base_dir_source()
+    configured = paths.configured_data_dir()
+
+    known = []
+    for entry in paths.known_data_dirs():
+        known.append({
+            "path": str(entry),
+            "active": entry == resolved,
+            "exists": entry.exists(),
+        })
+
+    subdirs = []
+    for label, getter in (
+        ("arrow", paths.arrow_dir),
+        ("stream-lists", paths.stream_lists_dir),
+        ("station-lists", paths.station_lists_dir),
+        ("plots", paths.plots_dir),
+        ("resources", paths.resources_dir),
+    ):
+        d = getter()
+        count = None
+        if d.is_dir():
+            try:
+                count = sum(1 for _ in d.iterdir())
+            except OSError:
+                count = None
+        subdirs.append({"name": label, "path": str(d),
+                        "exists": d.is_dir(), "entries": count})
+
+    # Inside a container the resolved path is the *container* path; on its own
+    # that is confusing, since it does not exist on the host.  es-pos-docker.sh
+    # passes the host side of the bind mount so both ends can be shown.
+    host_data_dir = os.environ.get(paths.HOST_DATA_DIR_ENV_VAR) or None
+    in_docker = paths.in_container() or bool(host_data_dir)
+    persistent = paths.data_dir_is_persistent(resolved) if in_docker else None
+
+    return JSONResponse({
+        "data_directory": str(resolved),
+        "exists": resolved.exists(),
+        "source": source,
+        "in_docker": in_docker,
+        "host_data_directory": host_data_dir,
+        "data_persistent": persistent,
+        "launched_by_script": bool(host_data_dir),
+        "source_label": {
+            "env": f"{paths.ENV_VAR} environment variable",
+            "config": "config file",
+            "prompt": "answered at the first-run prompt",
+            "default": "built-in default (nothing configured)",
+        }.get(source, source),
+        "config_file": str(paths.config_path()),
+        "config_file_exists": paths.config_path().exists(),
+        "configured_data_directory": str(configured) if configured else None,
+        "env_var": paths.ENV_VAR,
+        "env_value": os.environ.get(paths.ENV_VAR),
+        "mismatch": configured is not None and configured != resolved,
+        "known_data_directories": known,
+        "subdirectories": subdirs,
+    })
+
+
+# ── /api/files (File Explorer — rooted at the data directory) ────────────────
+#
+# The Plots tab only ever showed <base>/plots.  The File Explorer is rooted at
+# the data directory itself so the Arrow tree, the lists and the exports are all
+# reachable from one place, with per-type summaries and file management.
+
+_TEXT_EDIT_SUFFIXES = {".jsonl", ".json", ".csv", ".toml", ".txt", ".md"}
+_IMAGE_MEDIA = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".svg": "image/svg+xml", ".gif": "image/gif",
+}
+_MSEED_SUFFIXES = {".mseed", ".ms", ".ms3", ".seed"}
+#: Cap on bytes read back for text editing.  A stray multi-GB file would
+#: otherwise be pulled into the browser whole.
+_MAX_EDIT_BYTES = 8 * 1024 * 1024
+
+
+def _files_root() -> pathlib.Path:
+    return paths.base_dir()
+
+
+def _safe_files_path(rel: str) -> pathlib.Path | None:
+    """Resolve *rel* inside the data directory, refusing traversal.
+
+    Uses ``is_relative_to`` rather than a string prefix test: with a root of
+    ``/data``, a prefix test also accepts ``/data-backup``.
+    """
+    root = _files_root().resolve()
+    try:
+        candidate = (root / rel.lstrip("/")).resolve()
+    except Exception:
+        return None
+    if candidate != root and not candidate.is_relative_to(root):
+        return None
+    return candidate
+
+
+def _file_kind(path: pathlib.Path) -> str:
+    """Coarse type used by the UI to pick an action set and a summary."""
+    suffix = path.suffix.lower()
+    if suffix == ".arrow":
+        return "arrow"
+    if suffix in _MSEED_SUFFIXES:
+        return "miniseed"
+    if suffix == ".geojson" or path.name.lower().endswith(".geojson.jsonl"):
+        return "geojson"
+    if suffix == ".jsonl":
+        return "jsonl"
+    if suffix in _IMAGE_MEDIA:
+        return "image"
+    if suffix == ".csv":
+        return "csv"
+    if suffix == ".toml":
+        return "toml"
+    if suffix in _TEXT_EDIT_SUFFIXES:
+        return "text"
+    return "other"
+
+
+@app.get("/api/files/list")
+async def api_files_list(path: str = "") -> JSONResponse:
+    """List one directory under the data directory (lazily, one level at a time)."""
+    target = _safe_files_path(path)
+    if target is None or not target.exists() or not target.is_dir():
+        return JSONResponse({"error": "Not found", "path": path}, status_code=404)
+
+    root = _files_root().resolve()
+    entries = []
+    for child in sorted(target.iterdir(), key=lambda p: (p.is_file(), p.name.lower())):
+        try:
+            stat = child.stat()
+        except OSError:
+            continue
+        is_file = child.is_file()
+        entries.append({
+            "name": child.name,
+            "type": "file" if is_file else "dir",
+            "path": str(child.resolve().relative_to(root)),
+            "kind": _file_kind(child) if is_file else "dir",
+            "size": stat.st_size if is_file else None,
+            "mtime": stat.st_mtime,
+        })
+    return JSONResponse({"path": path, "root": str(root), "entries": entries})
+
+
+def _summarize_arrow(target: pathlib.Path) -> dict:
+    rows: list[tuple[str, str]] = []
+    table = ipc.open_stream(target).read_all()
+    rows.append(("Rows", f"{table.num_rows:,}"))
+    rows.append(("Columns", str(table.num_columns)))
+    if "time" in table.column_names and table.num_rows:
+        times = table.column("time")
+        t0 = pc.min(times).as_py()
+        t1 = pc.max(times).as_py()
+        if t0 is not None and t1 is not None:
+            rows.append(("First sample", _ms_to_iso(t0)))
+            rows.append(("Last sample", _ms_to_iso(t1)))
+            span = (t1 - t0) / 1000.0
+            rows.append(("Span", _fmt_duration(span)))
+            if table.num_rows > 1:
+                rows.append(("Nominal rate", f"{(table.num_rows - 1) / span:.3f} Hz"
+                             if span > 0 else "—"))
+    schema = [{"name": f.name, "type": str(f.type),
+               "nulls": table.column(f.name).null_count}
+              for f in table.schema]
+    return {"rows": rows, "schema": schema}
+
+
+def _summarize_miniseed(target: pathlib.Path) -> dict:
+    from pymseed import MS3Record
+
+    sids: dict[str, int] = {}
+    n_records = 0
+    n_samples = 0
+    encodings: set[str] = set()
+    versions: set[int] = set()
+    start = end = None
+    for rec in MS3Record.from_file(str(target)):
+        n_records += 1
+        n_samples += rec.samplecnt
+        sids[rec.sourceid] = sids.get(rec.sourceid, 0) + rec.samplecnt
+        encodings.add(rec.encoding_str())   # a method, not a property
+        versions.add(rec.formatversion)
+        s, e = rec.starttime, rec.endtime
+        start = s if start is None else min(start, s)
+        end = e if end is None else max(end, e)
+
+    rows = [
+        ("Records", f"{n_records:,}"),
+        ("Samples", f"{n_samples:,}"),
+        ("Channels", str(len(sids))),
+        ("Format", ", ".join(f"miniSEED {v}" for v in sorted(versions)) or "—"),
+        ("Encoding", ", ".join(sorted(encodings)) or "—"),
+    ]
+    if start is not None and end is not None:
+        rows.append(("First sample", _ns_to_iso(start)))
+        rows.append(("Last sample", _ns_to_iso(end)))
+        rows.append(("Span", _fmt_duration((end - start) / 1e9)))
+    channels = [{"name": sid, "samples": n} for sid, n in sorted(sids.items())]
+    return {"rows": rows, "channels": channels}
+
+
+def _summarize_geojson(target: pathlib.Path) -> dict:
+    """Summarize a GeoJSON file: either a FeatureCollection or NDJSON features."""
+    text = target.read_text(encoding="utf-8", errors="replace")
+    features: list = []
+    shape = "unknown"
+    stripped = text.lstrip()
+    if stripped.startswith("{"):
+        try:
+            doc = json.loads(text)
+        except json.JSONDecodeError:
+            doc = None
+        if isinstance(doc, dict) and doc.get("type") == "FeatureCollection":
+            features = doc.get("features") or []
+            shape = "FeatureCollection"
+        elif isinstance(doc, dict):
+            features = [doc]
+            shape = doc.get("type", "object")
+    if not features:
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                features.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        if features:
+            shape = "NDJSON (one feature per line)"
+
+    times: list[str] = []
+    stations: set[str] = set()
+    lats: list[float] = []
+    lons: list[float] = []
+    for f in features:
+        if not isinstance(f, dict):
+            continue
+        props = f.get("properties") or {}
+        for key in ("time", "timestamp", "t"):
+            if props.get(key):
+                times.append(str(props[key]))
+                break
+        for key in ("station", "geosncl", "id"):
+            if props.get(key):
+                stations.add(str(props[key]))
+                break
+        geom = f.get("geometry") or {}
+        coords = geom.get("coordinates")
+        if isinstance(coords, list) and len(coords) >= 2:
+            try:
+                lons.append(float(coords[0]))
+                lats.append(float(coords[1]))
+            except (TypeError, ValueError):
+                pass
+
+    rows = [("Shape", shape), ("Features", f"{len(features):,}")]
+    if stations:
+        rows.append(("Stations", f"{len(stations):,}"))
+    if times:
+        rows.append(("First time", min(times)))
+        rows.append(("Last time", max(times)))
+    if lats and lons:
+        rows.append(("Latitude range", f"{min(lats):.5f} … {max(lats):.5f}"))
+        rows.append(("Longitude range", f"{min(lons):.5f} … {max(lons):.5f}"))
+    return {"rows": rows, "stations": sorted(stations)[:200]}
+
+
+def _summarize_jsonl(target: pathlib.Path) -> dict:
+    """Summarize a JSONL list (stream lists, station lists, anything similar)."""
+    lines = [l for l in target.read_text(encoding="utf-8", errors="replace").splitlines() if l.strip()]
+    parsed: list[dict] = []
+    bad = 0
+    for line in lines:
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            bad += 1
+            continue
+        if isinstance(rec, dict):
+            parsed.append(rec)
+
+    keys: dict[str, int] = {}
+    for rec in parsed:
+        for k in rec:
+            keys[k] = keys.get(k, 0) + 1
+
+    rows = [("Entries", f"{len(lines):,}")]
+    if bad:
+        rows.append(("Unparseable lines", f"{bad:,}"))
+    if keys:
+        rows.append(("Fields", ", ".join(sorted(keys))))
+    if "station" in keys:
+        rows.insert(0, ("Kind", "station list"))
+        stations = sorted({str(r.get("station", "")).upper() for r in parsed if r.get("station")})
+        rows.append(("Unique stations", f"{len(stations):,}"))
+    elif "geosncl" in keys:
+        rows.insert(0, ("Kind", "stream list"))
+        geos = [str(r["geosncl"]) for r in parsed if r.get("geosncl")]
+        rows.append(("Unique streams", f"{len(set(geos)):,}"))
+        rows.append(("Unique stations",
+                     f"{len({g.split('.')[0].upper() for g in geos}):,}"))
+        facilities = sorted({str(r.get("facility")) for r in parsed if r.get("facility")})
+        if facilities:
+            rows.append(("Facilities", ", ".join(facilities)))
+    return {"rows": rows, "sample": lines[:10]}
+
+
+def _summarize_csv(target: pathlib.Path) -> dict:
+    """Summarize a CSV: shape, headers, and per-column detail where it is cheap.
+
+    Numeric columns get a min/max range, which is what makes coordinates.csv --
+    by far the most-edited CSV here -- readable at a glance.
+    """
+    import csv as _csv
+
+    text = target.read_text(encoding="utf-8", errors="replace")
+    reader = _csv.reader(io.StringIO(text))
+    try:
+        header = next(reader)
+    except StopIteration:
+        return {"rows": [("Rows", "0"), ("Note", "file is empty")]}
+    body = [r for r in reader if any(cell.strip() for cell in r)]
+
+    rows = [
+        ("Rows", f"{len(body):,}"),
+        ("Columns", str(len(header))),
+        ("Headers", ", ".join(header)),
+    ]
+
+    ragged = sum(1 for r in body if len(r) != len(header))
+    if ragged:
+        rows.append(("Rows with wrong column count", f"{ragged:,}"))
+
+    columns = []
+    for i, name in enumerate(header):
+        values = [r[i].strip() for r in body if i < len(r) and r[i].strip()]
+        detail = ""
+        numeric: list[float] = []
+        for v in values:
+            try:
+                numeric.append(float(v))
+            except ValueError:
+                numeric = []
+                break
+        if numeric:
+            detail = f"{min(numeric):.6g} … {max(numeric):.6g}"
+        else:
+            uniq = sorted(set(values))
+            detail = (", ".join(uniq[:6]) + (" …" if len(uniq) > 6 else "")
+                      if len(uniq) <= 20 else f"{len(uniq):,} distinct values")
+        columns.append({
+            "name": name,
+            "filled": len(values),
+            "blank": len(body) - len(values),
+            "detail": detail,
+        })
+
+    return {
+        "rows": rows,
+        "columns": columns,
+        "sample": [",".join(header)] + [",".join(r) for r in body[:5]],
+    }
+
+
+def _flatten_toml(value, prefix: str = "") -> list[tuple[str, str]]:
+    """Flatten nested TOML tables into dotted key/value pairs for display."""
+    out: list[tuple[str, str]] = []
+    if isinstance(value, dict):
+        for k, v in value.items():
+            key = f"{prefix}.{k}" if prefix else str(k)
+            out.extend(_flatten_toml(v, key))
+    elif isinstance(value, list):
+        out.append((prefix, f"[{len(value)} item(s)]" if len(value) > 4
+                    else ", ".join(str(v) for v in value)))
+    else:
+        out.append((prefix, str(value)))
+    return out
+
+
+def _summarize_toml(target: pathlib.Path) -> dict:
+    """Summarize a TOML file by flattening it to dotted keys.
+
+    The TOML files here are the export path specs, so the useful view is simply
+    every setting and its value -- with parse errors surfaced, since an invalid
+    spec is exactly what someone opening this would be trying to find.
+    """
+    import tomllib
+
+    text = target.read_text(encoding="utf-8", errors="replace")
+    try:
+        doc = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        return {"rows": [("Valid TOML", "no"), ("Parse error", str(exc))]}
+
+    flat = _flatten_toml(doc)
+    tables = [k for k, v in doc.items() if isinstance(v, dict)]
+    rows = [
+        ("Valid TOML", "yes"),
+        ("Settings", f"{len(flat):,}"),
+        ("Top-level keys", ", ".join(k for k, v in doc.items() if not isinstance(v, dict)) or "—"),
+        ("Tables", ", ".join(f"[{t}]" for t in tables) or "—"),
+        ("Comment lines", f"{sum(1 for l in text.splitlines() if l.strip().startswith('#')):,}"),
+    ]
+    return {"rows": rows, "settings": [{"key": k, "value": v} for k, v in flat]}
+
+
+def _ms_to_iso(ms: int) -> str:
+    return dt.datetime.fromtimestamp(ms / 1000, tz=dt.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+
+
+def _ns_to_iso(ns: int) -> str:
+    return dt.datetime.fromtimestamp(ns / 1e9, tz=dt.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+
+
+def _fmt_duration(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    if seconds < 60:
+        return f"{seconds:.1f} s"
+    if seconds < 3600:
+        return f"{seconds / 60:.1f} min"
+    if seconds < 86400:
+        return f"{seconds / 3600:.2f} h"
+    return f"{seconds / 86400:.2f} d"
+
+
+@app.get("/api/files/summary")
+async def api_files_summary(path: str) -> JSONResponse:
+    """Type-aware summary of one file's contents."""
+    target = _safe_files_path(path)
+    if target is None or not target.exists() or not target.is_file():
+        return JSONResponse({"error": "Not found", "path": path}, status_code=404)
+
+    kind = _file_kind(target)
+    stat = target.stat()
+    base = {
+        "path": path,
+        "name": target.name,
+        "kind": kind,
+        "size": stat.st_size,
+        "mtime": stat.st_mtime,
+        "editable": kind in ("jsonl", "geojson", "text", "csv", "toml")
+                    and target.suffix.lower() in _TEXT_EDIT_SUFFIXES
+                    and stat.st_size <= _MAX_EDIT_BYTES,
+    }
+    try:
+        if kind == "arrow":
+            base.update(_summarize_arrow(target))
+        elif kind == "miniseed":
+            base.update(await asyncio.get_event_loop().run_in_executor(
+                None, _summarize_miniseed, target))
+        elif kind == "geojson":
+            base.update(_summarize_geojson(target))
+        elif kind == "jsonl":
+            base.update(_summarize_jsonl(target))
+        elif kind == "csv":
+            base.update(_summarize_csv(target))
+        elif kind == "toml":
+            base.update(_summarize_toml(target))
+        else:
+            base["rows"] = []
+    except Exception as exc:
+        # A summary failing must not make the file unmanageable -- the UI still
+        # needs to offer rename/delete on something it cannot parse.
+        base["rows"] = []
+        base["error"] = f"{type(exc).__name__}: {exc}"
+    return JSONResponse(base)
+
+
+@app.get("/api/files/raw", response_model=None)
+async def api_files_raw(path: str) -> JSONResponse:
+    """Text contents of a file, for the in-page editor."""
+    target = _safe_files_path(path)
+    if target is None or not target.exists() or not target.is_file():
+        return JSONResponse({"error": "Not found", "path": path}, status_code=404)
+    if target.suffix.lower() not in _TEXT_EDIT_SUFFIXES:
+        return JSONResponse({"error": f"{target.suffix} is not an editable text file"},
+                            status_code=400)
+    if target.stat().st_size > _MAX_EDIT_BYTES:
+        return JSONResponse(
+            {"error": f"File is larger than {_MAX_EDIT_BYTES // (1024 * 1024)} MB; "
+                      f"edit it outside the browser."},
+            status_code=413)
+    return JSONResponse({"path": path, "name": target.name,
+                         "content": target.read_text(encoding="utf-8", errors="replace")})
+
+
+class _FileSaveBody(BaseModel):
+    path: str
+    content: str
+
+
+@app.put("/api/files/raw", response_model=None)
+async def api_files_save(body: _FileSaveBody) -> JSONResponse:
+    """Overwrite a text file, validating JSONL line-by-line first."""
+    target = _safe_files_path(body.path)
+    if target is None or not target.exists() or not target.is_file():
+        return JSONResponse({"error": "Not found", "path": body.path}, status_code=404)
+    if target.suffix.lower() not in _TEXT_EDIT_SUFFIXES:
+        return JSONResponse({"error": f"{target.suffix} is not an editable text file"},
+                            status_code=400)
+    if target.suffix.lower() == ".jsonl":
+        for i, line in enumerate(body.content.splitlines(), start=1):
+            if not line.strip():
+                continue
+            try:
+                json.loads(line)
+            except Exception as exc:
+                return JSONResponse({"error": f"Invalid JSON on line {i}: {exc}"},
+                                    status_code=400)
+    content = body.content
+    if content and not content.endswith("\n"):
+        content += "\n"
+    target.write_text(content, encoding="utf-8")
+    _log.info("[files] saved %s (%d bytes)", body.path, len(content))
+    return JSONResponse({"ok": True, "path": body.path, "bytes": len(content)})
+
+
+class _FileRenameBody(BaseModel):
+    path: str
+    name: str
+
+
+@app.post("/api/files/rename", response_model=None)
+async def api_files_rename(body: _FileRenameBody) -> JSONResponse:
+    """Rename a file in place (new name only — this does not move it)."""
+    target = _safe_files_path(body.path)
+    if target is None or not target.exists():
+        return JSONResponse({"error": "Not found", "path": body.path}, status_code=404)
+    new_name = pathlib.Path(body.name.strip()).name   # no directory components
+    if not new_name or new_name in (".", ".."):
+        return JSONResponse({"error": "Invalid name"}, status_code=400)
+    dest = target.parent / new_name
+    if dest.exists():
+        return JSONResponse({"error": f"{new_name} already exists"}, status_code=409)
+    target.rename(dest)
+    rel = str(dest.resolve().relative_to(_files_root().resolve()))
+    _log.info("[files] renamed %s -> %s", body.path, rel)
+    return JSONResponse({"ok": True, "path": rel, "name": new_name})
+
+
+@app.delete("/api/files", response_model=None)
+async def api_files_delete(path: str) -> JSONResponse:
+    """Delete a single file.
+
+    Files only: a recursive directory delete is far too easy to trigger by
+    accident on a tree this size, and nothing in the UI needs it.
+    """
+    target = _safe_files_path(path)
+    if target is None or not target.exists():
+        return JSONResponse({"error": "Not found", "path": path}, status_code=404)
+    if target.is_dir():
+        return JSONResponse({"error": "Refusing to delete a directory"}, status_code=400)
+    target.unlink()
+    _log.info("[files] deleted %s", path)
+    return JSONResponse({"ok": True, "path": path})
+
+
+@app.get("/api/files/download", response_model=None)
+async def api_files_download(path: str) -> FileResponse | JSONResponse:
+    """Serve a file inline — used to render images in the explorer."""
+    target = _safe_files_path(path)
+    if target is None or not target.exists() or not target.is_file():
+        return JSONResponse({"error": "Not found", "path": path}, status_code=404)
+    media = _IMAGE_MEDIA.get(target.suffix.lower(), "application/octet-stream")
+    return FileResponse(target, media_type=media)
+
+
 # ── /api/station-builder ─────────────────────────────────────────────────────
 
 def _stations_payload(geosncls) -> list[dict]:
@@ -2423,11 +3243,21 @@ class _CoordinatesBody(BaseModel):
 
 @app.get("/api/coordinates/raw")
 async def api_coordinates_get() -> JSONResponse:
-    """Return the current editable coordinates CSV text (seeding on first use)."""
+    """Return the current editable coordinates CSV text (seeding on first use).
+
+    Reports the resolved path either way.  The file lives under the *data*
+    directory, so "could not open it" is nearly always a data-directory
+    question -- naming the path it tried turns that into a one-look diagnosis
+    instead of a guess.
+    """
+    path = _coords_mod.data_csv_path()
     try:
-        return JSONResponse({"content": _coords_mod.read_text()})
+        return JSONResponse({"content": _coords_mod.read_text(), "path": str(path)})
     except Exception as exc:
-        return JSONResponse({"error": str(exc)}, status_code=500)
+        return JSONResponse(
+            {"error": f"{type(exc).__name__}: {exc}", "path": str(path)},
+            status_code=500,
+        )
 
 
 @app.put("/api/coordinates/raw", response_model=None)

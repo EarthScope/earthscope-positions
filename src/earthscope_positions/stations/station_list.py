@@ -1,13 +1,24 @@
 """
-station_list - discover and manage GNSS PPP position stream lists.
+station_list - build and inspect GNSS PPP stream lists and station lists.
+
+Backs the ``es-pos lists`` command group.  Two kinds of list are managed:
+stream lists (full geosncl records, under <base>/stream-lists/) and station
+lists (station codes only, under <base>/station-lists/), mirroring the Stream
+List Builder and Station Builder tabs in the web UI.
 
 CLI subcommands:
-  get datasource  search /discover/datasource/stream (earthscope-sdk)
-  get radial      search /discover/gnss/radial (direct REST — no SDK method)
-  filter          merge and filter existing stream list files
+  list                 available lists of both kinds, with entry counts
+  show-streams         print / --path / --edit a stream list
+  show-stations        print / --path / --edit a station list
+  get-streams          search /discover/datasource/stream (earthscope-sdk)
+  get-stations         the same search, saved as station codes
+  get-radial-streams   search /discover/gnss/radial (direct REST — no SDK method)
+  get-radial-stations  the same search, saved as station codes
+  filter-streams       merge and filter existing stream lists
 """
 
 import argparse
+import os
 import pathlib
 import sys
 from typing import Optional, get_args
@@ -90,11 +101,29 @@ def _api_error(exc: Exception) -> None:
 # Record helpers
 # ---------------------------------------------------------------------------
 
+_GEOSNCL_NS_PREFIX = "GEOSNCL:"
+
+
+def _normalize_geosncl(gs: Optional[str]) -> Optional[str]:
+    """Strip the namespace prefix the radial endpoint puts on geosncl.
+
+    /discover/gnss/radial returns names as ``"GEOSNCL:P156.NC.LY_.20"`` while
+    /discover/datasource/stream returns the bare ``"P156.NC.LY_.20"``.  Left
+    alone the prefix rides into saved stream lists, and every consumer that
+    splits on "." then reads the station as ``"GEOSNCL:P156"`` -- note that
+    ``parse_geosncl`` does *not* raise on it (the dot count is still 4), it
+    just returns the wrong station, so this has to be normalised at ingestion.
+    """
+    if not gs:
+        return gs
+    return gs[len(_GEOSNCL_NS_PREFIX):] if gs.startswith(_GEOSNCL_NS_PREFIX) else gs
+
+
 def _record(edid: str, geosncl: Optional[str], facility, software) -> dict:
     """Build a stream-list record.  facility/software are plain strings now
     (the SDK returns them as strings rather than enums)."""
     return {
-        "geosncl": geosncl,
+        "geosncl": _normalize_geosncl(geosncl),
         "edid": edid,
         "facility": facility,
         "software": software,
@@ -274,14 +303,18 @@ def network_stations(network_name: str) -> list[str]:
     return sorted(stations)
 
 
+def _normalize_stations(stations: list[str]) -> list[str]:
+    """Upper-cased, de-duplicated, sorted -- the on-disk form of a station list."""
+    return sorted({s.strip().upper() for s in stations if s and s.strip()})
+
+
 def save_station_list(name: str, stations: list[str]) -> pathlib.Path:
     """Write a **station** list (``{"station": "P143"}`` per line) under
     ``<base>/station-lists/<name>.jsonl``.  Returns the written path."""
     out = paths.station_lists_dir() / f"{_sanitize_list_name(name)}.jsonl"
     out.parent.mkdir(parents=True, exist_ok=True)
-    norm = sorted({s.strip().upper() for s in stations if s and s.strip()})
-    lines = b"\n".join(orjson.dumps({"station": s}) for s in norm) + b"\n"
-    out.write_bytes(lines)
+    norm = _normalize_stations(stations)
+    out.write_bytes(b"\n".join(orjson.dumps({"station": s}) for s in norm) + b"\n")
     return out
 
 
@@ -291,6 +324,174 @@ def save_stream_list(name: str, records: list[dict]) -> pathlib.Path:
     out = _resolve_output(_sanitize_list_name(name))
     _write(records, out)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Stream-list record validation
+# ---------------------------------------------------------------------------
+
+#: The canonical stream-list record.  Every field is required: `edid` is the
+#: datasource id the fetch API is queried with (without it every request 422s
+#: and reads as "no data"), and facility/software are what the builders filter
+#: on.  A partial record silently degrades everything downstream, so lists are
+#: validated on write rather than tolerated on read.
+STREAM_RECORD_FIELDS = ("geosncl", "edid", "facility", "software")
+
+#: The generated superset of every gnss_ppp stream.  Treated as read-only: it
+#: is the membership reference every other list is checked against, so an
+#: edited copy would quietly invalidate them all.
+ALL_STREAMS_LIST = "all-streams"
+
+
+def validate_stream_record(rec: object) -> str | None:
+    """Return an error describing why *rec* is not a valid stream record, else None."""
+    if not isinstance(rec, dict):
+        return f"expected a JSON object, got {type(rec).__name__}"
+    missing = [f for f in STREAM_RECORD_FIELDS if not str(rec.get(f) or "").strip()]
+    if missing:
+        return f"missing or empty field(s): {', '.join(missing)}"
+    extra = [k for k in rec if k not in STREAM_RECORD_FIELDS]
+    if extra:
+        return f"unexpected field(s): {', '.join(sorted(extra))}"
+    geosncl = str(rec["geosncl"])
+    try:
+        parse_geosncl_parts(geosncl)
+    except ValueError as exc:
+        return str(exc)
+    return None
+
+
+def parse_geosncl_parts(geosncl: str) -> tuple[str, str, str, str]:
+    """Split a geosncl into (station, network, channel base, location).
+
+    Raises ``ValueError`` with a usable message when the shape is wrong -- the
+    same four-part STATION.NETWORK.CHAN.LOC form the export path specs assume.
+    """
+    parts = geosncl.split(".")
+    if len(parts) != 4:
+        raise ValueError(
+            f"geosncl {geosncl!r} must be STATION.NETWORK.CHAN.LOC (4 dot-separated parts)")
+    if any(not p.strip() for p in parts):
+        raise ValueError(f"geosncl {geosncl!r} has an empty part")
+    return parts[0], parts[1], parts[2], parts[3]
+
+
+def validate_stream_list_text(
+    text: str, known_geosncls: "set[str] | None" = None,
+) -> list[str]:
+    """Validate raw JSONL stream-list text.  Returns human-readable errors.
+
+    When *known_geosncls* is given, every record must also appear in it -- the
+    all-streams superset.  A stream missing from that set is either a typo or a
+    stream added to the API since all-streams was last generated; both need
+    looking at rather than being written into a list that will later fail to
+    fetch.
+    """
+    import orjson as _orjson
+
+    errors: list[str] = []
+    seen: set[str] = set()
+    for i, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            rec = _orjson.loads(stripped)
+        except Exception as exc:
+            errors.append(f"line {i}: invalid JSON ({exc})")
+            continue
+        problem = validate_stream_record(rec)
+        if problem:
+            errors.append(f"line {i}: {problem}")
+            continue
+        geosncl = str(rec["geosncl"])
+        if geosncl in seen:
+            errors.append(f"line {i}: duplicate geosncl {geosncl}")
+        seen.add(geosncl)
+        if known_geosncls is not None and geosncl not in known_geosncls:
+            errors.append(
+                f"line {i}: {geosncl} is not in '{ALL_STREAMS_LIST}' — refresh it, "
+                f"or remove this stream")
+    return errors
+
+
+def read_stream_list_records(name: str) -> list[dict]:
+    """Records in ``<base>/stream-lists/<name>.jsonl`` (unvalidated)."""
+    import orjson as _orjson
+
+    path = paths.stream_lists_dir() / f"{name}.jsonl"
+    if not path.exists():
+        return []
+    out: list[dict] = []
+    for line in path.read_bytes().splitlines():
+        if not line.strip():
+            continue
+        try:
+            rec = _orjson.loads(line)
+        except Exception:
+            continue
+        if isinstance(rec, dict):
+            out.append(rec)
+    return out
+
+
+def all_stream_geosncls() -> set[str]:
+    """Every geosncl in the all-streams list — the membership reference."""
+    return {
+        str(r["geosncl"]) for r in read_stream_list_records(ALL_STREAMS_LIST)
+        if r.get("geosncl")
+    }
+
+
+def read_station_list(name: str) -> list[str]:
+    """Station codes in ``<base>/station-lists/<name>.jsonl`` (upper, sorted, unique).
+
+    An empty list if the file is absent; a malformed line is skipped rather
+    than failing the whole read, so one bad hand-edit does not make a list
+    unusable.
+    """
+    path = paths.station_lists_dir() / f"{name}.jsonl"
+    if not path.exists():
+        return []
+    out: set[str] = set()
+    for line in path.read_bytes().splitlines():
+        if not line.strip():
+            continue
+        try:
+            rec = orjson.loads(line)
+        except orjson.JSONDecodeError:
+            continue
+        station = str(rec.get("station") or "").strip().upper()
+        if station:
+            out.add(station)
+    return sorted(out)
+
+
+def network_station_list(
+    network_name: str, *, refresh: bool = False,
+) -> tuple[str, list[str], bool]:
+    """Station list for *network_name*, creating it on first use.
+
+    Returns ``(list_name, stations, from_cache)``.
+
+    The saved list is the point: loading a network should leave behind a
+    reusable station list, not just an in-memory selection.  Once it exists it
+    is read from disk instead of re-querying -- a full network query is slow,
+    and a user who has since hand-edited the list would otherwise have their
+    edits silently overwritten on the next load.  Pass ``refresh=True`` to
+    re-query and overwrite deliberately.
+    """
+    name = _sanitize_list_name(network_name)
+    if not refresh:
+        cached = read_station_list(name)
+        if cached:
+            return name, cached, True
+    # Normalise before returning, not just before writing: otherwise a fresh
+    # load hands back the API's ordering while a cached load hands back the
+    # sorted file, and callers see the same request answered two ways.
+    stations = _normalize_stations(network_stations(network_name))
+    save_station_list(name, stations)
+    return name, stations, False
 
 
 def _records_and_stations(streams) -> tuple[list[dict], list[str]]:
@@ -439,9 +640,14 @@ def _get_radial(args) -> list[dict]:
 # filter / merge
 # ---------------------------------------------------------------------------
 
-def _resolve_input(name: str) -> pathlib.Path:
-    """Find an input file, checking data/stream-lists/ and adding .jsonl if needed."""
-    sl = paths.stream_lists_dir()
+def lists_dir(kind: str) -> pathlib.Path:
+    """Directory holding lists of *kind* -- ``"streams"`` or ``"stations"``."""
+    return paths.stream_lists_dir() if kind == "streams" else paths.station_lists_dir()
+
+
+def _resolve_input(name: str, kind: str = "streams") -> pathlib.Path:
+    """Find an input list file, adding .jsonl and checking the list dir."""
+    sl = lists_dir(kind)
     p = pathlib.Path(name)
     stem = p.stem if p.suffix in (".jsonl", ".json") else p.name
     candidates = [
@@ -521,14 +727,44 @@ def _do_filter(args) -> list[dict]:
 # Output
 # ---------------------------------------------------------------------------
 
-def _resolve_output(name: str) -> pathlib.Path:
-    """Resolve an output name to a path under <project_root>/data/stream-lists/, adding .jsonl if needed."""
+def _resolve_output(name: str, kind: str = "streams") -> pathlib.Path:
+    """Resolve an output name to a path under the list dir, adding .jsonl if needed."""
     p = pathlib.Path(name)
     stem = p.stem if p.suffix in (".jsonl", ".json") else p.name
     p = pathlib.Path(stem + ".jsonl")
     if p.parent == pathlib.Path("."):
-        p = paths.stream_lists_dir() / p.name
+        p = lists_dir(kind) / p.name
     return p
+
+
+def _write_stations(stations: list[str], output: Optional[pathlib.Path]) -> None:
+    """Write a station list (one ``{"station": "P143"}`` per line), or print it."""
+    norm = _normalize_stations(stations)
+    lines = b"\n".join(orjson.dumps({"station": s}) for s in norm) + b"\n"
+    if output is None:
+        sys.stdout.buffer.write(lines)
+        print(
+            f"\n{len(norm)} stations shown above. "
+            f"Add -o <name> to save to {paths.station_lists_dir()}/<name>.jsonl",
+            file=sys.stderr,
+        )
+    else:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(lines)
+        print(f"Wrote {len(norm)} stations → {output}", file=sys.stderr)
+
+
+def _stations_from_records(records: list[dict]) -> list[str]:
+    """Unique station codes from stream records, in sorted order."""
+    return sorted({st for r in records if (st := _station_of(r.get("geosncl")))})
+
+
+def _entry_count(path: pathlib.Path) -> int:
+    """Non-blank lines in a JSONL list; -1 if it cannot be read."""
+    try:
+        return sum(1 for line in path.read_bytes().splitlines() if line.strip())
+    except OSError:
+        return -1
 
 
 def _write(records: list[dict], output: Optional[pathlib.Path]) -> None:
@@ -572,78 +808,26 @@ _NETWORK_CHOICES = [
 ]
 
 
-def _add_data_dir_arg(p: argparse.ArgumentParser) -> None:
-    """Add the standard --data-directory flag (stream lists live under <base>/stream-lists)."""
+def _add_discover_filters(p: argparse.ArgumentParser) -> None:
+    """Filters shared by get-streams and get-stations (same API query, different output)."""
     p.add_argument(
-        "--data-directory",
-        metavar="PATH",
-        default=None,
-        help=(
-            "Base data directory (default: $ES_POS_DATA_DIRECTORY or ./data).  "
-            "Stream lists are read from / written to <PATH>/stream-lists."
-        ),
-    )
-
-
-def _build_parser(prog=None) -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
-    ap = argparse.ArgumentParser(
-        prog=prog,
-        description=(
-            "Discover and manage GNSS PPP position stream lists.\n\n"
-            "stream_type=gnss_ppp is always set for API calls.\n"
-            "For 'get radial', tier=stream is always set.\n\n"
-            "Stream lists can also be built interactively via the Stream List Builder\n"
-            "tab in the web UI ('es-pos webserver'), which shows all stations on a\n"
-            "map and lets you filter by processing center and PPP solution type."
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    sub = ap.add_subparsers(dest="command")
-
-    # ------------------------------------------------------------------ get
-    get_p = sub.add_parser(
-        "get",
-        help="Fetch a stream list from the EarthScope API",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    get_sub = get_p.add_subparsers(dest="source")
-
-    # -- get datasource
-    ds_p = get_sub.add_parser(
-        "datasource",
-        help="Search /discover/datasource/stream",
-        description=(
-            "Query the stream datasource discovery endpoint.\n"
-            "stream_type=gnss_ppp is always applied.\n\n"
-            "Good starting point:\n"
-            "  station_list get datasource --network-name SHAKE:ShakeAlert -o ShakeAlert"
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    ds_p.add_argument(
-        "-o", "--output",
-        default=None,
-        metavar="NAME",
-        help="Output list name; written to ./data/stream-lists/<name>.jsonl. Omit to print to screen.",
-    )
-    ds_p.add_argument(
         "--facility",
         choices=_FACILITY_CHOICES,
         metavar="FACILITY",
         help=f"Filter by processing facility. Choices: {_FACILITY_CHOICES}",
     )
-    ds_p.add_argument(
+    p.add_argument(
         "--software",
         choices=_SOFTWARE_CHOICES,
         metavar="SOFTWARE",
         help=f"Filter by processing software. Choices: {_SOFTWARE_CHOICES}",
     )
-    ds_p.add_argument(
+    p.add_argument(
         "--label",
         metavar="TEXT",
         help="Free-form label text to filter on",
     )
-    ds_p.add_argument(
+    p.add_argument(
         "--station-name",
         nargs="+",
         metavar="NAME",
@@ -653,87 +837,257 @@ def _build_parser(prog=None) -> tuple[argparse.ArgumentParser, argparse.Argument
             "Examples:  4CHARID:P146  IGS:P14600USA  PNUM:123"
         ),
     )
-    ds_p.add_argument(
+    p.add_argument(
         "--network-name",
         nargs="+",
         choices=_NETWORK_CHOICES,
         metavar="NETWORK",
         help=(
-            f"Network name(s).  Valid choices:\n"
+            "Network name(s).  Valid choices:\n"
             + "".join(f"  {n}\n" for n in _NETWORK_CHOICES)
         ),
     )
 
-    # -- get radial
-    rad_p = get_sub.add_parser(
-        "radial",
-        help="Search /refpos/search/radial",
-        description=(
-            "Radial search for GNSS PPP streams around a center point.\n"
-            "tier=stream and stream_type=gnss_ppp are always applied."
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    rad_p.add_argument(
-        "-o", "--output",
-        required=True,
-        metavar="FILE",
-        help="Output list name or path; written to ./data/stream-lists/<name>.jsonl by default",
-    )
-    rad_p.add_argument(
-        "--latitude",
-        type=float,
-        required=True,
-        metavar="DEG",
+
+def _add_radial_args(p: argparse.ArgumentParser) -> None:
+    """Centre point / radius shared by get-radial-streams and get-radial-stations."""
+    p.add_argument(
+        "--latitude", type=float, required=True, metavar="DEG",
         help="Center latitude in decimal degrees (−90 to 90)",
     )
-    rad_p.add_argument(
-        "--longitude",
-        type=float,
-        required=True,
-        metavar="DEG",
+    p.add_argument(
+        "--longitude", type=float, required=True, metavar="DEG",
         help="Center longitude in decimal degrees (−180 to 180)",
     )
-    rad_p.add_argument(
-        "--distance",
-        type=float,
-        required=True,
-        metavar="KM",
+    p.add_argument(
+        "--distance", type=float, required=True, metavar="KM",
         help="Search radius in km (Haversine great-circle distance)",
     )
-    rad_p.add_argument(
+    p.add_argument(
         "--network-name",
         nargs="+",
         choices=_NETWORK_CHOICES,
         metavar="NETWORK",
         help=(
-            f"Network name(s).  Valid choices:\n"
+            "Network name(s).  Valid choices:\n"
             + "".join(f"  {n}\n" for n in _NETWORK_CHOICES)
         ),
     )
-    rad_p.add_argument(
+    p.add_argument(
         "--facility",
         choices=_FACILITY_CHOICES,
         metavar="FACILITY",
         help=f"Filter streams by processing facility. Choices: {_FACILITY_CHOICES}",
     )
-    rad_p.add_argument(
+    p.add_argument(
         "--software",
         choices=_SOFTWARE_CHOICES,
         metavar="SOFTWARE",
         help=(
-            f"Filter results by processing software (applied locally after the API call).\n"
+            "Filter results by processing software (applied locally after the API call).\n"
             f"Choices: {_SOFTWARE_CHOICES}"
         ),
     )
 
-    # --------------------------------------------------------------- filter
-    filt_p = sub.add_parser(
-        "filter",
-        help="Merge and filter existing stream list JSONL files",
+
+def _add_output_arg(p: argparse.ArgumentParser, kind: str, *, required: bool = False) -> None:
+    where = "stream-lists" if kind == "streams" else "station-lists"
+    p.add_argument(
+        "-o", "--output",
+        default=None,
+        required=required,
+        metavar="NAME",
+        help=(
+            f"Output list name; written to <data-directory>/{where}/<name>.jsonl."
+            + ("" if required else "  Omit to print to screen.")
+        ),
+    )
+
+
+def _build_parser(prog=None) -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
+    ap = argparse.ArgumentParser(
+        prog=prog,
         description=(
-            "Load one or more stream list files, merge them (deduplicating by edid),\n"
-            "apply optional filters, and write the result to a new file."
+            "Build and inspect the stream and station lists everything else runs on.\n\n"
+            "Two kinds of list, mirroring the two builder tabs in the web UI:\n"
+            "  stream lists   full geosncl records  (<data-directory>/stream-lists/)\n"
+            "                 consumed by fetch, completeness, positions, ppsd,\n"
+            "                 export and replay\n"
+            "  station lists  station codes only    (<data-directory>/station-lists/)\n"
+            "                 used as include/exclude sets when building stream lists\n\n"
+            "stream_type=gnss_ppp is always set for API calls; the radial commands\n"
+            "also always set tier=stream.\n\n"
+            "Commands:\n"
+            "  list                   Show every stream and station list, with entry counts\n"
+            "  show-streams           Print a stream list (or just its path, with --path)\n"
+            "  show-stations          Print a station list (or just its path, with --path)\n"
+            "  get-streams            Query the API and save a stream list\n"
+            "  get-stations           Query the API and save a station list\n"
+            "  get-radial-streams     Radial search around a point, saved as a stream list\n"
+            "  get-radial-stations    Radial search around a point, saved as a station list\n"
+            "  filter-streams         Merge and filter existing stream lists\n"
+            "  validate-streams       Check stream lists for incomplete records\n\n"
+            "Both kinds can also be built interactively in the web UI\n"
+            "('es-pos webserver') via the Station Builder and Stream List Builder tabs."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = ap.add_subparsers(dest="command")
+
+    # ----------------------------------------------------------------- list
+    list_p = sub.add_parser(
+        "list",
+        help="Show every stream and station list, with location and entry count.",
+        description=(
+            "List the stream and station lists available to this data directory,\n"
+            "with how many entries each holds.\n\n"
+            "Use 'show-streams NAME --path' or 'show-stations NAME --path' to get an\n"
+            "absolute path for editing a list by hand."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    group = list_p.add_mutually_exclusive_group()
+    group.add_argument(
+        "--streams", action="store_true", help="Show only stream lists.",
+    )
+    group.add_argument(
+        "--stations", action="store_true", help="Show only station lists.",
+    )
+
+    # ------------------------------------------------------------- show-*
+    for cmd, kind, what in (
+        ("show-streams", "streams", "stream"),
+        ("show-stations", "stations", "station"),
+    ):
+        show_p = sub.add_parser(
+            cmd,
+            help=f"Print a {what} list, or just its path with --path.",
+            description=(
+                f"Print the contents of a {what} list.\n\n"
+                f"--edit opens it in $VISUAL / $EDITOR and reports the entry count\n"
+                f"afterwards, so a bad hand-edit is obvious straight away.\n\n"
+                f"--path prints only the absolute path and nothing else, for\n"
+                f"composing with other tools:\n"
+                f"  es-pos lists {cmd} NAME --edit\n"
+                f"  wc -l \"$(es-pos lists {cmd} NAME --path)\""
+            ),
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+        )
+        show_p.add_argument("name", metavar="NAME", help=f"{what.capitalize()} list name.")
+        show_g = show_p.add_mutually_exclusive_group()
+        show_g.add_argument(
+            "--edit", action="store_true",
+            help="Open the list in $VISUAL / $EDITOR instead of printing it.",
+        )
+        show_g.add_argument(
+            "--path", action="store_true",
+            help="Print only the absolute file path, not the contents.",
+        )
+
+    # ------------------------------------------------------------ get-streams
+    gs_p = sub.add_parser(
+        "get-streams",
+        help="Query the API and save a stream list.",
+        description=(
+            "Query the stream datasource discovery endpoint and save the matching\n"
+            "streams as a stream list.  stream_type=gnss_ppp is always applied.\n\n"
+            "Good starting point:\n"
+            "  es-pos lists get-streams --network-name SHAKE:ShakeAlert -o ShakeAlert"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _add_output_arg(gs_p, "streams")
+    _add_discover_filters(gs_p)
+
+    # ----------------------------------------------------------- get-stations
+    gst_p = sub.add_parser(
+        "get-stations",
+        help="Query the API and save a station list.",
+        description=(
+            "Same query as get-streams, but saves the unique station codes instead\n"
+            "of the full stream records -- the CLI equivalent of the web UI's\n"
+            "Station Builder output.\n\n"
+            "Station lists are the include/exclude sets the Stream List Builder\n"
+            "works from; they are not directly fetchable (use a stream list for that).\n\n"
+            "Example:\n"
+            "  es-pos lists get-stations --network-name SHAKE:ShakeAlert -o ShakeAlert"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _add_output_arg(gst_p, "stations")
+    _add_discover_filters(gst_p)
+
+    # ---------------------------------------------------- get-radial-streams
+    grs_p = sub.add_parser(
+        "get-radial-streams",
+        help="Radial search around a point, saved as a stream list.",
+        description=(
+            "Radial search for GNSS PPP streams around a center point.\n"
+            "tier=stream and stream_type=gnss_ppp are always applied.\n\n"
+            "A 404 'No streams found' means nothing matched -- check that the centre\n"
+            "point is on land and the radius actually reaches a station.\n\n"
+            "Example:\n"
+            "  es-pos lists get-radial-streams --latitude 40 --longitude -124 \\\n"
+            "      --distance 500 -o humboldt"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _add_output_arg(grs_p, "streams")
+    _add_radial_args(grs_p)
+
+    # --------------------------------------------------- get-radial-stations
+    grst_p = sub.add_parser(
+        "get-radial-stations",
+        help="Radial search around a point, saved as a station list.",
+        description=(
+            "Same search as get-radial-streams, but saves the unique station codes\n"
+            "instead of the full stream records.\n\n"
+            "Example:\n"
+            "  es-pos lists get-radial-stations --latitude 40 --longitude -124 \\\n"
+            "      --distance 500 -o humboldt"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _add_output_arg(grst_p, "stations")
+    _add_radial_args(grst_p)
+
+    # ------------------------------------------------------ validate-streams
+    val_p = sub.add_parser(
+        "validate-streams",
+        help="Check stream lists for incomplete records.",
+        description=(
+            "Check that every line of every stream list is a complete record\n"
+            "  {\"geosncl\", \"edid\", \"facility\", \"software\"}\n"
+            "and that its stream appears in the all-streams reference.\n\n"
+            "A record without an edid cannot be fetched -- the positions API is\n"
+            "queried by EDID, and a geosncl does not parse as one -- so it fails\n"
+            "silently as 'no data' rather than as an error.\n\n"
+            "Exits non-zero if any list has problems.  With --fix, invalid lines\n"
+            "are dropped and the file rewritten (a .bak copy is kept)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    val_p.add_argument(
+        "name", nargs="*", metavar="NAME",
+        help="Stream list(s) to check.  Default: every list.",
+    )
+    val_p.add_argument(
+        "--fix", action="store_true",
+        help=("Repair each list from all-streams where possible, dropping only what "
+              "cannot be resolved (saves <name>.jsonl.bak)."),
+    )
+    val_p.add_argument(
+        "--quiet", "-q", action="store_true",
+        help="Only print lists that have problems.",
+    )
+
+    # -------------------------------------------------------- filter-streams
+    filt_p = sub.add_parser(
+        "filter-streams",
+        help="Merge and filter existing stream lists.",
+        description=(
+            "Load one or more stream lists, merge them (deduplicating by edid),\n"
+            "apply optional filters, and write the result to a new stream list."
         ),
         formatter_class=argparse.RawTextHelpFormatter,
     )
@@ -742,14 +1096,9 @@ def _build_parser(prog=None) -> tuple[argparse.ArgumentParser, argparse.Argument
         action="append",
         required=True,
         metavar="FILE",
-        help="Input file; repeat for multiple: -i ShakeAlert -i cwu  (data/stream-lists/ and .jsonl resolved automatically)",
+        help="Input list; repeat for multiple: -i ShakeAlert -i cwu  (list dir and .jsonl resolved automatically)",
     )
-    filt_p.add_argument(
-        "-o", "--output",
-        default=None,
-        metavar="NAME",
-        help="Output list name; written to ./data/stream-lists/<name>.jsonl. Omit to print to screen.",
-    )
+    _add_output_arg(filt_p, "streams")
     filt_p.add_argument(
         "--facility",
         nargs="+",
@@ -801,10 +1150,206 @@ def _build_parser(prog=None) -> tuple[argparse.ArgumentParser, argparse.Argument
         ),
     )
 
-    for _p in (ds_p, rad_p, filt_p):
-        _add_data_dir_arg(_p)
+    return ap, list_p
 
-    return ap, get_p
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+def _cmd_list(args) -> None:
+    """Show the available lists of each kind, with entry counts."""
+    show_streams = not args.stations
+    show_stations = not args.streams
+    sections = []
+    if show_streams:
+        sections.append(("Stream lists", "streams"))
+    if show_stations:
+        sections.append(("Station lists", "stations"))
+
+    for i, (title, kind) in enumerate(sections):
+        if i:
+            print()
+        directory = lists_dir(kind)
+        files = sorted(directory.glob("*.jsonl")) if directory.is_dir() else []
+        print(f"{title} ({len(files)})")
+        if not directory.is_dir():
+            print(f"  (no {directory} yet)")
+            continue
+        if not files:
+            print(f"  (none in {directory})")
+            continue
+        width = max(len(f.stem) for f in files)
+        for f in files:
+            count = _entry_count(f)
+            shown = "unreadable" if count < 0 else f"{count:,} entries"
+            # Full path, not dir-header + filename: the path is the thing you
+            # copy into an editor, and it should survive being read out of
+            # scrollback without the header still being on screen.
+            print(f"  {f.stem.ljust(width)}  {shown:>15}  {f.resolve()}")
+
+    # stdout, not stderr: this is part of the listing, and on stderr it would
+    # interleave ahead of the output it refers to.
+    verb = "show-streams" if show_streams else "show-stations"
+    print(f"\nEdit a list:  es-pos lists {verb} NAME --edit")
+
+
+def _editor_command() -> list[str]:
+    """The user's editor, as a command prefix.
+
+    $VISUAL then $EDITOR, per POSIX convention; either may carry arguments
+    (``EDITOR="code -w"``), so it is split as a shell word list rather than
+    treated as a bare program name.  Falls back to the platform default only
+    when it is actually installed -- exec'ing a missing `vi` would fail with a
+    far less useful message than saying which variable to set.
+    """
+    import shlex
+    import shutil
+
+    for var in ("VISUAL", "EDITOR"):
+        value = os.environ.get(var, "").strip()
+        if value:
+            parts = shlex.split(value)
+            if parts:
+                return parts
+    fallback = "notepad" if sys.platform == "win32" else "vi"
+    if shutil.which(fallback):
+        return [fallback]
+    sys.exit(
+        "No editor configured.  Set $EDITOR (or $VISUAL), e.g.:\n"
+        "  export EDITOR=nano\n"
+        "Or edit the file directly -- 'es-pos lists show-... NAME --path' "
+        "prints its location."
+    )
+
+
+def _cmd_show(args, kind: str) -> None:
+    """Print a list's contents, or its path, or open it in an editor."""
+    path = _resolve_input(args.name, kind)
+
+    if args.path:
+        print(path.resolve())
+        return
+
+    if args.edit:
+        import subprocess
+        cmd = [*_editor_command(), str(path.resolve())]
+        before = _entry_count(path)
+        try:
+            code = subprocess.call(cmd)
+        except OSError as exc:
+            sys.exit(f"Could not launch editor {cmd[0]!r}: {exc}")
+        if code != 0:
+            sys.exit(f"Editor exited with status {code}; {path} left as it was.")
+        after = _entry_count(path)
+        delta = "" if after == before else f"  ({after - before:+,} from {before:,})"
+        print(f"{path} — {after:,} entries{delta}", file=sys.stderr)
+        if kind == "streams" and path.stem != ALL_STREAMS_LIST:
+            # Catch a bad hand-edit now, while the file is still in mind, rather
+            # than as a silent no-data result during a later fetch.
+            known = all_stream_geosncls()
+            errors = validate_stream_list_text(
+                path.read_text(encoding="utf-8", errors="replace"), known or None)
+            if errors:
+                print(f"\n[warn] {len(errors)} problem(s) in this list:", file=sys.stderr)
+                for e in errors[:5]:
+                    print(f"  {e}", file=sys.stderr)
+                if len(errors) > 5:
+                    print(f"  … and {len(errors) - 5} more", file=sys.stderr)
+                print("  Run 'es-pos lists validate-streams' for the full report.",
+                      file=sys.stderr)
+        return
+
+    sys.stdout.buffer.write(path.read_bytes())
+    print(f"\n{_entry_count(path)} entries in {path}", file=sys.stderr)
+
+
+def _cmd_validate_streams(args) -> None:
+    """Report (and optionally drop) stream-list records that cannot be fetched."""
+    import orjson as _orjson
+
+    directory = lists_dir("streams")
+    if args.name:
+        paths_to_check = [_resolve_input(n, "streams") for n in args.name]
+    else:
+        paths_to_check = sorted(directory.glob("*.jsonl"))
+    if not paths_to_check:
+        sys.exit("No stream lists found.")
+
+    reference = {
+        str(r["geosncl"]): r for r in read_stream_list_records(ALL_STREAMS_LIST)
+        if r.get("geosncl")
+    }
+    known = set(reference)
+    if known:
+        print(f"Reference: {ALL_STREAMS_LIST} ({len(known):,} streams)\n")
+    else:
+        print(f"[warn] {ALL_STREAMS_LIST} is empty or missing — membership is not "
+              f"being checked.\n")
+
+    total_bad = 0
+    for path in paths_to_check:
+        name = path.stem
+        text = path.read_text(encoding="utf-8", errors="replace")
+        # all-streams is the reference; checking it against itself is circular.
+        errors = validate_stream_list_text(
+            text, None if name == ALL_STREAMS_LIST else (known or None))
+        n_lines = sum(1 for l in text.splitlines() if l.strip())
+
+        if not errors:
+            if not args.quiet:
+                print(f"  OK    {name:<28} {n_lines:>7,} record(s)")
+            continue
+
+        total_bad += 1
+        print(f"  FAIL  {name:<28} {n_lines:>7,} record(s), {len(errors):,} problem(s)")
+        for e in errors[:5]:
+            print(f"          {e}")
+        if len(errors) > 5:
+            print(f"          … and {len(errors) - 5:,} more")
+
+        if args.fix:
+            # Repair before discarding.  These lists are mostly complete records
+            # missing facility/software, and all-streams has those values -- so
+            # fill them in and only drop what genuinely cannot be resolved.
+            kept: list[dict] = []
+            repaired = dropped = 0
+            seen: set[str] = set()
+            for line in text.splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    rec = _orjson.loads(line)
+                except Exception:
+                    dropped += 1
+                    continue
+                geosncl = str(rec.get("geosncl") or "") if isinstance(rec, dict) else ""
+                if validate_stream_record(rec) is None and geosncl not in seen:
+                    if not known or geosncl in known:
+                        seen.add(geosncl)
+                        kept.append({f: rec[f] for f in STREAM_RECORD_FIELDS})
+                        continue
+                canonical = reference.get(geosncl)
+                if canonical is not None and validate_stream_record(canonical) is None:
+                    if geosncl not in seen:
+                        seen.add(geosncl)
+                        kept.append({f: canonical[f] for f in STREAM_RECORD_FIELDS})
+                        repaired += 1
+                    continue
+                dropped += 1
+            backup = path.with_suffix(".jsonl.bak")
+            backup.write_text(text, encoding="utf-8")
+            path.write_bytes(b"\n".join(_orjson.dumps(r) for r in kept) + b"\n")
+            print(f"          fixed: {len(kept):,} record(s) kept "
+                  f"({repaired:,} repaired from {ALL_STREAMS_LIST}, {dropped:,} dropped); "
+                  f"original saved to {backup.name}")
+
+    if total_bad:
+        print(f"\n{total_bad} list(s) with problems."
+              + ("" if args.fix else
+                 f"  Re-run with --fix to repair them from {ALL_STREAMS_LIST}."))
+        sys.exit(1)
+    print(f"\nAll {len(paths_to_check)} list(s) valid.")
 
 
 # ---------------------------------------------------------------------------
@@ -812,34 +1357,52 @@ def _build_parser(prog=None) -> tuple[argparse.ArgumentParser, argparse.Argument
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    ap, get_p = _build_parser()
+    ap, list_p = _build_parser()
     args = ap.parse_args()
 
     if not args.command:
         ap.print_help()
         sys.exit(0)
 
-    paths.set_base_dir(getattr(args, "data_directory", None))
-
     try:
-        if args.command == "get":
-            if not getattr(args, "source", None):
-                get_p.print_help()
-                sys.exit(0)
+        if args.command == "list":
+            _cmd_list(args)
 
-            output = _resolve_output(args.output) if args.output else None
+        elif args.command == "show-streams":
+            _cmd_show(args, "streams")
 
-            if args.source == "datasource":
-                records = _get_datasource(args)
-            else:
-                records = _get_radial(args)
-            _write(records, output)
+        elif args.command == "show-stations":
+            _cmd_show(args, "stations")
 
-        elif args.command == "filter":
-            output = _resolve_output(args.output) if args.output else None
+        elif args.command == "get-streams":
+            records = _get_datasource(args)
+            _write(records, _resolve_output(args.output, "streams") if args.output else None)
+
+        elif args.command == "get-stations":
+            records = _get_datasource(args)
+            _write_stations(
+                _stations_from_records(records),
+                _resolve_output(args.output, "stations") if args.output else None,
+            )
+
+        elif args.command == "get-radial-streams":
+            records = _get_radial(args)
+            _write(records, _resolve_output(args.output, "streams") if args.output else None)
+
+        elif args.command == "get-radial-stations":
+            records = _get_radial(args)
+            _write_stations(
+                _stations_from_records(records),
+                _resolve_output(args.output, "stations") if args.output else None,
+            )
+
+        elif args.command == "validate-streams":
+            _cmd_validate_streams(args)
+
+        elif args.command == "filter-streams":
             records = _do_filter(args)
             print(f"After filtering: {len(records)} records.", file=sys.stderr)
-            _write(records, output)
+            _write(records, _resolve_output(args.output, "streams") if args.output else None)
     finally:
         # Release the SDK client so this CLI process exits cleanly (no pending
         # async retry-context warnings at interpreter shutdown).

@@ -95,7 +95,7 @@
         :disable="selected.size === 0" @click="openSaveDialog" />
       <q-btn label="Save To File"     dense flat no-caps size="sm" icon="image"
         :disable="selected.size === 0" @click="openSavePlotDialog">
-        <q-tooltip>Write the current plots to a PNG in File Plots</q-tooltip>
+        <q-tooltip>Write the current plots to a PNG in File Explorer</q-tooltip>
       </q-btn>
       <q-btn label="Coherence"        dense flat no-caps size="sm" icon="grid_on"
         :disable="selected.size < 2 || selected.size > COHERENCE_MAX_STREAMS" @click="openCoherenceDialog">
@@ -336,7 +336,7 @@
         <q-card-section>
           <div class="text-caption text-grey-7 q-mb-sm">
             Writes the current plots (time-series, scatter, histograms) as a PNG to
-            <code>data/plots/positions/</code> — viewable in the <b>File Plots</b> tab.
+            <code>data/plots/positions/</code> — viewable in the <b>File Explorer</b> tab.
           </div>
           <q-input v-model="savePlotName" label="File name" dense outlined autofocus
             suffix=".png"
@@ -829,7 +829,7 @@ async function doSavePlot() {
     const dataUrl = canvas.toDataURL("image/png");
     const res = await savePlotImage(_cleanName(name), dataUrl);
     savePlotOpen.value = false;
-    $q.notify({ type: "positive", message: `Saved ${res.name} — see File Plots (positions/).` });
+    $q.notify({ type: "positive", message: `Saved ${res.name} — see File Explorer (positions/).` });
   } catch (e: any) {
     savePlotError.value = e?.response?.data?.error ?? "Failed to save.";
   } finally {
@@ -1166,7 +1166,7 @@ function saveCoherencePlot() {
     if (!clean) return;
     try {
       const res = await savePlotImage(clean, canvas.toDataURL("image/png"), "coherence");
-      $q.notify({ type: "positive", message: `Saved ${res.name} — see File Plots (coherence/).` });
+      $q.notify({ type: "positive", message: `Saved ${res.name} — see File Explorer (coherence/).` });
     } catch (e: any) {
       $q.notify({ type: "negative", message: e?.response?.data?.error ?? "Failed to save." });
     }
@@ -1433,7 +1433,7 @@ function saveKlePlot() {
     if (!clean) return;
     try {
       const res = await savePlotImage(clean, canvas.toDataURL("image/png"), "kle");
-      $q.notify({ type: "positive", message: `Saved ${res.name} — see File Plots (kle/).` });
+      $q.notify({ type: "positive", message: `Saved ${res.name} — see File Explorer (kle/).` });
     } catch (e: any) {
       $q.notify({ type: "negative", message: e?.response?.data?.error ?? "Failed to save." });
     }
@@ -1552,7 +1552,7 @@ function savePcaPlot() {
     if (!clean) return;
     try {
       const res = await savePlotImage(clean, canvas.toDataURL("image/png"), "pca");
-      $q.notify({ type: "positive", message: `Saved ${res.name} — see File Plots (pca/).` });
+      $q.notify({ type: "positive", message: `Saved ${res.name} — see File Explorer (pca/).` });
     } catch (e: any) {
       $q.notify({ type: "negative", message: e?.response?.data?.error ?? "Failed to save." });
     }

@@ -4,12 +4,17 @@ arrow_inspect — display contents of Apache Arrow IPC files.
 Auto-detects IPC file format (.arrow), IPC stream format (.arrows), and
 JSON error payloads written by failed curl downloads.
 
+Reached as ``es-pos inspect``; ``main()`` is delegated to from es_pos.py the
+same way the stations/fetch groups are.  It deliberately has no console-script
+entry point of its own — a bare ``inspect`` command on PATH is far too generic
+a name to claim.
+
 Usage:
-    arrow_inspect /tmp/test.arrow
-    arrow_inspect data/arrow/ACSB.PB.LY_.40/202601/*.arrow
-    arrow_inspect /tmp/test.arrow --rows 20
-    arrow_inspect /tmp/test.arrow --schema-only
-    arrow_inspect /tmp/test.arrow --stats
+    es-pos inspect /tmp/test.arrow
+    es-pos inspect data/arrow/ACSB.PB.LY_.40/202601/*.arrow
+    es-pos inspect /tmp/test.arrow --rows 20
+    es-pos inspect /tmp/test.arrow --schema-only
+    es-pos inspect /tmp/test.arrow --stats
 """
 from __future__ import annotations
 
@@ -176,7 +181,7 @@ def _inspect(path: pathlib.Path, args: argparse.Namespace) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        prog="inspect",
+        prog="es-pos inspect",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description="""Display contents of Apache Arrow IPC files.
 
@@ -185,10 +190,10 @@ JSON error payloads written by failed curl downloads.
 Timestamps stored as integer milliseconds-since-epoch are shown as ISO 8601.
 
 Examples:
-  inspect /tmp/test.arrow
-  inspect data/arrow/ACSB.PB.LY_.40/202601/*.arrow --rows 5
-  inspect /tmp/test.arrow --schema-only
-  inspect /tmp/test.arrow --stats
+  es-pos inspect /tmp/test.arrow
+  es-pos inspect data/arrow/ACSB.PB.LY_.40/202601/*.arrow --rows 5
+  es-pos inspect /tmp/test.arrow --schema-only
+  es-pos inspect /tmp/test.arrow --stats
 """,
     )
     ap.add_argument("files", nargs="+", metavar="FILE",

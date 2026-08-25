@@ -34,13 +34,34 @@ from earthscope_positions.stations import station_list
 
 
 @pytest.fixture(autouse=True)
-def _reset_data_dir(monkeypatch):
-    """Keep the data-directory resolution hermetic: no leaked env var or
-    override from the developer's shell or a prior test."""
+def _reset_data_dir(monkeypatch, tmp_path_factory):
+    """Keep the data-directory resolution hermetic.
+
+    Clears the env override *and* redirects the config file into a throwaway
+    directory -- without that second step every test would read (and
+    ``es-pos config`` tests would overwrite) the developer's real
+    ~/.earthscope-positions.json.  Interactive prompting is forced off so a
+    test can never block on stdin.
+
+    There is no flag layer any more, so a test that wants a specific directory
+    sets it through the config (``set_configured_data_dir``) or the environment
+    variable, exactly as a real caller would.
+    """
     monkeypatch.delenv(paths.ENV_VAR, raising=False)
-    paths.set_base_dir(None)
+    monkeypatch.delenv(paths.CONFIG_ENV_VAR, raising=False)
+    monkeypatch.delenv("ES_POS_CONFIG_MISMATCH_NOTIFIED", raising=False)
+    cfg_dir = tmp_path_factory.mktemp("es-pos-config")
+    paths.set_config_path(cfg_dir / paths.CONFIG_FILENAME)
+    paths.reset_cache()
+    paths.set_interactive(False)
+    # Seed a throwaway data directory so a test that resolves paths without
+    # configuring one falls through to *this*, never to the real
+    # ~/earthscope-positions default in the developer's home.
+    paths.set_configured_data_dir(cfg_dir / "data")
     yield
-    paths.set_base_dir(None)
+    paths.reset_cache()
+    paths.set_config_path(None)
+    paths.set_interactive(False)
 
 
 # ---------------------------------------------------------------------------
@@ -51,17 +72,19 @@ def _reset_data_dir(monkeypatch):
 
 @pytest.fixture
 def project_tree(tmp_path, monkeypatch):
-    """chdir into an isolated project root (contains a pyproject.toml).
+    """chdir into an isolated project root and point the data directory at it.
 
-    ``positions_fetch`` and ``station_list`` both locate the project root by
-    walking up from the CWD looking for ``pyproject.toml``, then read/write
-    under ``<root>/data``.  Pointing that at a tmp dir keeps tests hermetic and
-    lets us assert on the files they create.
+    The pyproject.toml is still written because ``_project_root()`` uses it to
+    locate checkout-relative assets (the built SPA, the README).  The data
+    directory is now set explicitly through the *config* layer rather than
+    inferred from the CWD -- that inference is gone, and using the config layer
+    leaves the env layer free for the precedence tests to exercise.
     """
     (tmp_path / "pyproject.toml").write_text("[project]\nname = 'test'\n")
     (tmp_path / "data" / "arrow").mkdir(parents=True)
     (tmp_path / "data" / "stream-lists").mkdir(parents=True)
     monkeypatch.chdir(tmp_path)
+    paths.set_configured_data_dir(tmp_path / "data")
     return tmp_path
 
 

@@ -24,8 +24,45 @@ const selectedStations = ref(new Set<string>());
 const history = ref<string[][]>([[]]);
 const historyIdx = ref(0);
 
-const unionMode  = ref(true);
-const toggleMode = ref(true);
+// What to do with a newly selected batch of stations -- map rectangle drag,
+// Add Network Stations, and Radial Search all funnel through applySelection().
+// Persisted so it survives a reload; 'exclude' is the pre-rename value the
+// radial dialog used to store on its own.
+type SelectMode = 'only' | 'add' | 'remove';
+const _storedMode = localStorage.getItem('stationSelectMode')
+  ?? localStorage.getItem('radialMode');
+const selectMode = ref<SelectMode>(
+  _storedMode === 'add' ? 'add'
+  : (_storedMode === 'remove' || _storedMode === 'exclude') ? 'remove'
+  : 'only');
+watch(selectMode, (m) => localStorage.setItem('stationSelectMode', m));
+
+const SELECT_MODE_OPTIONS = [
+  { label: 'Only',   value: 'only'   },
+  { label: 'Add',    value: 'add'    },
+  { label: 'Remove', value: 'remove' },
+];
+
+/** Combine a freshly-identified batch of stations with the current selection
+ *  according to selectMode, then commit it (history + markers). */
+function applySelection(hits: Set<string> | string[]): number {
+  const batch = hits instanceof Set ? hits : new Set(hits);
+  let ss: Set<string>;
+  if (selectMode.value === 'only') {
+    ss = new Set(batch);
+  } else if (selectMode.value === 'add') {
+    ss = new Set(selectedStations.value);
+    batch.forEach(h => ss.add(h));
+  } else {
+    ss = new Set(selectedStations.value);
+    batch.forEach(h => ss.delete(h));
+  }
+  selectedStations.value = ss;
+  pushHistory(ss);
+  updateAllMarkers();
+  activeStation.value = null;
+  return batch.size;
+}
 const shiftHeld  = ref(false);
 
 const listOptions   = ref<string[]>([]);
@@ -107,15 +144,12 @@ function selectNone() {
   pushHistory(new Set()); updateAllMarkers(); activeStation.value = null;
 }
 function selectInBounds(bounds: L.LatLngBounds) {
-  const ss = unionMode.value ? new Set(selectedStations.value) : new Set<string>();
+  const hits = new Set<string>();
   for (const s of stations.value) {
     if (s.lat === null || s.lon === null) continue;
-    if (!bounds.contains(L.latLng(s.lat, s.lon))) continue;
-    if (toggleMode.value && ss.has(s.station)) ss.delete(s.station);
-    else ss.add(s.station);
+    if (bounds.contains(L.latLng(s.lat, s.lon))) hits.add(s.station);
   }
-  selectedStations.value = ss;
-  pushHistory(ss); updateAllMarkers();
+  applySelection(hits);
 }
 
 // ── History ─────────────────────────────────────────────────────────────────
@@ -138,10 +172,6 @@ const radialOpen = ref(false);
 const radialLat  = ref<number | null>(null);
 const radialLon  = ref<number | null>(null);
 const radialKm   = ref<number | null>(100);
-const radialMode = ref<'only' | 'add' | 'exclude'>(
-  (localStorage.getItem('radialMode') as 'only' | 'add' | 'exclude') || 'only');
-watch(radialMode, (m) => localStorage.setItem('radialMode', m));
-
 function haversineKm(lat1: number, lon1: number, lat2: number, lon2: number): number {
   const R = 6371, toRad = Math.PI / 180;
   const dLat = (lat2 - lat1) * toRad, dLon = (lon2 - lon1) * toRad;
@@ -156,13 +186,8 @@ function applyRadial() {
     if (s.lat === null || s.lon === null) continue;
     if (haversineKm(radialLat.value, radialLon.value, s.lat, s.lon) <= radialKm.value) hits.add(s.station);
   }
-  let ss: Set<string>;
-  if (radialMode.value === 'only') ss = hits;
-  else if (radialMode.value === 'add') { ss = new Set(selectedStations.value); hits.forEach(h => ss.add(h)); }
-  else { ss = new Set(selectedStations.value); hits.forEach(h => ss.delete(h)); }
-  selectedStations.value = ss;
-  pushHistory(ss); updateAllMarkers();
-  $q.notify({ type: 'positive', message: `Radial: ${hits.size} station(s) within ${radialKm.value} km (${radialMode.value}).` });
+  applySelection(hits);
+  $q.notify({ type: 'positive', message: `Radial: ${hits.size} station(s) within ${radialKm.value} km (${selectMode.value}).` });
   radialOpen.value = false;
 }
 /** Open the Radial Search dialog pre-filled with a station's coordinates as the
@@ -179,22 +204,33 @@ const networkOptions  = ref<string[]>([]);
 const selectedNetwork = ref<string | null>(null);
 const networkLoading  = ref(false);
 const networkMsg      = ref('');
+const networkLastList = ref('');
 
 async function loadNetworks() {
   try { networkOptions.value = (await axios.get('/api/station-builder/networks')).data.networks ?? []; }
   catch { networkOptions.value = []; }
 }
-async function loadNetworkStations() {
+async function loadNetworkStations(refresh = false) {
   if (!selectedNetwork.value || networkLoading.value) return;
-  networkLoading.value = true; networkMsg.value = 'Loading…';
+  networkLoading.value = true;
+  networkMsg.value = refresh ? 'Re-querying…' : 'Loading…';
   try {
-    const r = await axios.get('/api/station-builder/network-stations', { params: { network: selectedNetwork.value } });
-    const codes: string[] = r.data.stations ?? [];
-    const ss = new Set(selectedStations.value);
-    for (const s of codes) ss.add(s.toUpperCase());
-    selectedStations.value = ss;
-    pushHistory(ss); updateAllMarkers();
-    networkMsg.value = `Added ${codes.length} station(s) from ${selectedNetwork.value}.`;
+    const r = await axios.get('/api/station-builder/network-stations', {
+      params: { network: selectedNetwork.value, refresh },
+    });
+    const codes: string[] = (r.data.stations ?? []).map((s: string) => s.toUpperCase());
+    applySelection(codes);
+
+    // Loading a network also leaves a saved station list behind, so surface
+    // its name and whether it came from disk -- otherwise a cached load looks
+    // identical to a fresh query while quietly not hitting the API.
+    networkLastList.value = r.data.name ?? '';
+    const via = r.data.cached
+      ? `loaded from saved list "${r.data.name}"`
+      : `saved as station list "${r.data.name}"`;
+    const verb = selectMode.value === 'remove' ? 'Removed' : 'Applied';
+    networkMsg.value = `${verb} ${codes.length} station(s) from ${selectedNetwork.value} — ${via}.`;
+    await loadListOptions();   // the new list should appear in the list dropdown
   } catch (e: unknown) {
     const err = e as { response?: { data?: { error?: string } } };
     networkMsg.value = err?.response?.data?.error ?? String(e);
@@ -314,10 +350,28 @@ const coordEditOpen = ref(false);
 const coordEditContent = ref('');
 const coordEditSaving = ref(false);
 const coordEditError = ref('');
+const coordEditPath = ref('');
 async function openEditCoordinates() {
   coordEditError.value = ''; coordEditSaving.value = false;
-  try { coordEditContent.value = (await axios.get('/api/coordinates/raw')).data.content ?? ''; coordEditOpen.value = true; }
-  catch { $q.notify({ type: 'negative', message: 'Could not open coordinates file.' }); }
+  try {
+    const r = await axios.get('/api/coordinates/raw');
+    coordEditContent.value = r.data.content ?? '';
+    coordEditPath.value = r.data.path ?? '';
+    coordEditOpen.value = true;
+  } catch (err: unknown) {
+    // Surface what the server actually said, and which file it tried. The old
+    // blanket "Could not open coordinates file" hid the one detail that
+    // identifies the problem.
+    const e2 = err as { response?: { data?: { error?: string; path?: string } } };
+    const detail = e2?.response?.data?.error ?? String(err);
+    const where = e2?.response?.data?.path;
+    $q.notify({
+      type: 'negative', multiLine: true, timeout: 9000,
+      message: where
+        ? `Could not open coordinates file (${where}): ${detail}`
+        : `Could not open coordinates file: ${detail}`,
+    });
+  }
 }
 async function doSaveCoordinates() {
   coordEditSaving.value = true; coordEditError.value = '';
@@ -440,6 +494,19 @@ onUnmounted(() => {
             <q-btn flat dense round icon="undo" size="sm" :disable="historyIdx<=0" @click="histBack" />
             <q-btn flat dense round icon="redo" size="sm" :disable="historyIdx>=history.length-1" @click="histForward" />
           </div>
+          <div class="text-caption text-grey-6 q-mt-sm">New selections</div>
+          <q-btn-toggle
+            v-model="selectMode"
+            spread no-caps dense unelevated
+            toggle-color="primary"
+            :options="SELECT_MODE_OPTIONS"
+          >
+            <q-tooltip max-width="300px">
+              What happens to stations picked by a map drag, Add Network Stations, or
+              Radial Search — <b>Only</b> replaces the selection, <b>Add</b> merges into
+              it, <b>Remove</b> subtracts them from it.
+            </q-tooltip>
+          </q-btn-toggle>
           <div class="text-caption text-grey-7 q-mt-xs">{{ selCount }} station(s) selected</div>
 
           <q-separator class="q-my-sm" />
@@ -455,7 +522,22 @@ onUnmounted(() => {
           <q-btn class="full-width q-mb-xs" size="sm" color="primary" unelevated
                  icon="lan" label="Add Network Stations"
                  :disable="!selectedNetwork || networkLoading" :loading="networkLoading"
-                 @click="loadNetworkStations" />
+                 @click="loadNetworkStations(false)">
+            <q-tooltip max-width="280px">
+              Adds the network's stations to the selection and saves them as a station
+              list named after the network. If that list already exists it is loaded
+              from disk instead of re-querying the API.
+            </q-tooltip>
+          </q-btn>
+          <q-btn v-if="networkLastList" class="full-width q-mb-xs" size="sm" flat dense
+                 color="grey-8" icon="refresh" label="Re-query network" no-caps
+                 :disable="!selectedNetwork || networkLoading"
+                 @click="loadNetworkStations(true)">
+            <q-tooltip max-width="280px">
+              Ignore the saved list, query the API again, and overwrite
+              "{{ networkLastList }}" — discards any hand-edits to it.
+            </q-tooltip>
+          </q-btn>
           <div v-if="networkMsg" class="text-caption text-grey-7 q-mb-sm">{{ networkMsg }}</div>
 
           <q-separator class="q-my-sm" />
@@ -464,8 +546,13 @@ onUnmounted(() => {
           <div class="text-overline text-grey-7 q-mb-xs">Coordinates</div>
           <input ref="coordFileInput" type="file" accept=".csv,text/csv" style="display:none" @change="onCoordFileChange" />
           <q-btn class="full-width q-mb-xs" size="sm" color="blue-grey" unelevated
-                 icon="upload_file" label="Update Coordinates" @click="coordFileInput?.click()">
-            <q-tooltip max-width="260px">Upload CSV (station,latitude,longitude,height[,source]). Uploaded rows win; source defaults to “user”.</q-tooltip>
+                 icon="upload_file" label="Add Coordinate File" @click="coordFileInput?.click()">
+            <q-tooltip max-width="280px">
+              Merge a CSV (station,latitude,longitude,height[,source]) into the stored
+              coordinates. Rows in the uploaded file win on station matches; source
+              defaults to “user”. Nothing is replaced wholesale — use Edit Coordinates
+              for that.
+            </q-tooltip>
           </q-btn>
           <q-btn class="full-width q-mb-xs" size="sm" color="blue-grey" outline
                  icon="edit_location_alt" label="Edit Coordinates" @click="openEditCoordinates" />
@@ -475,6 +562,9 @@ onUnmounted(() => {
           <!-- Save -->
           <div class="text-overline text-grey-7 q-mb-xs">Save Station List</div>
           <q-input v-model="listName" label="List name" dense outlined class="q-mb-xs" clearable />
+          <div class="text-caption q-mb-xs" :class="selCount ? 'text-grey-7' : 'text-grey-5'">
+            {{ selCount }} station(s) will be saved
+          </div>
           <q-btn class="full-width" size="sm" color="positive" unelevated label="Save"
                  :disable="!listName.trim() || selCount === 0" @click="saveList" />
 
@@ -539,11 +629,10 @@ onUnmounted(() => {
           <q-input v-model.number="radialLat" type="number" label="Latitude" dense outlined />
           <q-input v-model.number="radialLon" type="number" label="Longitude" dense outlined />
           <q-input v-model.number="radialKm" type="number" label="Distance (km)" dense outlined />
-          <div class="text-caption text-grey-7">Mode</div>
-          <q-option-group v-model="radialMode" inline :options="[
-            { label:'Only', value:'only' }, { label:'Add', value:'add' }, { label:'Exclude', value:'exclude' }]" />
+          <div class="text-caption text-grey-7">Mode (shared with the map and network selection)</div>
+          <q-option-group v-model="selectMode" inline :options="SELECT_MODE_OPTIONS" />
           <div class="text-caption text-grey-6">
-            Only = replace selection; Add = add to selection; Exclude = remove (for rings).
+            Only = replace selection; Add = add to selection; Remove = subtract (for rings).
           </div>
         </q-card-section>
         <q-card-actions align="right">
@@ -584,7 +673,10 @@ onUnmounted(() => {
       <q-card class="column no-wrap">
         <q-card-section class="row items-center q-py-sm bg-blue-grey text-white">
           <q-icon name="edit_location_alt" class="q-mr-sm" />
-          <div class="text-subtitle1">Edit coordinates</div>
+          <div class="text-subtitle1">
+            Edit coordinates
+            <span v-if="coordEditPath" class="text-caption q-ml-sm" style="opacity:.8">{{ coordEditPath }}</span>
+          </div>
           <q-space />
           <div class="text-caption">station,latitude,longitude,height[,source]</div>
           <q-btn flat round dense icon="close" class="q-ml-sm" v-close-popup :disable="coordEditSaving" />

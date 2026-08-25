@@ -1,18 +1,18 @@
 """
 es-pos — unified EarthScope GNSS positions CLI.
 
-Fans out to all subcommands.  'inspect' is a separate standalone tool.
+Fans out to all subcommands.
 
 Usage:
-  es-pos stations get datasource --network-name SHAKE:ShakeAlert -o ShakeAlert
-  es-pos stations get radial --latitude 37.5 --longitude -122.0 --distance 100 -o bay_area
-  es-pos stations filter -i ShakeAlert -o ShakeAlert.clean --facility JPL
+  es-pos lists get-streams --network-name SHAKE:ShakeAlert -o ShakeAlert
+  es-pos lists get-radial-streams --latitude 37.5 --longitude -122.0 --distance 100 -o bay_area
+  es-pos lists filter-streams -i ShakeAlert -o ShakeAlert.clean --facility JPL
 
   es-pos fetch --list ShakeAlert.clean --start 2026-01-01 --end 2026-04-01
   es-pos fetch --retry --result error-422
 
   es-pos process completeness
-  es-pos process completeness --overwrite --data-directory /custom/data
+  es-pos process completeness --overwrite
 
   es-pos process ppsd
   es-pos process ppsd -i ShakeAlert --start 2026-01-01 --end 2026-01-31
@@ -35,29 +35,6 @@ def _project_root() -> pathlib.Path:
     return paths.project_root()
 
 
-def _add_data_dir_args(p: argparse.ArgumentParser, *, arrow: bool = True) -> None:
-    """Add the standard --data-directory flag.
-
-    (*arrow* is accepted for call-site compatibility but no longer does anything;
-    the Arrow root is always ``<data-directory>/arrow``.)
-    """
-    p.add_argument(
-        "--data-directory",
-        metavar="PATH",
-        default=None,
-        help=(
-            "Base data directory (default: $ES_POS_DATA_DIRECTORY or ./data).  "
-            "Arrow files live under <PATH>/arrow, stream lists under "
-            "<PATH>/stream-lists, plots under <PATH>/plots."
-        ),
-    )
-
-
-def _apply_data_dir_args(args: argparse.Namespace) -> None:
-    """Push the resolved --data-directory into `paths` (Arrow root = <base>/arrow)."""
-    paths.set_base_dir(getattr(args, "data_directory", None))
-
-
 def _build_top_parser() -> tuple[
     argparse.ArgumentParser,
     argparse.ArgumentParser,
@@ -71,19 +48,21 @@ def _build_top_parser() -> tuple[
         description="""EarthScope GNSS positions toolkit.
 
 Typical workflow:
-  1.  es-pos stations get datasource --network-name SHAKE:ShakeAlert -o ShakeAlert
-      (or use the Station Builder tab in the web UI)
+  1.  es-pos lists get-streams --network-name SHAKE:ShakeAlert -o ShakeAlert
+      (or use the Station/Stream List Builder tabs in the web UI)
   2.  es-pos fetch --list ShakeAlert --start 2026-01-01 --end 2026-04-01
   3.  es-pos process completeness        (speeds up the web UI)
   4.  es-pos webserver                   (open http://localhost:8000)
 
 Subcommands:
-  stations   Discover and manage GNSS stream lists.
+  lists      Build and inspect stream lists and station lists.
   fetch      Download and manage position data.
   process    Post-process downloaded data.
-  export     Export to MiniSEED 3, GeoJSON, or PPSD plots.
+  export     Export to MiniSEED (v3 or v2), GeoJSON, or PPSD plots.
   replay     Replay data to a Kafka topic at original ingest timing.
   webserver  Serve the positions web UI and API.
+  inspect    Print schema/rows/statistics of Arrow IPC files.
+  config     Show or change the persisted data-directory setting.
   test       Diagnostic tools for the positions API.
 
 Use 'es-pos <subcommand> --help' for per-command options.
@@ -92,13 +71,26 @@ Use 'es-pos <subcommand> --help' for per-command options.
     sub = ap.add_subparsers(dest="group", metavar="SUBCOMMAND")
 
     sub.add_parser(
+        "lists",
+        help="Build and inspect stream lists and station lists.",
+        add_help=False,
+    )
+    # Renamed to `lists` (it manages both stream *and* station lists, which
+    # `stations` implied it did not).  Kept only to redirect, not hidden --
+    # a plain "invalid choice" would leave the reader guessing.
+    sub.add_parser(
         "stations",
-        help="Discover and manage GNSS stream lists.",
+        help=argparse.SUPPRESS,
         add_help=False,
     )
     sub.add_parser(
         "fetch",
         help="Download and manage GNSS position data.",
+        add_help=False,
+    )
+    sub.add_parser(
+        "inspect",
+        help="Print schema, sample rows, and statistics of Arrow IPC files.",
         add_help=False,
     )
 
@@ -142,7 +134,6 @@ Examples:
   es-pos process ppsd
   es-pos process ppsd --overwrite
   es-pos process ppsd -i ShakeAlert --start 2026-01-01 --end 2026-01-31
-  es-pos process ppsd --data-directory /data/archive
 """,
     )
     ppsd_proc_p.add_argument(
@@ -160,7 +151,6 @@ Examples:
         "--all", action="store_true",
         help="Process all .arrow files under DATA_DIR (default: ./data/arrow).  Mutually exclusive with -i.",
     )
-    _add_data_dir_args(ppsd_proc_p)
     ppsd_proc_p.add_argument(
         "--start",
         metavar="YYYY-MM-DD",
@@ -214,10 +204,8 @@ pre-computing them here makes the Completeness & Latency tab load faster.
 Examples:
   es-pos process completeness
   es-pos process completeness --overwrite
-  es-pos process completeness --data-directory /data/archive
 """,
     )
-    _add_data_dir_args(comp_p)
     comp_p.add_argument(
         "--overwrite",
         action="store_true",
@@ -267,7 +255,6 @@ Web UI tabs:
 Examples:
   es-pos webserver
   es-pos webserver --port 9000
-  es-pos webserver --data-directory /archive/data
 """,
     )
     web_p.add_argument(
@@ -293,7 +280,118 @@ Examples:
             "server's public name/IP when running remotely."
         ),
     )
-    _add_data_dir_args(web_p)
+
+    # ── config ───────────────────────────────────────────────────────────────
+    config_p = sub.add_parser(
+        "config",
+        help="Show or change the persisted data-directory setting.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="""Inspect and change the persisted earthscope-positions settings.
+
+Settings live in a single JSON file in your home directory
+(~/.earthscope-positions.json by default; override with ES_POS_CONFIG_FILE).
+It is created at runtime and is unaffected by upgrading or reinstalling the
+package.
+
+The data directory is resolved in this order — the first that applies wins:
+
+  1. the ES_POS_DATA_DIRECTORY environment variable
+  2. data_directory in the config file
+  3. first run on a terminal: you are asked, and the answer is saved to (2)
+  4. otherwise the default, ~/earthscope-positions
+
+There is no --data-directory flag; the environment variable covers the same
+ground for automated callers.  If it is set and disagrees with the configured
+value, every command prints a one-time note showing both.
+
+Directories used before are remembered, so you can switch between them by
+number instead of retyping a path.
+
+Subcommands:
+  show             Print the resolved data directory and which layer set it.
+  list-data-dirs   List remembered data directories, marking the active one.
+  use-data-dir     Switch the active data directory (by number or path).
+  set-data-dir     Record a data directory in the config file (does not move data).
+  move-data-dir    Move the existing data tree somewhere else, then record it.
+  forget-data-dir  Remove a directory from the remembered list (leaves data alone).
+
+Examples:
+  es-pos config show
+  es-pos config list-data-dirs
+  es-pos config use-data-dir 2
+  es-pos config set-data-dir /mnt/gnss/positions
+  es-pos config move-data-dir /Volumes/BigDisk/positions
+""",
+    )
+    config_sub = config_p.add_subparsers(dest="config_cmd", metavar="SUBCOMMAND")
+    config_sub.add_parser(
+        "show",
+        help="Print the resolved data directory and which layer set it.",
+    )
+    config_sub.add_parser(
+        "list-data-dirs",
+        help="List remembered data directories, marking the active one.",
+        description=(
+            "List every data directory this install has used, in the order they "
+            "were first seen, with the active one marked.  The numbers are stable "
+            "and are what 'use-data-dir' and 'forget-data-dir' accept."
+        ),
+    )
+    cfg_use_p = config_sub.add_parser(
+        "use-data-dir",
+        help="Switch the active data directory (by number or path).",
+        description=(
+            "Make a remembered directory active.  TARGET is either a number from "
+            "'es-pos config list-data-dirs' or a path.  A path that has not been "
+            "seen before is remembered too.  No data is moved."
+        ),
+    )
+    cfg_use_p.add_argument(
+        "target", metavar="TARGET",
+        help="Number from 'list-data-dirs', or a directory path.",
+    )
+    cfg_forget_p = config_sub.add_parser(
+        "forget-data-dir",
+        help="Remove a directory from the remembered list (leaves data alone).",
+        description=(
+            "Drop a directory from the remembered list.  The directory and its "
+            "contents are untouched -- this only stops it being offered.  The "
+            "active directory cannot be forgotten; switch away from it first."
+        ),
+    )
+    cfg_forget_p.add_argument(
+        "target", metavar="TARGET",
+        help="Number from 'list-data-dirs', or a directory path.",
+    )
+    cfg_set_p = config_sub.add_parser(
+        "set-data-dir",
+        help="Record a data directory in the config file (does not move data).",
+        description=(
+            "Record PATH as the data directory.  This only changes where "
+            "earthscope-positions looks; it does not move any existing data.  "
+            "Use 'es-pos config move-data-dir' for that."
+        ),
+    )
+    cfg_set_p.add_argument("path", metavar="PATH", help="Directory to record.")
+    cfg_set_p.add_argument(
+        "--no-create", action="store_true",
+        help="Do not create the directory if it does not exist.",
+    )
+    cfg_move_p = config_sub.add_parser(
+        "move-data-dir",
+        help="Move the existing data tree to PATH, then record it.",
+        description=(
+            "Move the current data directory to PATH and record the new location.  "
+            "PATH must not already exist, or must be empty.  Refuses to move a "
+            "directory into itself.  The move is a real relocation, so it can take "
+            "a while for a large tree."
+        ),
+    )
+    cfg_move_p.add_argument("path", metavar="PATH", help="New location for the data directory.")
+    cfg_move_p.add_argument(
+        "--yes", "-y", action="store_true",
+        help="Skip the confirmation prompt.",
+    )
 
     # ── test ─────────────────────────────────────────────────────────────────
     test_p = sub.add_parser(
@@ -391,7 +489,6 @@ Examples:
         "--all", action="store_true",
         help="Process all stations found in the data directory.  Mutually exclusive with -i.",
     )
-    _add_data_dir_args(gj_p)
     gj_p.add_argument(
         "--start-time", metavar="YYYY-MM-DD",
         help="Start date, inclusive.",
@@ -481,7 +578,6 @@ Examples:
         "--all", action="store_true",
         help="Process all stations found in the data directory.  Mutually exclusive with -i.",
     )
-    _add_data_dir_args(ms_p)
     ms_p.add_argument(
         "--start-time", metavar="YYYY-MM-DD",
         help="Start date, inclusive.",
@@ -569,7 +665,6 @@ Examples:
         "--all", action="store_true",
         help="Process all .arrow files under DATA_DIR (default: ./data/arrow).",
     )
-    _add_data_dir_args(ppsd_p)
     ppsd_p.add_argument(
         "--start", metavar="YYYY-MM-DD",
         help="Only include files on or after this date.",
@@ -640,7 +735,6 @@ Examples:
         "--all", action="store_true",
         help="Replay all stations in the data directory.  Mutually exclusive with -i.",
     )
-    _add_data_dir_args(replay_p)
     replay_p.add_argument(
         "--start-time", metavar="YYYY-MM-DD",
         help="Start date, inclusive.",
@@ -695,7 +789,7 @@ Examples:
         help="Suppress progress output.",
     )
 
-    return ap, process_p, web_p, test_p, export_p, replay_p
+    return ap, process_p, web_p, test_p, export_p, replay_p, config_p
 
 
 # ---------------------------------------------------------------------------
@@ -1025,6 +1119,220 @@ def _cmd_export_miniseed(args: argparse.Namespace) -> None:
           file=sys.stderr)
 
 
+def _dir_size(path: pathlib.Path) -> tuple[int, int]:
+    """(total bytes, file count) under *path*; missing dirs count as empty."""
+    total = count = 0
+    for f in path.rglob("*"):
+        try:
+            if f.is_file() and not f.is_symlink():
+                total += f.stat().st_size
+                count += 1
+        except OSError:
+            continue
+    return total, count
+
+
+def _fmt_size(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+_SOURCE_LABELS = {
+    "env":     f"{paths.ENV_VAR} environment variable",
+    "config":  "config file",
+    "prompt":  "answered at the first-run prompt (saved to the config file)",
+    "default": "built-in default (nothing configured)",
+}
+
+
+def _cmd_config_show(args: argparse.Namespace) -> None:
+    resolved = paths.base_dir()
+    source = paths.base_dir_source()
+    cfg_path = paths.config_path()
+    configured = paths.configured_data_dir()
+
+    print(f"Data directory:  {resolved}")
+    print(f"  set by:        {_SOURCE_LABELS.get(source, source)}")
+    print(f"  exists:        {'yes' if resolved.exists() else 'no (created on first write)'}")
+    if resolved.exists():
+        size, count = _dir_size(resolved)
+        print(f"  contents:      {_fmt_size(size)} in {count:,} file(s)")
+    print()
+    print(f"Config file:     {cfg_path}")
+    print(f"  exists:        {'yes' if cfg_path.exists() else 'no'}")
+    print(f"  data_directory:{' ' + str(configured) if configured else ' (not set)'}")
+
+    known = paths.known_data_dirs()
+    if len(known) > 1:
+        print(f"\nRemembered directories ({len(known)}) — switch with "
+              f"'es-pos config use-data-dir N':")
+        _print_known(known, resolved)
+
+    env = os.environ.get(paths.ENV_VAR)
+    if env:
+        print(f"\n{paths.ENV_VAR}={env}")
+    if configured is not None and configured != resolved:
+        print(
+            f"\nNote: the active directory differs from the configured one.\n"
+            f"  To make the config match what is in use:  es-pos config set-data-dir {resolved}\n"
+            f"  To use the configured location instead:   unset the override above."
+        )
+
+
+def _print_known(known: list[pathlib.Path], active: pathlib.Path) -> None:
+    """Numbered listing of remembered directories.
+
+    Numbers come from the config file's stored order, which is stable, so a
+    number a user reads here is still valid after switching.
+    """
+    for i, path in enumerate(known, 1):
+        mark = "*" if path == active else " "
+        if not path.exists():
+            state = "  (missing)"
+        else:
+            size, count = _dir_size(path)
+            state = f"  ({_fmt_size(size)}, {count:,} file(s))"
+        print(f"  {mark} {i}. {path}{state}")
+
+
+def _resolve_known_target(target: str) -> pathlib.Path:
+    """Turn a listing number or a path into a directory.
+
+    Numbers are resolved against the remembered list; anything else is treated
+    as a path, so a directory that has never been used still works.
+    """
+    known = paths.known_data_dirs()
+    if target.isdigit():
+        index = int(target)
+        if not 1 <= index <= len(known):
+            sys.exit(
+                f"No remembered data directory numbered {index}.  "
+                f"There {'is' if len(known) == 1 else 'are'} {len(known)}.  "
+                f"Run 'es-pos config list-data-dirs' to see them."
+            )
+        return known[index - 1]
+    return pathlib.Path(target).expanduser()
+
+
+def _cmd_config_list_data_dirs(args: argparse.Namespace) -> None:
+    known = paths.known_data_dirs()
+    if not known:
+        print("No data directories remembered yet.")
+        print("Set one with: es-pos config set-data-dir PATH")
+        return
+    active = paths.base_dir()
+    print(f"Remembered data directories ({len(known)}), '*' = active:")
+    _print_known(known, active)
+    if paths.base_dir_source() == "env":
+        print(f"\n[note] {paths.ENV_VAR} is overriding the active entry "
+              f"for this run ({active}).")
+
+
+def _cmd_config_use_data_dir(args: argparse.Namespace) -> None:
+    target = _resolve_known_target(args.target)
+    saved = paths.set_configured_data_dir(target)
+    print(f"Active data directory is now {saved}")
+    print(f"  recorded in {paths.config_path()}")
+    if not saved.exists():
+        print("  (directory does not exist yet — it is created on first write)")
+    env = os.environ.get(paths.ENV_VAR)
+    if env and pathlib.Path(env).expanduser() != saved:
+        print(
+            f"\n[note] {paths.ENV_VAR} is set to {env} and takes precedence over\n"
+            f"       the config file.  Unset it for this switch to take effect."
+        )
+
+
+def _cmd_config_forget_data_dir(args: argparse.Namespace) -> None:
+    target = _resolve_known_target(args.target)
+    try:
+        removed = paths.forget_data_dir(target)
+    except ValueError as exc:
+        sys.exit(str(exc))
+    if not removed:
+        sys.exit(f"{target} is not in the remembered list.")
+    print(f"Forgot {target}")
+    print("  the directory and its contents were not touched.")
+
+
+def _cmd_config_set_data_dir(args: argparse.Namespace) -> None:
+    target = pathlib.Path(args.path).expanduser()
+    if not args.no_create:
+        target.mkdir(parents=True, exist_ok=True)
+    saved = paths.set_configured_data_dir(target)
+    print(f"Data directory set to {saved}")
+    print(f"  recorded in {paths.config_path()}")
+    if not saved.exists():
+        print("  (directory does not exist yet — it is created on first write)")
+    # An override still in effect would quietly win over what we just saved.
+    env = os.environ.get(paths.ENV_VAR)
+    if env and pathlib.Path(env).expanduser() != saved:
+        print(
+            f"\n[note] {paths.ENV_VAR} is set to {env} and takes precedence over the\n"
+            f"       config file.  Unset it for this setting to take effect."
+        )
+
+
+def _cmd_config_move_data_dir(args: argparse.Namespace) -> None:
+    import shutil
+
+    src = paths.base_dir().resolve()
+    dst = pathlib.Path(args.path).expanduser().resolve()
+
+    if not src.exists():
+        sys.exit(f"Current data directory does not exist: {src}\n"
+                 f"Nothing to move — use 'es-pos config set-data-dir' instead.")
+    if dst == src:
+        sys.exit(f"Source and destination are the same directory: {src}")
+    if src in dst.parents:
+        sys.exit(f"Cannot move {src} into its own subdirectory ({dst}).")
+    if dst.exists():
+        if not dst.is_dir():
+            sys.exit(f"Destination exists and is not a directory: {dst}")
+        if any(dst.iterdir()):
+            sys.exit(f"Destination already exists and is not empty: {dst}")
+
+    size, count = _dir_size(src)
+    print(f"Move data directory")
+    print(f"  from: {src}")
+    print(f"  to:   {dst}")
+    print(f"  size: {_fmt_size(size)} in {count:,} file(s)")
+
+    if not args.yes and sys.stdin.isatty():
+        try:
+            reply = input("Proceed? [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            reply = ""
+        if reply not in ("y", "yes"):
+            sys.exit("Aborted.")
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        # Empty (checked above); shutil.move would otherwise nest src inside it.
+        dst.rmdir()
+    try:
+        shutil.move(str(src), str(dst))
+    except OSError as exc:
+        sys.exit(f"Move failed: {exc}")
+
+    # `drop=src` keeps the vacated path out of the remembered list -- it no
+    # longer exists, so offering it for switching would only ever fail.
+    saved = paths.set_configured_data_dir(dst, drop=src)
+    print(f"\nMoved.  Data directory is now {saved}")
+    print(f"  recorded in {paths.config_path()}")
+
+    env = os.environ.get(paths.ENV_VAR)
+    if env and pathlib.Path(env).expanduser() == src:
+        print(
+            f"\n[note] {paths.ENV_VAR} still points at the old location.\n"
+            f"       Unset it, or update it to {saved}."
+        )
+
+
 def _cmd_webserver(args: argparse.Namespace) -> None:
     import uvicorn
     from earthscope_positions.webserver.webserver import (
@@ -1224,7 +1532,7 @@ def _cmd_replay(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    ap, process_p, web_p, test_p, export_p, replay_p = _build_top_parser()
+    ap, process_p, web_p, test_p, export_p, replay_p, config_p = _build_top_parser()
 
     if len(sys.argv) == 1:
         ap.print_help()
@@ -1234,21 +1542,69 @@ def main() -> None:
     # to the delegated module's parser, which gives correct per-command help.
     args, remaining = ap.parse_known_args()
 
-    # Apply --data-directory for groups handled in this module
-    # (process/export/replay/webserver).  The stations/fetch/test groups re-parse
-    # and apply the same flag in their own main().
-    _apply_data_dir_args(args)
-
     group = args.group
 
-    if group == "stations":
-        sys.argv = ["es-pos stations"] + remaining
+    # Allow the first-run data-directory prompt only for an interactive
+    # terminal, and never for `config` (which reports on the setting, so
+    # prompting first would be backwards) or `inspect` (explicit file paths,
+    # no data directory involved).
+    paths.set_interactive(
+        sys.stdin.isatty() and group not in ("config", "inspect")
+    )
+
+    # In a container, refuse to run against a data directory that is not on a
+    # mount -- everything written there dies with the container.  `config` and
+    # `inspect` are exempt: they are how you diagnose the problem, so they must
+    # keep working while it exists.
+    if group not in ("config", "inspect"):
+        problems = paths.container_data_dir_problems()
+        if problems:
+            sys.exit("\n".join(["Refusing to start:", ""] + problems))
+        for note in paths.container_data_dir_notes():
+            print(f"[note] {note}", file=sys.stderr)
+
+    if group == "lists":
+        sys.argv = ["es-pos lists"] + remaining
         from earthscope_positions.stations.station_list import main as _main
         _main()
+
+    elif group == "stations":
+        sys.exit(
+            "'es-pos stations' is now 'es-pos lists' — it manages station lists as\n"
+            "well as stream lists.  Command names changed too:\n"
+            "  es-pos stations get datasource   ->  es-pos lists get-streams\n"
+            "  es-pos stations get radial       ->  es-pos lists get-radial-streams\n"
+            "  es-pos stations filter           ->  es-pos lists filter-streams\n"
+            "New: get-stations, get-radial-stations, list, show-streams, show-stations.\n"
+            "Run 'es-pos lists --help' for the full set."
+        )
 
     elif group == "fetch":
         sys.argv = ["es-pos fetch"] + remaining
         from earthscope_positions.fetch.positions_fetch import main as _main
+        _main()
+
+    elif group == "config":
+        config_cmd = getattr(args, "config_cmd", None)
+        if config_cmd == "show":
+            _cmd_config_show(args)
+        elif config_cmd == "list-data-dirs":
+            _cmd_config_list_data_dirs(args)
+        elif config_cmd == "use-data-dir":
+            _cmd_config_use_data_dir(args)
+        elif config_cmd == "forget-data-dir":
+            _cmd_config_forget_data_dir(args)
+        elif config_cmd == "set-data-dir":
+            _cmd_config_set_data_dir(args)
+        elif config_cmd == "move-data-dir":
+            _cmd_config_move_data_dir(args)
+        else:
+            config_p.print_help()
+            sys.exit(0)
+
+    elif group == "inspect":
+        sys.argv = ["es-pos inspect"] + remaining
+        from earthscope_positions.arrow_inspect import main as _main
         _main()
 
     elif group == "webserver":

@@ -42,6 +42,17 @@ COPY . .
 RUN uv venv venv \
     && uv pip install --python venv/bin/python --no-cache "."
 
+# The data directory is baked into the image at a fixed path and bind-mounted
+# from the host at run time (es-pos-docker.sh resolves the host side from
+# ~/.earthscope-positions.json).  /data rather than /app/data so the data is not
+# tangled up with the code install, and so the container still has a valid,
+# writable path when run with no mount at all.
+#
+# Setting it as an ENV rather than on the server's command line also covers
+# `es-pos cli` shells inside the container.  There is no --data-directory flag.
+ENV ES_POS_DATA_DIRECTORY=/data
+RUN mkdir -p /data
+
 # Must match the ES_POS_PORT default in es-pos-docker.sh's `entrypoint` command.
 EXPOSE 8000
 

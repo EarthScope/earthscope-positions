@@ -493,10 +493,15 @@ async def _fetch_one_day(
 class _Progress:
     """Thread-safe in-place progress line printed to stderr."""
 
-    def __init__(self, total: int) -> None:
-        self.total = total
+    def __init__(self, total: int, precached: int = 0) -> None:
+        # *precached* is (stream, day) pairs a caller already determined were
+        # cached and therefore never handed to us -- the web UI filters those
+        # out before spawning this process.  Counting them here keeps the
+        # denominator the real total and stops a mostly-cached run from looking
+        # like a full re-download of a handful of streams.
+        self.total = total + precached
         self.ok = 0  # freshly downloaded
-        self.cached = 0  # skipped — arrow file already present
+        self.cached = precached  # skipped — arrow file already present
         self.no_data = 0  # API returned nothing (new or previously known)
         self.failed = 0  # HTTP / parse error (incl. rejected-NNN: a malformed request, not an absence of data)
         self._lock = threading.Lock()
@@ -788,15 +793,21 @@ def _cmd_get(args) -> None:
         for ds, de in day_segs
         for rec in stations_sorted
     ]
-    asyncio.run(_run_tasks(all_tasks, args.workers))
+    asyncio.run(_run_tasks(all_tasks, args.workers,
+                           getattr(args, "precached", 0) or 0))
 
 
-async def _run_tasks(all_tasks: list[tuple], workers: int) -> None:
+async def _run_tasks(all_tasks: list[tuple], workers: int, precached: int = 0) -> None:
     """Run *all_tasks* against one shared SDK client for this process's
     lifetime (one client per CLI invocation — this module is always run as
     either a direct CLI command or a fresh subprocess, never imported into a
-    long-lived process), reporting progress as it goes."""
-    progress = _Progress(len(all_tasks))
+    long-lived process), reporting progress as it goes.
+
+    *precached* is the number of (stream, day) pairs the caller already found
+    cached and excluded from *all_tasks*; they are folded into the tally so the
+    displayed totals describe the whole request, not just its remainder.
+    """
+    progress = _Progress(len(all_tasks), precached)
     async with _make_client() as client:
         await _run_parallel(all_tasks, workers, progress, client)
     progress.finish()
@@ -983,24 +994,6 @@ def _cmd_concat(args) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _add_data_dir_args(p: argparse.ArgumentParser) -> None:
-    """Add the standard --data-directory flag (Arrow root = <base>/arrow)."""
-    p.add_argument(
-        "--data-directory",
-        metavar="PATH",
-        default=None,
-        help=(
-            "Base data directory (default: $ES_POS_DATA_DIRECTORY or ./data).  "
-            "Arrow files live under <PATH>/arrow, stream lists under "
-            "<PATH>/stream-lists."
-        ),
-    )
-
-
-def _apply_data_dir_args(args: argparse.Namespace) -> None:
-    paths.set_base_dir(getattr(args, "data_directory", None))
-
-
 def _build_parser(prog=None) -> argparse.ArgumentParser:
     """One flat command — no subcommands.  Default mode downloads --list;
     --retry switches to retrying previously failed (error-NNN) requests.
@@ -1022,8 +1015,8 @@ Downloaded data is automatically visible in the Positions tab and
 Completeness & Latency tab of the web UI ('es-pos webserver').
 The web UI also supports on-demand fetching via its built-in Fetch button.
 
-Stream list files are built with 'es-pos stations get' or interactively
-via the Station Builder tab in the web UI.
+Stream list files are built with 'es-pos lists get-streams' or interactively
+via the Stream List Builder tab in the web UI.
 
 Examples:
   es-pos fetch --list ShakeAlert --start 2025-01-01 --end 2025-01-31
@@ -1086,6 +1079,18 @@ Examples:
         help=f"Number of parallel downloads (default: {_DEFAULT_WORKERS}).",
     )
     ap.add_argument(
+        "--precached",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Number of (stream, day) pairs the caller already determined were "
+            "cached and excluded from --list.  Folded into the progress totals so "
+            "they describe the whole request rather than only its remainder.  Set "
+            "by the web UI, which filters cache hits before invoking this."
+        ),
+    )
+    ap.add_argument(
         "--retry",
         action="store_true",
         help=(
@@ -1105,14 +1110,12 @@ Examples:
         action="store_true",
         help="(--retry only) Print matching entries without downloading.",
     )
-    _add_data_dir_args(ap)
     return ap
 
 
 def main() -> None:
     ap = _build_parser()
     args = ap.parse_args()
-    _apply_data_dir_args(args)
     if args.retry:
         _cmd_retry(args)
     elif args.list:

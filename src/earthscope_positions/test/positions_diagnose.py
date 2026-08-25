@@ -507,16 +507,6 @@ Examples:
         metavar="FILE",
         help="Output JSONL path (default: data/positions_diagnose/diagnose_TIMESTAMP.jsonl).",
     )
-    ap.add_argument(
-        "--data-directory",
-        metavar="PATH",
-        default=None,
-        help=(
-            "Base data directory (default: $ES_POS_DATA_DIRECTORY or ./data).  "
-            "Stream lists are read from <PATH>/stream-lists; output goes to "
-            "<PATH>/positions_diagnose."
-        ),
-    )
     return ap
 
 
@@ -590,7 +580,6 @@ def _dispatch(args: argparse.Namespace) -> None:
 def main() -> None:
     ap = _build_parser()
     args = ap.parse_args()
-    paths.set_base_dir(getattr(args, "data_directory", None))
     _dispatch(args)
 
 

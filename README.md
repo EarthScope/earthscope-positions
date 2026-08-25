@@ -19,33 +19,29 @@ Download, store, process, visualize, and export GNSS PPP position data from the 
 ## Quick start
 
 ```bash
-# 1. Authenticate with EarthScope
-es user login
-
-# 2. Build a station list (ShakeAlert network as example)
-es-pos stations get datasource --network-name SHAKE:ShakeAlert -o ShakeAlert
-
-# 3. Download data
-es-pos fetch get -i ShakeAlert --start 2026-01-01 --end 2026-01-08
-
-# 4. Pre-compute completeness summaries (speeds up the web UI)
-es-pos process completeness
-
-# 5. Launch the web UI
-es-pos webserver
-# → open http://localhost:8000
+es user login       # authenticate with EarthScope
+es-pos webserver    # → open http://localhost:8000
 ```
+
+That is the whole setup. On first run the server picks a
+[data directory](#where-your-data-lives), seeds the default stream and station lists, and
+everything else — building lists, downloading data, processing, plotting, exporting,
+replaying — is available from the tabs in the browser.
+
+The CLI does the same jobs if you would rather script them; see the
+[CLI reference](#cli-reference).
 
 ---
 
 ## Installation
 
-Requires **Python ≥ 3.13**.
+Requires **Python ≥ 3.11**. (3.11 is the floor because the export path-spec
+readers use the stdlib `tomllib`, which landed in 3.11.)
 
 ```bash
-python3.13 -m venv venv
+python3 -m venv venv
 source venv/bin/activate
-pip install -e .          # from project root (editable install)
+pip install .          # from project root
 ```
 
 When returning to the project later, re-activate the virtual environment:
@@ -54,35 +50,112 @@ When returning to the project later, re-activate the virtual environment:
 source venv/bin/activate
 ```
 
-The `es`, `es-pos`, and `inspect` CLIs are now available in your virtual environment.
+The `es` and `es-pos` CLIs are now available in your virtual environment.
 
 ### The SPA
 
 The SPA (Single Page Application) is pre-built in `spa/spaBuild/` and served by the web server. Only Earthscope developers should edit the SPA source in `spa/spaGenerator/`, which requires access to the private npm registry for the `@earthscope/spa-lib` package.
+
+---
+
+## Where your data lives
+
+Everything this tool writes — downloaded position data, your lists, exports, plots —
+goes under a single **data directory**.
+
+**The default is `~/earthscope-positions`.** On the first interactive run you are asked
+where you want it and the answer is saved; a non-interactive first run takes the default
+and prints where it went. Nothing is written next to the repository, and nothing depends
+on which directory you happen to be standing in.
+
+The choice is remembered in **`~/.earthscope-positions.json`**:
+
+```json
+{
+  "data_directory": "/Volumes/BigDisk/positions",
+  "known_data_directories": [
+    "/Users/you/earthscope-positions",
+    "/Volumes/BigDisk/positions"
+  ]
+}
+```
+
+That file is created at runtime in your home directory — **not** inside the installed
+package — so it survives `pip install --upgrade`, reinstalls, and uninstalls. You should
+never need to edit it by hand; `es-pos config` writes it.
+
+```bash
+es-pos config show                            # where is my data, and what set it?
+es-pos config list-data-dirs                  # every directory used before, numbered
+es-pos config use-data-dir 2                  # switch by number (no data is moved)
+es-pos config set-data-dir /mnt/gnss          # record a new location
+es-pos config move-data-dir /Volumes/BigDisk  # move the tree there, then record it
+```
+
+The Overview tab of the web UI shows the same information read-only. Switching is a
+command-line operation: the server resolves its data directory once at startup, so change
+it with `es-pos config` and restart `es-pos webserver`.
+
+Inside the base directory:
+
+```
+<data-dir>/arrow/                 # downloaded position Arrow files
+<data-dir>/stream-lists/          # stream-list JSONL files
+<data-dir>/station-lists/         # station-list JSONL files
+<data-dir>/plots/                 # generated plot images
+<data-dir>/miniseed/              # `es-pos export miniseed` output (per the path spec)
+<data-dir>/geojson/               # `es-pos export geojson` output (per the path spec)
+<data-dir>/resources/             # editable coordinates.csv + export path-spec TOMLs
+<data-dir>/positions_errors.jsonl # fetch API error log
+```
+
+For CI, cron, and Docker, `ES_POS_DATA_DIRECTORY` overrides the configured location for a
+single invocation. Full precedence rules are under [Data directory](#data-directory).
+
 ---
 
 ## Data flow
 
+Two kinds of list feed everything else. **Station lists** are just station codes and are
+used to scope *which stations you are looking at*; **stream lists** name the individual
+streams and are what actually gets fetched.
+
 ```
-es-pos stations get  ──►  data/stream-lists/<name>.json
-                              │
-                              ▼
-es-pos fetch get     ──►  data/arrow/<GEOSNCL>/YYYYMM/<GEOSNCL>_<start>_<end>.arrow
-                              │
-                    ┌─────────┴────────────────────────┐
-                    ▼                                  ▼
-es-pos process      ──►  data/arrow/<GEOSNCL>/...     es-pos webserver
-completeness              .completeness.arrow          http://localhost:8000
-                              │
-                    ┌─────────┴──────────────────────────────┐
-                    ▼                        ▼               ▼
-es-pos export    ──►  data/miniseed/…   data/geojson/…   data/plots/ppsd/…
-miniseed/geojson/ppsd                                     (visible in File Plots tab)
-                              │
-                              ▼
-es-pos replay    ──►  Kafka topic (compact GeoJSON NDJSON, keyed by GEOSNCL)
-                       (also controllable via web UI Replay tab)
+es-pos lists get-stations        ──►  <data-dir>/station-lists/<name>.jsonl
+es-pos lists get-radial-stations        {"station": "P143"}
+        (Station Builder tab)                    │
+                                                 │  used as include/exclude sets
+                                                 ▼
+es-pos lists get-streams         ──►  <data-dir>/stream-lists/<name>.jsonl
+es-pos lists get-radial-streams         {"geosncl": "P143.PB.LY_.10", "edid": …}
+es-pos lists filter-streams                      │
+        (Stream List Builder tab)                │
+                                                 ▼
+es-pos fetch --list <name>       ──►  <data-dir>/arrow/<GEOSNCL>/YYYYMM/
+        (Fetch Data tab)                           <GEOSNCL>_<start>_<end>.arrow
+                                                 │
+                          ┌──────────────────────┴──────────────────────┐
+                          ▼                                             ▼
+es-pos process completeness ──►  <data-dir>/arrow/<GEOSNCL>/       es-pos webserver
+        (Completeness tab)         ….completeness.arrow            http://localhost:8000
+                                                 │
+              ┌──────────────────────────────────┼──────────────────────────────────┐
+              ▼                                  ▼                                  ▼
+es-pos export miniseed          es-pos export geojson             es-pos export ppsd
+   <data-dir>/miniseed/…           <data-dir>/geojson/…              <data-dir>/plots/ppsd/…
+        (Export tab)                   (Export tab)                  (PPSD Generation tab)
+                                                 │
+                                                 ▼
+                                    browse any of it in the File Explorer tab
+                                                 │
+                                                 ▼
+es-pos replay -i <name>          ──►  Kafka topic
+        (Replay tab)                    compact GeoJSON NDJSON, keyed by GEOSNCL
 ```
+
+Only stream lists are fetchable — a station list has no stream identifiers in it. The
+usual path is to down-select stations on the map (saving a station list), then build a
+stream list from those stations filtered by processing center and solution type.
 
 ---
 
@@ -129,24 +202,101 @@ Sample rate is nominally 1 Hz (one row per second).
 
 ## CLI reference
 
-### `es-pos stations`
+### `es-pos lists`
 
-Discover and manage stream lists from the EarthScope API. Lists are written to `./data/stream-lists/<name>.json`.
+Build and inspect the two kinds of list everything else runs on. The command names mirror the
+two builder tabs in the web UI.
+
+| Kind | Contents | Location | Used by |
+| --- | --- | --- | --- |
+| **stream list** | full geosncl records | `<data-dir>/stream-lists/` | fetch, completeness, positions, ppsd, export, replay |
+| **station list** | station codes only | `<data-dir>/station-lists/` | include/exclude sets when building stream lists |
+
+`stream_type=gnss_ppp` is always applied; the radial commands also set `tier=stream`.
+
+**Inspecting what you have**
 
 ```bash
-# Discover all ShakeAlert streams
-es-pos stations get datasource --network-name SHAKE:ShakeAlert -o ShakeAlert
+es-pos lists list                       # every list of both kinds, with entry counts
+es-pos lists list --streams             # …only stream lists
+es-pos lists list --stations            # …only station lists
 
-# Discover stations within 100 km of a point
-es-pos stations get radial --latitude 37.5 --longitude -122.0 --distance 100 -o bay_area
-
-# Filter an existing list (e.g. keep only JPL-processed)
-es-pos stations filter -i ShakeAlert -o ShakeAlert.jpl --facility JPL
+es-pos lists show-streams ShakeAlert    # print a stream list
+es-pos lists show-stations ShakeAlert   # print a station list
 ```
 
-> **Tip:** Station lists can also be built interactively in the **Station Builder** tab of the web UI,
-> which displays all stations on an interactive map and lets you select by clicking, dragging
-> rectangles, or filtering by processing center and solution type.
+`list` gives the full path of every list and how many entries it holds:
+
+```
+Stream lists (4)
+  SCGN             431 entries  /Users/you/earthscope-positions/stream-lists/SCGN.jsonl
+  all-streams    7,107 entries  /Users/you/earthscope-positions/stream-lists/all-streams.jsonl
+  shake-alert    5,502 entries  /Users/you/earthscope-positions/stream-lists/shake-alert.jsonl
+  …
+
+Station lists (3)
+  SCGN              138 entries  /Users/you/earthscope-positions/station-lists/SCGN.jsonl
+  all-stations    1,665 entries  /Users/you/earthscope-positions/station-lists/all-stations.jsonl
+  …
+```
+
+**Editing a list by hand**
+
+`--edit` opens the list in `$VISUAL` / `$EDITOR` and reports the entry count when you come
+back, so a bad hand-edit shows up immediately:
+
+```bash
+es-pos lists show-streams ShakeAlert --edit
+es-pos lists show-stations bay-area --edit
+```
+
+```
+…/stream-lists/ShakeAlert.jsonl — 5,503 entries  (+1 from 5,502)
+```
+
+If the editor exits non-zero the list is reported as left alone. `$VISUAL` wins over
+`$EDITOR`, either may carry arguments (`EDITOR="code -w"`), and with neither set it falls
+back to `vi` (`notepad` on Windows) when that is actually installed — otherwise it tells you
+to set the variable rather than failing obscurely.
+
+`--path` prints the absolute path and nothing else, for composing with other tools:
+
+```bash
+es-pos lists show-streams ShakeAlert --path
+wc -l "$(es-pos lists show-streams ShakeAlert --path)"
+```
+
+**Building lists from the API**
+
+```bash
+# All ShakeAlert streams → stream list
+es-pos lists get-streams --network-name SHAKE:ShakeAlert -o ShakeAlert
+
+# The same query, saved as a station list instead
+es-pos lists get-stations --network-name SHAKE:ShakeAlert -o ShakeAlert
+
+# Everything within 100 km of a point
+es-pos lists get-radial-streams  --latitude 37.5 --longitude -122.0 --distance 100 -o bay_area
+es-pos lists get-radial-stations --latitude 37.5 --longitude -122.0 --distance 100 -o bay_area
+
+# Filter an existing stream list (e.g. keep only JPL-processed)
+es-pos lists filter-streams -i ShakeAlert -o ShakeAlert.jpl --facility JPL
+```
+
+Omit `-o` on any `get-*` command to print to screen without saving.
+
+> **A 404 `{"detail":"No streams found"}` from the radial commands means nothing matched**, not
+> that something broke — check the centre point is on land and the radius actually reaches a
+> station. The `tier=stream` / `stream_type=gnss_ppp` filters are always applied, so a point over
+> land with no PPP streams in range returns 404 too.
+
+> **Renamed:** this group used to be `es-pos stations`, with `get datasource` / `get radial` /
+> `filter`. It managed only stream lists, with no way to produce a station list — which is what
+> the Station Builder tab writes. Running the old name prints the mapping to the new one.
+
+> **Tip:** Both kinds can also be built interactively in the web UI — the **Station Builder** tab
+> displays all stations on a map for click/drag selection, and the **Stream List Builder** tab
+> filters those stations' streams by processing center and solution type.
 
 ### `es-pos fetch`
 
@@ -185,7 +335,6 @@ but pre-computing them speeds up the **Completeness & Latency** tab significantl
 ```bash
 es-pos process completeness
 es-pos process completeness --overwrite                    # regenerate even if files exist
-es-pos process completeness --data-directory /archive      # custom base data directory
 ```
 
 Each Arrow file gets a sibling `.completeness.arrow` with 96 rows (one per 15-min bin):
@@ -208,7 +357,6 @@ Launch the web UI and data API.
 ```bash
 es-pos webserver                            # http://localhost:8000
 es-pos webserver --port 9000
-es-pos webserver --data-directory /archive  # serve data from a custom base directory
 
 # Run on a remote machine (bind all interfaces + advertise a public hostname
 # so the Replay curl callbacks point at the right host):
@@ -220,19 +368,18 @@ es-pos webserver --host 0.0.0.0 --hostname gnss.example.org --port 8000
 | `--host` | `127.0.0.1` | Bind address. Use `0.0.0.0` to accept remote connections. |
 | `--port` | `8000` | Bind port. |
 | `--hostname` | `localhost` | Externally-reachable hostname used for callback URLs shown in the UI (e.g. the Replay curl commands). Set to the server's public name/IP when running remotely. |
-| `--data-directory` | `./data` | Base data directory (see [Data directory](#data-directory)). |
 
 The SPA must be built first (`cd spa/spaGenerator && npm run build`).
 The web UI has these tabs:
 
 | Tab | Description |
 |-----|-------------|
-| **Station Builder** | Interactive map of all stations in `<data-directory>/resources/coordinates.csv` (see [Data directory](#data-directory)). Click or rectangle-drag to select stations; filter by processing center and solution type; **Prune** deselects stations with no matching stream; **All Streams → List** saves every `gnss_ppp` stream; **Load Network** loads all streams for a chosen `RTDB:*`/`SHAKE:*` network; save selections as station lists. |
+| **Station Builder** | Interactive map of all stations in `<data-directory>/resources/coordinates.csv` (see [Data directory](#data-directory)). Click or rectangle-drag to select stations; filter by processing center and solution type; **Prune** deselects stations with no matching stream; **All Streams → List** saves every `gnss_ppp` stream; **Add Network Stations** adds every station in a chosen `RTDB:*`/`SHAKE:*` network to the selection **and saves them as a station list named after the network** — if that list already exists it is loaded from disk rather than re-queried, so hand-edits survive (**Re-query network** refetches and overwrites); save selections as station lists. |
 | **Fetch Data** | Guided three-step walkthrough (choose lists → date range & filters → fetch) that downloads only the missing `(geosncl, day)` pairs with a live progress bar and log. Only one fetch runs at a time; the job keeps running when you switch tabs. |
 | **Completeness & Latency** | Heat-map of data completeness and ingest latency per station per day. Completeness is generated on-demand if not pre-computed. Includes a Fetch button that runs `es-pos fetch` for the selected list/range. |
 | **Positions** | Interactive ENU time-series plots with power spectra (linear-frequency axis, down to 5-minute noise). Select stations from a saved list, set a date range, overlay multiple stations. |
 | **Export** | Convert downloaded Arrow position data into MiniSEED or GeoJSON. Pick the format, the **MiniSEED version** (3 by default, or 2), stream list(s) and a date range. The path-spec TOML controlling output directory structure and filenames is editable in-page (**Save spec**, then **Convert** with overwrite to regenerate under the new layout). |
-| **File Plots** | File browser for `./data/plots/` — navigate directories and display PNG/JPEG plots generated by `es-pos export ppsd`. |
+| **File Explorer** | File browser rooted at the **data directory** — the Arrow tree, stream/station lists, exports and plots in one place. Selecting a file shows a type-aware summary: `.arrow` (rows, columns, time span, schema), MiniSEED (records, samples, channels, format, encoding), GeoJSON (features, stations, lat/lon bounds), `.jsonl` (stream vs station list, entry counts, first lines); images render inline. Text files can be edited in place (JSONL validated line-by-line), and any file renamed or deleted. |
 | **Replay** | Configure and run a Kafka replay from the browser. Shows preload summary, a live status log, and a **delivery check** (a consumer reads the topic back from the latest offset, reporting messages written vs. read, one-for-one matches, mean added round-trip latency, and a warning/error if echoes lag ≥ 2 s / 5 s). State persists server-side — closing and reopening the browser reconnects to the same replay. |
 
 ### `es-pos export miniseed`
@@ -348,7 +495,7 @@ Output: `data/plots/ppsd/<mode>/ppsd-<geosncl>/ppsd-<geosncl>_<start>_<end>.png`
 then by plot identity, so repeated runs for the same station/group accumulate
 side-by-side instead of scattering across per-run date folders.
 
-Plots are visible in the **File Plots** tab of the web UI immediately after generation.
+Plots are visible in the **File Explorer** tab of the web UI immediately after generation.
 
 ### `es-pos replay`
 
@@ -422,7 +569,6 @@ es-pos replay -i ShakeAlert --start-time 2026-01-01 --duration 1d \
 | `--filter-center CENTER` | all | Keep only streams from this processing center (repeatable). |
 | `--filter-solution DIGIT` | all | Keep only streams with this PPP solution digit 0–6 (repeatable). |
 | `--filter-type DIGIT` | all | Keep only streams with this solution-type digit 0–3 (repeatable). |
-| `--data-directory PATH` | `./data` | Base data directory (see [Data directory](#data-directory)). |
 
 #### Web UI Replay tab
 
@@ -461,12 +607,52 @@ es-pos test fetch -i ShakeAlert.clean --start 2026-01-01 --total-duration 25200
 es-pos test plot data/positions_diagnose/diagnose_20260701T000000Z.jsonl
 ```
 
-### `inspect`
+### `es-pos config`
 
-Standalone tool to inspect Arrow IPC files (print schema, sample rows, statistics).
+Show or change the persisted data-directory setting.
 
 ```bash
-inspect data/arrow/P143.CI.LY_.20/202601/P143.CI.LY_.20_20260101T000000Z_20260102T000000Z.arrow
+es-pos config show                                # where is my data, and what set it?
+es-pos config list-data-dirs                      # every directory used before, numbered
+es-pos config use-data-dir 2                      # switch active directory by number
+es-pos config use-data-dir /mnt/gnss/positions    # …or by path
+es-pos config set-data-dir /mnt/gnss/positions    # record a location (does not move data)
+es-pos config move-data-dir /Volumes/BigDisk/pos  # move the tree there, then record it
+es-pos config forget-data-dir 3                   # drop from the list; data untouched
+```
+
+`show` reports the resolved directory, **which layer decided it**, how much is in it, the
+config file path, the remembered list, and a note if `ES_POS_DATA_DIRECTORY` disagrees
+with the configured value.
+
+`list-data-dirs` numbers every directory this install has used, marks the active one with
+`*`, and shows each one's size (or `(missing)` if it has been deleted or moved outside the
+tool). The numbers come from the config file's stored order and do **not** shuffle when
+you switch, so a number you read stays valid.
+
+`use-data-dir` switches the active directory, taking either a number from the listing or a
+path. A path that has not been seen before is remembered too. No data is moved.
+
+`set-data-dir` records a location and creates the directory (pass `--no-create` to skip),
+but never moves existing data. Use `move-data-dir` for that — it relocates the tree and
+updates the config in one step, refusing to overwrite a non-empty destination or to move a
+directory into itself, and confirming first unless given `--yes`. The vacated path is
+dropped from the remembered list, since it no longer exists.
+
+`forget-data-dir` removes an entry from the list without touching the directory or its
+contents. The active directory cannot be forgotten — switch away from it first.
+
+### `es-pos inspect`
+
+Inspect Arrow IPC files (print schema, sample rows, statistics). Auto-detects IPC file
+format (`.arrow`), IPC stream format (`.arrows`), and JSON error payloads written by
+failed downloads.
+
+```bash
+es-pos inspect data/arrow/P143.CI.LY_.20/202601/P143.CI.LY_.20_20260101T000000Z_20260102T000000Z.arrow
+es-pos inspect data/arrow/P143.CI.LY_.20/202601/*.arrow --rows 5
+es-pos inspect /tmp/test.arrow --schema-only
+es-pos inspect /tmp/test.arrow --stats
 ```
 
 ---
@@ -501,24 +687,97 @@ The web server exposes a REST API at `/api/`:
 
 ---
 
-## Stream lists
+## Station lists
 
-Stream lists are JSON files in `./data/stream-lists/`:
+Station lists name **stations**, nothing more. They live in
+`<data-dir>/station-lists/` as JSONL — one JSON object per line, not a JSON array:
 
-```json
-[
-  {"geosncl": "P143.CI.LY_.20"},
-  {"geosncl": "DEEJ.PW.LY_.00"},
-  ...
-]
+```
+{"station": "P143"}
+{"station": "DEEJ"}
 ```
 
-Built three ways:
-1. **CLI** — `es-pos stations get datasource/radial` then optionally `es-pos stations filter`
-2. **Web UI Stream List Builder tab** — interactive map with click/drag selection and stream-type filters
-3. **Manually** — any JSON editor placed in `./data/stream-lists/`
+They are the down-selection step: which stations am I interested in? They are **not
+fetchable** on their own, because a station code says nothing about which of that
+station's streams to download. Their job is to act as the include/exclude sets the Stream
+List Builder works from.
 
-Used by `es-pos fetch --list <name>` and loaded in the web UI via the list selector.
+Built four ways:
+
+1. **CLI** — `es-pos lists get-stations` / `es-pos lists get-radial-stations`
+2. **Web UI Station Builder tab** — click or rectangle-drag on the map, radial search, or
+   **Add Network Stations** (which also saves a list named after the network)
+3. **Automatically** — loading a network saves one; `all-stations` and `shake-alert` are
+   created on first server start
+4. **By hand** — `es-pos lists show-stations <name> --edit`, or any editor
+
+```bash
+es-pos lists list --stations                    # what do I have, and how big?
+es-pos lists show-stations bay-area             # print one
+es-pos lists show-stations bay-area --edit      # open it in $EDITOR
+es-pos lists show-stations bay-area --path      # just the path, for scripting
+```
+
+---
+
+## Stream lists
+
+Stream lists name **streams** — a station plus a specific processing solution — and are
+what everything downstream actually consumes. They live in `<data-dir>/stream-lists/`,
+also as JSONL:
+
+```
+{"geosncl": "P143.PB.LY_.10", "edid": "01H46MV4YA5Z3MFKJZ0NW4T39W", "facility": "earthscope", "software": "pivot_rtx"}
+{"geosncl": "DEEJ.PW.LY_.00", "edid": "01H46MV4E16V5EKRJRKV4B9AT2", "facility": "cwu", "software": "fastlane"}
+```
+
+**All four fields are required.** `edid` is the datasource id the fetch API is actually
+queried with — a record without one 422s on every request and reads as "no data" rather
+than as an error — and `facility`/`software` are what the builders filter on. Every stream
+must also appear in `all-streams`, the generated superset that every other list is
+validated against.
+
+Those rules are enforced where lists are written: the web UI's editor rejects an
+incomplete line and names it, the Stream List Builder's Save writes complete records
+(reporting anything it had to skip), and loading a list reports how many entries were
+dropped as unusable.
+
+`all-streams` itself is **read-only** — it is the reference the others are checked
+against, so the UI offers no edit, rename, or delete for it. To rebuild it, delete the
+file and restart the server.
+
+To audit what you already have:
+
+```bash
+es-pos lists validate-streams            # check every list; exits non-zero on problems
+es-pos lists validate-streams SCGN       # check one
+es-pos lists validate-streams --fix      # repair from all-streams (keeps a .bak)
+```
+
+`--fix` repairs rather than discards: a record missing only `facility`/`software` is
+completed from `all-streams`, and only entries that cannot be resolved at all are dropped.
+Lists built before these rules existed — anything saved with just `geosncl`+`edid`, or a
+radial search from before the `GEOSNCL:` prefix fix — are repaired in place.
+
+One station typically has several streams (different processing centers and solution
+types), which is why a station list cannot stand in for a stream list.
+
+Built four ways:
+
+1. **CLI** — `es-pos lists get-streams` / `get-radial-streams`, then optionally
+   `es-pos lists filter-streams`
+2. **Web UI Stream List Builder tab** — pick include/exclude station lists, then filter
+   those stations' streams by processing center and solution type
+3. **Automatically** — `all-streams` and `shake-alert` are created on first server start
+4. **By hand** — `es-pos lists show-streams <name> --edit`, or any editor
+
+```bash
+es-pos lists list --streams                     # what do I have, and how big?
+es-pos lists show-streams ShakeAlert --edit     # open it in $EDITOR
+```
+
+Consumed by `es-pos fetch --list <name>`, `es-pos process`, `es-pos export`,
+`es-pos replay -i <name>`, and every list selector in the web UI.
 
 ---
 
@@ -555,11 +814,40 @@ print(c.latitude, c.longitude, c.height, c.source)
 
 ### Data directory
 
-All data lives under a single **base data directory**, resolved with this precedence:
+The default location and the config file are covered under
+[Where your data lives](#where-your-data-lives); this section is the precedence
+reference.
 
-1. the `--data-directory PATH` CLI flag (available on every data-touching command);
-2. the `ES_POS_DATA_DIRECTORY` environment variable;
-3. `./data` (the default).
+All data lives under a single **base data directory**, resolved with this precedence —
+the first that applies wins:
+
+1. the `ES_POS_DATA_DIRECTORY` environment variable;
+2. `data_directory` in the config file (`~/.earthscope-positions.json`);
+3. on a first run in a terminal, you are **asked**, and the answer is saved to (2);
+4. otherwise the default, `~/earthscope-positions`.
+
+Layer 1 is a per-invocation override for Docker, CI, and cron. Layer 2 is what makes a
+choice persist across shells, which the environment variable does not — see
+[`es-pos config`](#es-pos-config).
+
+> **There is no `--data-directory` flag.** It was removed: a third way to say the same
+> thing, repeated on every data-touching subcommand, caused more confusion than it
+> resolved. `ES_POS_DATA_DIRECTORY` covers the same ground for automated callers, and the
+> webserver propagates its resolved directory to child processes through the environment.
+
+> **If layer 1 is in effect and disagrees with the configured value**, every command
+> prints a one-time note showing both paths and how to reconcile them. A stale
+> `ES_POS_DATA_DIRECTORY` in a shell profile otherwise wins silently, and you find out
+> only after a long fetch lands somewhere unexpected.
+
+Directories you have used before are remembered, so you can switch between them by
+number rather than retyping a path — see `es-pos config list-data-dirs` / `use-data-dir`.
+
+> **Changed:** earlier versions defaulted to `<nearest ancestor containing
+> pyproject.toml>/data`. That is gone. Run from inside an unrelated Python project, it
+> wrote a multi-GB tree into *that* project's directory. If you have an existing `./data`
+> tree from before, the tool notices it and tells you the one command that adopts it:
+> `es-pos config set-data-dir ./data`.
 
 The layout is derived from the base:
 
@@ -579,13 +867,37 @@ Examples:
 ```bash
 # Point the whole tree at a custom location
 es-pos --help                                   # (flag lives on each subcommand)
-es-pos fetch --list ShakeAlert --start 2026-01-01 --data-directory /mnt/es
+ES_POS_DATA_DIRECTORY=/mnt/es es-pos fetch --list ShakeAlert --start 2026-01-01
 ES_POS_DATA_DIRECTORY=/mnt/es es-pos webserver   # same, via environment
 ```
 
 The Arrow root is always `<data-directory>/arrow`; every sub-directory
 (`arrow/`, `stream-lists/`, `station-lists/`, `plots/`, `resources/`, …) derives from
-the single `--data-directory` base.
+the single resolved base.
+
+### Config file (`~/.earthscope-positions.json`)
+
+Holds settings that persist between runs — the active data directory and the ones used
+before it:
+
+```json
+{
+  "data_directory": "/Volumes/BigDisk/positions",
+  "known_data_directories": [
+    "/Users/you/earthscope-positions",
+    "/mnt/gnss/positions",
+    "/Volumes/BigDisk/positions"
+  ]
+}
+```
+
+`known_data_directories` keeps its first-seen order, so the numbers shown by
+`es-pos config list-data-dirs` stay valid after you switch.
+
+It is created at runtime in your home directory, **not** inside the installed package,
+so it survives `pip install --upgrade`, reinstalls, and uninstalls. You should not need
+to edit it by hand — `es-pos config` writes it — but it is plain JSON if you want to.
+Set `ES_POS_CONFIG_FILE` to put it somewhere else.
 
 ### MiniSEED path spec (`<data-directory>/resources/miniseed_path_spec.toml`)
 
@@ -611,10 +923,11 @@ Controls output naming for `es-pos export geojson` (separate sections for compac
 earthscope-positions/
 ├── src/earthscope_positions/
 │   ├── es_pos.py              # Unified CLI entry point (es-pos)
-│   ├── arrow_inspect.py       # inspect CLI tool
+│   ├── arrow_inspect.py       # es-pos inspect subcommand
+│   ├── paths.py               # Data-directory resolution + config file
 │   ├── coordinates.py         # Station coordinate lookup class
 │   ├── stations/
-│   │   └── station_list.py    # es-pos stations subcommands
+│   │   └── station_list.py    # es-pos lists subcommands
 │   ├── fetch/
 │   │   └── positions_fetch.py # es-pos fetch subcommands
 │   ├── process/
@@ -662,7 +975,7 @@ earthscope-positions/
 
 ## Requirements
 
-- Python ≥ 3.13
+- Python ≥ 3.11
 - EarthScope SDK + CLI (`earthscope-sdk`, `earthscope-cli`)
 - PyArrow ≥ 12
 - FastAPI + uvicorn (web server)
@@ -699,10 +1012,26 @@ all live in that one file):
 ./es-pos-docker.sh run                # run it (foreground, --rm -it)
 ```
 
-`run` mounts a **data directory** at `/app/data` and your **`~/.earthscope`**
+`run` mounts a **data directory** at `/data` and your **`~/.earthscope`**
 credentials at `/root/.earthscope`, so downloaded data and your EarthScope
 login both persist on the host across container runs — log in with
 `es user login` on the host first; the container never needs its own login.
+
+**The container path is fixed at `/data`; only the host side varies.** With no
+`--data-dir`, the script resolves the host directory the same way the CLI does —
+`$ES_POS_DATA_DIRECTORY`, else `data_directory` from `~/.earthscope-positions.json`,
+else `~/earthscope-positions` — so a container run lands on the same tree as
+`es-pos` on the host without being told twice. The banner names which one it used:
+
+```
+Starting earthscope-positions:latest  ->  http://localhost:8000
+  data:        /Users/you/earthscope-positions  ->  /data   (from /Users/you/.earthscope-positions.json)
+  credentials: /Users/you/.earthscope  ->  /root/.earthscope
+```
+
+Point it somewhere else with `--data-dir /Volumes/BigDisk/positions`. `run` also sets
+`ES_POS_HOST_DATA_DIRECTORY` inside the container — used only so the Overview tab can
+show both ends of the mount, since `/data` on its own means nothing on the host.
 Binds to `0.0.0.0` inside the container; on a Mac, Docker Desktop maps
 `localhost:PORT` on the host straight through, so `http://localhost:8000`
 (the default) just works.
@@ -736,7 +1065,7 @@ profile's tokens instead of `"default"`.
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--data-dir PATH` | `./data` | Host directory mounted at `/app/data` |
+| `--data-dir PATH` | *(resolved — env var, then `~/.earthscope-positions.json`, then `~/earthscope-positions`)* | Host directory mounted at `/data` |
 | `--earthscope-dir PATH` | `~/.earthscope` | Host directory mounted at `/root/.earthscope` |
 | `--profile NAME` | `default` | Named profile to read credentials from (must match what `login` used) |
 | `--port N` | `8000` | Port published on the host and inside the container |
@@ -747,7 +1076,7 @@ profile's tokens instead of `"default"`.
 
 ### CLI access
 
-For one-off commands (`es-pos fetch`, `es-pos stations`, `es-pos export`, …)
+For one-off commands (`es-pos fetch`, `es-pos lists`, `es-pos export`, …)
 instead of the web server, use `cli`:
 
 ```bash

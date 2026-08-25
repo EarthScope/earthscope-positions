@@ -34,6 +34,10 @@ const enabledStreams = ref(new Set<string>());
 
 // Stream-list management.
 const streamListOptions = ref<string[]>([]);
+// all-streams is generated and is the membership reference every other list is
+// validated against, so the UI must not offer to change it.
+const protectedLists = ref<string[]>([]);
+function isProtected(name: string) { return protectedLists.value.includes(name); }
 const listName = ref('');
 
 const activeStation = ref<StationData | null>(null);
@@ -172,23 +176,51 @@ const matchingStreams = computed(() => visibleStreamList.value.filter((gs) => {
 
 // Replace the working set outright -- unlike add/remove, the result does not
 // depend on what was already selected.
-function setMatchingStreams() {
-  enabledStreams.value = new Set(matchingStreams.value);
-  updateAllMarkers();
-}
-function addMatchingStreams() {
-  if (!matchingStreams.value.length) return;
-  const s = new Set(enabledStreams.value);
-  for (const gs of matchingStreams.value) s.add(gs);
+type MatchMode = 'only' | 'add' | 'remove';
+
+/** Apply a batch of streams to the working set. Shared by the chip filter and
+ *  the regex filter so both behave identically. */
+function applyStreams(batch: string[], mode: MatchMode) {
+  if (mode !== 'only' && !batch.length) return;
+  let s: Set<string>;
+  if (mode === 'only') {
+    s = new Set(batch);
+  } else {
+    s = new Set(enabledStreams.value);
+    for (const gs of batch) (mode === 'add' ? s.add(gs) : s.delete(gs));
+  }
   enabledStreams.value = s;
   updateAllMarkers();
 }
-function removeMatchingStreams() {
-  if (!matchingStreams.value.length) return;
-  const s = new Set(enabledStreams.value);
-  for (const gs of matchingStreams.value) s.delete(gs);
-  enabledStreams.value = s;
-  updateAllMarkers();
+
+function setMatchingStreams()    { applyStreams(matchingStreams.value, 'only'); }
+function addMatchingStreams()    { applyStreams(matchingStreams.value, 'add'); }
+function removeMatchingStreams() { applyStreams(matchingStreams.value, 'remove'); }
+
+// ── Regex filter ─────────────────────────────────────────────────────────────
+// Matches against the full geosncl (STATION.NETWORK.CHAN.LOC) of every stream
+// on a visible station, so it composes with the include/exclude station lists
+// exactly as the chip filter does.
+const regexPattern = ref('');
+const regexError   = ref('');
+
+const regexMatches = computed<string[]>(() => {
+  const pattern = regexPattern.value.trim();
+  if (!pattern) { regexError.value = ''; return []; }
+  let re: RegExp;
+  try {
+    re = new RegExp(pattern, 'i');
+    regexError.value = '';
+  } catch (e: unknown) {
+    regexError.value = (e as Error).message;
+    return [];
+  }
+  return visibleStreamList.value.filter(gs => re.test(gs));
+});
+
+function applyRegex(mode: MatchMode) {
+  if (regexError.value || !regexPattern.value.trim()) return;
+  applyStreams(regexMatches.value, mode);
 }
 
 // ── Include / exclude station lists (auto-apply) ──────────────────────────────
@@ -223,6 +255,8 @@ async function loadStationListOptions() {
 async function loadStreamListOptions() {
   try { streamListOptions.value = (await axios.get(STREAM_API)).data.lists ?? []; }
   catch { streamListOptions.value = []; }
+  try { protectedLists.value = (await axios.get(`${STREAM_API}/protected`)).data.protected ?? []; }
+  catch { protectedLists.value = []; }
 }
 
 // ── Save / manage stream lists ────────────────────────────────────────────────
@@ -230,8 +264,22 @@ async function persistStreamList(name: string, geosncls: string[]): Promise<bool
   try {
     // Posting geosncls (rather than raw JSONL) keeps the server-side edid
     // enrichment, without which `es-pos fetch --list` 422s on every request.
-    await axios.post(`${STREAM_API}/${encodeURIComponent(name)}`, { geosncls });
-    $q.notify({ type: 'positive', message: `Saved stream list "${name}" (${geosncls.length} streams)` });
+    const r = await axios.post(`${STREAM_API}/${encodeURIComponent(name)}`, { geosncls });
+    const saved: number = r.data.count ?? geosncls.length;
+    const skipped: number = r.data.skipped ?? 0;
+    if (skipped > 0) {
+      // Streams with no complete record in all-streams are dropped rather than
+      // written as partial records that cannot be fetched.
+      const sample: string[] = r.data.skipped_geosncls ?? [];
+      $q.notify({
+        type: 'warning', multiLine: true, timeout: 12000,
+        message: `Saved stream list "${name}" with ${saved} of ${geosncls.length} stream(s).`
+               + ` ${skipped} skipped — no complete record in all-streams.`
+               + (sample.length ? `\n${sample.slice(0, 5).join(', ')}` : ''),
+      });
+    } else {
+      $q.notify({ type: 'positive', message: `Saved stream list "${name}" (${saved} streams)` });
+    }
     listName.value = '';
     await loadStreamListOptions();
     return true;
@@ -284,7 +332,20 @@ async function loadStreamListIntoSelection(name: string) {
     const r = await axios.get(`${STREAM_API}/${encodeURIComponent(name)}`);
     enabledStreams.value = new Set((r.data.geosncls ?? []) as string[]);
     updateAllMarkers();
-    $q.notify({ type: 'positive', message: `Loaded ${enabledStreams.value.size} stream(s) from "${name}".` });
+    const filtered: number = r.data.filtered ?? 0;
+    if (filtered > 0) {
+      // Incomplete records cannot be fetched, so they are dropped on read.
+      // Say so rather than silently loading a shorter list than the file.
+      const reasons: string[] = r.data.filtered_reasons ?? [];
+      $q.notify({
+        type: 'warning', multiLine: true, timeout: 12000,
+        message: `Loaded ${enabledStreams.value.size} of ${r.data.total} stream(s) from "${name}".`
+               + ` ${filtered} skipped — incomplete records (missing edid/facility/software).`
+               + (reasons.length ? `\n${reasons.slice(0, 5).join('\n')}` : ''),
+      });
+    } else {
+      $q.notify({ type: 'positive', message: `Loaded ${enabledStreams.value.size} stream(s) from "${name}".` });
+    }
   } catch { $q.notify({ type: 'negative', message: 'Load failed' }); }
 }
 
@@ -321,7 +382,7 @@ async function doSaveEdit(target: string) {
   } finally { editSaving.value = false; }
 }
 
-// ── Update XX-Active lists (NCEDC) ────────────────────────────────────────────
+// ── Update ShakeAlert partner streams (NCEDC) ─────────────────────────────────
 const saRunning = ref(false);
 const saLog = ref<{ text: string; isError?: boolean; isDone?: boolean }[]>([]);
 function updateActiveFromNcedc() {
@@ -413,7 +474,7 @@ onUnmounted(() => {
           <q-separator class="q-my-sm" />
 
           <!-- Filter by processing center / stream type -->
-          <div class="text-overline text-grey-7 q-mb-xs">Filter Streams</div>
+          <div class="text-overline text-grey-7 q-mb-xs">Select Streams</div>
           <div class="text-caption text-grey-6 q-mb-xs">Processing centers</div>
           <div class="row q-gutter-xs">
             <q-chip
@@ -454,6 +515,53 @@ onUnmounted(() => {
 
           <q-separator class="q-my-sm" />
 
+          <!-- Regex filter -->
+          <div class="text-overline text-grey-7 q-mb-xs">Select by Regex</div>
+          <q-input
+            v-model="regexPattern"
+            label="Regular expression"
+            placeholder="e.g.  ^P1[0-9]{2}\.  or  \.(PB|PW)\."
+            dense outlined clearable
+            :error="!!regexError"
+            :error-message="regexError"
+          >
+            <template #append>
+              <q-icon name="help_outline" size="18px" class="cursor-pointer">
+                <q-tooltip max-width="300px">
+                  Case-insensitive, matched anywhere in the full geosncl
+                  (STATION.NETWORK.CHAN.LOC). Only streams on currently visible
+                  stations are considered, same as the chip filter above.
+                  <br /><br />
+                  <code>^P1</code> — stations starting P1<br />
+                  <code>\.PB\.</code> — the PB network<br />
+                  <code>\.(10|60)$</code> — location 10 or 60
+                </q-tooltip>
+              </q-icon>
+            </template>
+          </q-input>
+          <div class="text-caption text-grey-7 q-mt-xs">
+            {{ regexPattern.trim() && !regexError ? regexMatches.length : 0 }} stream(s) match
+          </div>
+          <div class="row items-center q-gutter-xs q-mt-xs">
+            <q-btn flat dense size="sm" label="Only matching" color="primary"
+                   :disable="!regexPattern.trim() || !!regexError || !regexMatches.length"
+                   @click="applyRegex('only')">
+              <q-tooltip>Replace the selection with exactly the regex matches</q-tooltip>
+            </q-btn>
+            <q-btn flat dense size="sm" label="Add matching" color="positive"
+                   :disable="!regexPattern.trim() || !!regexError || !regexMatches.length"
+                   @click="applyRegex('add')">
+              <q-tooltip>Add the regex matches to the current selection</q-tooltip>
+            </q-btn>
+            <q-btn flat dense size="sm" label="Remove matching" color="negative"
+                   :disable="!regexPattern.trim() || !!regexError || !regexMatches.length"
+                   @click="applyRegex('remove')">
+              <q-tooltip>Remove the regex matches from the current selection</q-tooltip>
+            </q-btn>
+          </div>
+
+          <q-separator class="q-my-sm" />
+
           <!-- Save stream list -->
           <div class="text-overline text-grey-7 q-mb-xs">Save Stream List</div>
           <q-input v-model="listName" label="List name" dense outlined class="q-mb-xs" clearable />
@@ -475,12 +583,23 @@ onUnmounted(() => {
                 <div class="row items-center no-wrap">
                   <q-btn flat dense round icon="download" size="sm" color="primary"
                          @click="loadStreamListIntoSelection(n)"><q-tooltip>Load into selection</q-tooltip></q-btn>
-                  <q-btn flat dense round icon="drive_file_rename_outline" size="sm" color="grey-8"
-                         @click="renameListAction(n)"><q-tooltip>Rename</q-tooltip></q-btn>
-                  <q-btn flat dense round icon="edit_note" size="sm" color="grey-8"
-                         @click="openEditList(n)"><q-tooltip>Edit</q-tooltip></q-btn>
-                  <q-btn flat dense round icon="delete" size="sm" color="negative"
-                         @click="deleteListAction(n)"><q-tooltip>Delete</q-tooltip></q-btn>
+                  <template v-if="isProtected(n)">
+                    <q-icon name="lock" size="16px" color="grey-6" class="q-mr-sm">
+                      <q-tooltip max-width="280px">
+                        Generated list — it is the reference every other stream list is
+                        validated against, so it cannot be edited, renamed, or deleted.
+                        Delete the file and restart the server to rebuild it.
+                      </q-tooltip>
+                    </q-icon>
+                  </template>
+                  <template v-else>
+                    <q-btn flat dense round icon="drive_file_rename_outline" size="sm" color="grey-8"
+                           @click="renameListAction(n)"><q-tooltip>Rename</q-tooltip></q-btn>
+                    <q-btn flat dense round icon="edit_note" size="sm" color="grey-8"
+                           @click="openEditList(n)"><q-tooltip>Edit</q-tooltip></q-btn>
+                    <q-btn flat dense round icon="delete" size="sm" color="negative"
+                           @click="deleteListAction(n)"><q-tooltip>Delete</q-tooltip></q-btn>
+                  </template>
                 </div>
               </q-item-section>
             </q-item>
@@ -488,9 +607,16 @@ onUnmounted(() => {
 
           <q-separator class="q-my-sm" />
 
-          <!-- XX-Active -->
+          <!-- ShakeAlert partner streams -->
           <q-btn class="full-width q-mb-xs" size="sm" color="deep-orange" unelevated
-                 icon="refresh" label="Update XX-Active Lists" :disable="saRunning" @click="updateActiveFromNcedc" />
+                 icon="refresh" label="Update ShakeAlert Partner Streams" :disable="saRunning"
+                 @click="updateActiveFromNcedc">
+            <q-tooltip max-width="300px">
+              Rebuild the per-partner stream lists (bk, ci, nc, pb, pw) from the
+              ShakeAlert metadata index published by NCEDC, and refresh station
+              coordinates from station_coords_extended.dat.
+            </q-tooltip>
+          </q-btn>
           <div v-if="saLog.length" class="sa-log q-mt-xs">
             <div v-for="(e, i) in saLog" :key="i"
                  :class="e.isError ? 'text-negative' : e.isDone ? 'text-positive text-weight-medium' : 'text-grey-8'">
@@ -589,7 +715,16 @@ onUnmounted(() => {
           <q-input v-model="editName" dense outlined dark label="List name" style="width:280px" :suffix="'.jsonl'" />
           <q-btn flat round dense icon="close" class="q-ml-sm" v-close-popup :disable="editSaving" />
         </q-card-section>
-        <q-banner v-if="editError" dense class="bg-red-1 text-negative">{{ editError }}</q-banner>
+        <q-banner v-if="editError" dense class="bg-red-1 text-negative">
+          <pre class="edit-errors">{{ editError }}</pre>
+        </q-banner>
+        <q-card-section class="q-py-xs text-caption text-grey-7">
+          One JSON object per line, all four fields required — a record without
+          <code>edid</code> cannot be fetched:
+          <code>{"geosncl": "HELP.BK.LY_.30", "edid": "01H46MV57FWRWQM3HQBQVTJ1RK",
+          "facility": "ucb", "software": "septentrio_onboard"}</code>.
+          Every stream must also appear in <code>all-streams</code>.
+        </q-card-section>
         <q-card-section class="col q-pa-none" style="min-height:0">
           <q-input v-model="editContent" type="textarea" outlined class="edit-jsonl fit"
                    input-class="edit-jsonl-input" :disable="editSaving" />
@@ -611,5 +746,6 @@ onUnmounted(() => {
 .edit-jsonl { height:100%; }
 .edit-jsonl :deep(.q-field__control), .edit-jsonl :deep(.q-field__control-container) { height:100%; }
 .edit-jsonl :deep(.edit-jsonl-input) { height:100% !important; font-family:monospace; font-size:12px; line-height:1.5; resize:none; }
+.edit-errors { margin:0; font-family:monospace; font-size:12px; white-space:pre-wrap; word-break:break-word; max-height:30vh; overflow-y:auto; }
 .sa-log { font-family:monospace; font-size:0.72rem; max-height:140px; overflow-y:auto; white-space:pre-wrap; word-break:break-all; }
 </style>
