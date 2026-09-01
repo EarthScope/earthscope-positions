@@ -28,9 +28,11 @@ cached in the index so subsequent requests return immediately.
 from __future__ import annotations
 
 import asyncio
+import bisect
 import datetime as dt
 import functools
 import io
+import itertools
 import json
 import logging
 import os
@@ -56,7 +58,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from earthscope_positions import paths
+from earthscope_positions import environment, paths
 
 _UTC = dt.timezone.utc
 
@@ -112,17 +114,23 @@ def run_startup_preflight() -> None:
     server.
     """
     # 1) JWT / login check — fatal if missing or unrefreshable.
+    env = environment.current()
+    print(
+        f"Pre-flight: environment {env.label} ({env.name}) — {env.api_url}, "
+        f"es profile '{environment.profile()}'",
+        file=sys.stderr,
+    )
     print("Pre-flight: checking EarthScope login …", file=sys.stderr)
+    from earthscope_positions.fetch.positions_fetch import _ensure_token, login_command
     try:
-        from earthscope_positions.fetch.positions_fetch import _ensure_token
         _ensure_token()   # raises SystemExit with a clear message if not logged in
         print("  auth     : OK", file=sys.stderr)
     except SystemExit:
         raise
     except Exception as exc:
         raise SystemExit(
-            f"Pre-flight auth check failed: {exc}\n"
-            "Log in with:  es user login   then restart the server."
+            f"Pre-flight auth check failed for {env.label}: {exc}\n"
+            f"Log in with:  {login_command()}   then restart the server."
         )
 
     # 2) Seed the editable resources — coordinates.csv and the export path-spec
@@ -185,7 +193,15 @@ def _child_env() -> dict[str, str]:
     the "already warned about a config mismatch" marker so children do not
     repeat that notice into the UI log on every run.
     """
-    return {**os.environ, paths.ENV_VAR: str(paths.base_dir())}
+    return {
+        **os.environ,
+        paths.ENV_VAR: str(paths.base_dir()),
+        # The environment (prod/stage) and its es profile go across too, so a
+        # child cannot re-resolve to a different deployment than the server it
+        # was spawned by -- which would fetch the wrong EDIDs into the tree the
+        # server is serving.
+        **environment.child_env(),
+    }
 
 
 def _spa_dir() -> pathlib.Path:
@@ -218,6 +234,11 @@ _last_scan_files: int = 0
 
 def _completeness_path_for(arrow_path: pathlib.Path) -> pathlib.Path:
     return arrow_path.parent / (arrow_path.stem + ".completeness.arrow")
+
+
+def _completeness_is_stale(comp_path: pathlib.Path) -> bool:
+    from earthscope_positions.process.completeness import is_stale
+    return is_stale(comp_path)
 
 
 def _scan_data_dir_sync(data_dir: pathlib.Path) -> dict[str, list[tuple[dt.date, _FileEntry]]]:
@@ -279,18 +300,44 @@ async def _background_scanner() -> None:
 # On-demand completeness generation
 # ---------------------------------------------------------------------------
 
+#: Completeness paths this process has confirmed carry the current columns.
+#: Checking staleness means opening the file, so the answer is remembered rather
+#: than re-derived on every request; a file only goes stale by being *older*
+#: than the code, which cannot happen again while the process runs.
+_completeness_checked: set[str] = set()
+
+#: Source files whose completeness could not be built, path -> error.  Real
+#: trees contain truncated Arrow files from interrupted downloads; before this
+#: existed, one of them made the gather() below raise and took the whole
+#: Completeness page down with a 500.  Remembered so a broken file is attempted
+#: once, not on every request.
+_completeness_failed: dict[str, str] = {}
+
+
 async def _ensure_completeness(entry: _FileEntry) -> pathlib.Path | None:
     """
-    If the completeness file for *entry* doesn't exist yet, generate it in a
-    thread-pool worker (one concurrent generation per unique path).  Updates
-    entry.completeness_path in place on success.
+    If the completeness file for *entry* is missing or predates gap tracking,
+    generate it in a thread-pool worker (one concurrent generation per unique
+    path).  Updates entry.completeness_path in place on success.
     """
     comp = _completeness_path_for(entry.arrow_path)
-    if comp.exists():
-        entry.completeness_path = comp
-        return comp
-
     key = str(comp)
+    if str(entry.arrow_path) in _completeness_failed:
+        return None
+    if comp.exists():
+        if key in _completeness_checked:
+            entry.completeness_path = comp
+            return comp
+        # A tree built before restarts existed has files without the
+        # restart_count column; served as-is the metric would read as a
+        # uniform zero, which is indistinguishable from "no outages".
+        loop = asyncio.get_event_loop()
+        stale = await loop.run_in_executor(_executor, _completeness_is_stale, comp)
+        _completeness_checked.add(key)
+        if not stale:
+            entry.completeness_path = comp
+            return comp
+
     async with _gen_locks_mu:  # type: ignore[union-attr]
         if key not in _gen_locks:
             _gen_locks[key] = asyncio.Lock()
@@ -298,16 +345,33 @@ async def _ensure_completeness(entry: _FileEntry) -> pathlib.Path | None:
 
     async with per_file_lock:
         # Double-check inside lock (another coroutine may have just generated it)
-        if comp.exists():
+        if comp.exists() and not _completeness_is_stale(comp):
             entry.completeness_path = comp
+            _completeness_checked.add(key)
             return comp
 
         def _generate() -> pathlib.Path | None:
             from earthscope_positions.process.completeness import generate_completeness_file
-            return generate_completeness_file(entry.arrow_path, overwrite=False, sampling_hz=1.0)
+            # overwrite=True: we only get here for a file that is missing or
+            # stale, and generate_completeness_file's own skip-if-present check
+            # would otherwise refuse to replace the stale one.
+            out = generate_completeness_file(
+                entry.arrow_path, overwrite=True, sampling_hz=1.0
+            )
+            _completeness_checked.add(key)
+            return out
 
         loop = asyncio.get_event_loop()
-        result: pathlib.Path | None = await loop.run_in_executor(_executor, _generate)
+        try:
+            result: pathlib.Path | None = await loop.run_in_executor(_executor, _generate)
+        except Exception as exc:                                  # noqa: BLE001
+            # A truncated or otherwise unreadable source file must not fail the
+            # request it happened to be part of; record it, report it in the
+            # response, and leave the rest of the page working.
+            _completeness_failed[str(entry.arrow_path)] = f"{type(exc).__name__}: {exc}"
+            print(f"[warn] completeness failed for {entry.arrow_path}: {exc}",
+                  file=sys.stderr)
+            return None
         if result is not None:
             entry.completeness_path = result
         return result
@@ -642,18 +706,36 @@ def _read_completeness(path: pathlib.Path) -> pa.Table | None:
 
 
 def _aggregate_bins(table: pa.Table, target_bin_ms: int) -> dict[int, dict]:
-    """Aggregate 15-min completeness rows into coarser bins (weighted-mean latency)."""
+    """Aggregate 15-min completeness rows into coarser bins (weighted-mean latency).
+
+    Restart counts simply add up: each gap is recorded once, in the bin holding
+    the sample that resumed the stream, so coarsening never double-counts one.
+
+    ``restart_count``/``max_gap_s`` are absent from files written before gap
+    tracking existed.  Those contribute ``restarts_known = False``, which the UI
+    renders as "not computed" rather than as zero outages — a distinction worth
+    keeping, since the two look identical otherwise.
+    """
     result: dict[int, dict] = defaultdict(lambda: {
         "row_count": 0, "expected_count": 0,
         "lat_num": 0.0, "lat_den": 0,
         "dly_num": 0.0, "dly_den": 0,
+        "restarts": 0, "restarts_known": False, "max_gap_s": None,
     })
-    for bs, rc, ec, il, pd_ in zip(
+    names = set(table.schema.names)
+    have_restarts = {"restart_count", "max_gap_s"}.issubset(names)
+    n = table.num_rows
+    restarts = table.column("restart_count").to_pylist() if have_restarts else [None] * n
+    max_gaps = table.column("max_gap_s").to_pylist() if have_restarts else [None] * n
+
+    for bs, rc, ec, il, pd_, rs, mg in zip(
         table.column("bucket_start_ms").to_pylist(),
         table.column("row_count").to_pylist(),
         table.column("expected_count").to_pylist(),
         table.column("mean_ingest_latency_s").to_pylist(),
         table.column("mean_processing_delay_s").to_pylist(),
+        restarts,
+        max_gaps,
     ):
         coarser = (bs // target_bin_ms) * target_bin_ms
         g = result[coarser]
@@ -665,6 +747,11 @@ def _aggregate_bins(table: pa.Table, target_bin_ms: int) -> dict[int, dict]:
         if pd_ is not None and rc > 0:
             g["dly_num"] += pd_ * rc
             g["dly_den"] += rc
+        if rs is not None:
+            g["restarts"] += rs
+            g["restarts_known"] = True
+        if mg is not None and (g["max_gap_s"] is None or mg > g["max_gap_s"]):
+            g["max_gap_s"] = mg
     return dict(result)
 
 
@@ -692,8 +779,15 @@ def _build_station_buckets(
     bin_ms: int,
     data_dir: pathlib.Path,
     no_data_records: dict[str, str],  # date_iso → result ("no-data" | "error-NNN")
-) -> list[dict]:
-    """Build heatmap bucket list from pre-fetched (and completeness-ensured) entries."""
+) -> tuple[list[dict], "float | None"]:
+    """Build heatmap buckets, plus the gap threshold the restart counts used.
+
+    The threshold comes back with the buckets rather than being assumed by the
+    caller because it is recorded per completeness file: a tree generated with
+    an explicit ``--gap-seconds`` keeps its own value, and the UI has to label
+    the plot with what actually produced the numbers.  ``None`` means no file
+    in range recorded one.
+    """
     # Dates for which we have an arrow file — tried regardless of completeness status
     tried_dates: set[str] = set()
     for e in entries:
@@ -704,16 +798,29 @@ def _build_station_buckets(
 
     # Load and aggregate completeness files
     agg: dict[int, dict] = {}
+    gap_seconds: float | None = None
     completeness_files = [e.completeness_path for e in entries if e.completeness_path]
     if completeness_files:
         tables = [t for cf in completeness_files if (t := _read_completeness(cf)) is not None]
         if tables:
-            agg = _aggregate_bins(pa.concat_tables(tables), bin_ms)
+            from earthscope_positions.process.completeness import read_gap_seconds
+            for t in tables:
+                gs = read_gap_seconds(t)
+                if gs is not None:
+                    gap_seconds = gs if gap_seconds is None else max(gap_seconds, gs)
+            # concat_tables needs identical schemas; the per-file metadata
+            # differs (each records its own threshold), and pre-gap-tracking
+            # files are missing columns entirely, so unify before concatenating.
+            agg = _aggregate_bins(
+                pa.concat_tables(tables, promote_options="permissive"), bin_ms
+            )
 
     buckets = []
     for bs in bucket_grid:
         date_str = dt.datetime.fromtimestamp(bs / 1000, tz=_UTC).strftime("%Y-%m-%d")
         g = agg.get(bs)
+        restarts: int | None = None
+        max_gap: float | None = None
         if g is not None:
             rc = g["row_count"]
             ec = g["expected_count"]
@@ -721,6 +828,10 @@ def _build_station_buckets(
             lat = g["lat_num"] / g["lat_den"] if g["lat_den"] > 0 else None
             dly = g["dly_num"] / g["dly_den"] if g["dly_den"] > 0 else None
             state = "has-data" if rc > 0 else "no-data"
+            # None, not 0, when the source files predate gap tracking: an
+            # unmeasured bin must not read as a bin with no outages.
+            restarts = g["restarts"] if g["restarts_known"] else None
+            max_gap = g["max_gap_s"]
         elif date_str in no_data_records:
             res = no_data_records[date_str]
             state = "error" if res.startswith("error-") else "no-data"
@@ -737,9 +848,11 @@ def _build_station_buckets(
             "completeness": comp,
             "meanIngestLatencyS": lat,
             "meanProcessingDelayS": dly,
+            "restartCount": restarts,
+            "maxGapS": max_gap,
             "state": state,
         })
-    return buckets
+    return buckets, gap_seconds
 
 
 # ---------------------------------------------------------------------------
@@ -828,10 +941,20 @@ async def _shutdown() -> None:
 async def api_config() -> dict:
     """Client-facing server config, incl. the externally-reachable base URL used
     for callback commands (e.g. Replay curl snippets)."""
+    env = environment.current()
     return {
         "base_url": _public_base_url(),
         "hostname": _public_hostname,
         "port": _public_port,
+        # The UI badges anything that is not production, so a tab pointed at
+        # stage can never be mistaken for one pointed at prod.  `badge` is the
+        # server's call rather than the client's, so the rule lives in one
+        # place if a third environment ever appears.
+        "environment": env.name,
+        "environment_label": env.label,
+        "environment_badge": env.badge,
+        "api_url": env.api_url,
+        "es_profile": environment.profile(),
     }
 
 
@@ -1584,26 +1707,41 @@ async def api_completeness(
     bin_ms = bin_minutes * 60 * 1000
     bucket_grid = _make_bucket_grid(start_dt, end_dt, bin_minutes)
 
-    # Ensure completeness files exist for all entries in this page (on-demand generation)
+    # Ensure completeness files exist AND are current for this page's entries.
+    # Every entry goes through _ensure_completeness, not just those with no file
+    # yet: one written before restart tracking existed is present but missing
+    # the restart columns, and skipping it would serve the whole plot as
+    # "not computed" forever.  The check is remembered per path, so this is a
+    # set lookup after the first visit.
     gen_tasks = []
     page_entries: dict[str, list[_FileEntry]] = {}
     for geosncl in page_geosncls:
         entries = _entries_in_range(geosncl, start_dt, end_dt)
         page_entries[geosncl] = entries
         for entry in entries:
-            if entry.completeness_path is None:
-                gen_tasks.append(_ensure_completeness(entry))
+            gen_tasks.append(_ensure_completeness(entry))
 
     if gen_tasks:
         await asyncio.gather(*gen_tasks)
 
     # Build heatmap buckets
+    damaged = [
+        {"name": pathlib.Path(src).name, "error": err}
+        for geosncl in page_geosncls
+        for entry in page_entries[geosncl]
+        if (src := str(entry.arrow_path)) in _completeness_failed
+        for err in (_completeness_failed[src],)
+    ]
+
     stations = []
+    gap_seconds: float | None = None
     for geosncl in page_geosncls:
         no_data = _load_no_data_records(geosncl, dd)
-        buckets = _build_station_buckets(
+        buckets, gs = _build_station_buckets(
             geosncl, page_entries[geosncl], bucket_grid, bin_ms, dd, no_data
         )
+        if gs is not None:
+            gap_seconds = gs if gap_seconds is None else max(gap_seconds, gs)
         stations.append({"geosncl": geosncl, "buckets": buckets})
 
     return {
@@ -1611,6 +1749,13 @@ async def api_completeness(
         "binMinutes": bin_minutes,
         "bucketStarts": bucket_grid,
         "stations": stations,
+        # Labels the Restarts plot with the threshold that actually produced the
+        # counts, rather than the UI assuming the current default.
+        "gapSeconds": gap_seconds,
+        # Source files on this page that could not be summarised at all --
+        # normally truncated downloads.  Surfaced rather than swallowed: their
+        # cells would otherwise read as a plain absence of data.
+        "damaged": {"count": len(damaged), "files": damaged[:20]},
         "total": total,
         "page": page,
         "pageSize": size,
@@ -2327,6 +2472,160 @@ async def api_fetch_missing(
     )
 
 
+# ── /api/completeness/precache ───────────────────────────────────────────────
+#
+# Completeness files are built on demand as pages are viewed, which is fine for
+# a handful of streams but makes browsing a large tree feel slow: each new page
+# or date range pays to build whatever it touches (~6 ms per file warm, but
+# several hundred ms cold), and a tree whose files predate gap tracking has to
+# rebuild every one of them.  This does the whole selection up front so the
+# plots are instant afterwards.
+
+
+class _PrecacheBody(BaseModel):
+    lists: list[str] = []
+    geosncls: list[str] = []
+    filter_centers: list[str] = []
+    filter_sol_types: list[str] = []
+    search: str = ""
+    start: str
+    end: str
+
+
+def _precache_targets(
+    geosncls: list[str], start_dt: dt.datetime, end_dt: dt.datetime
+) -> list[pathlib.Path]:
+    """Source .arrow files in range whose completeness file is missing or stale.
+
+    Uses the in-memory index rather than walking the tree, so the selection
+    matches exactly what the heatmap would ask for.
+    """
+    from earthscope_positions.process.completeness import is_stale
+
+    out: list[pathlib.Path] = []
+    for geosncl in geosncls:
+        for entry in _entries_in_range(geosncl, start_dt, end_dt):
+            comp = _completeness_path_for(entry.arrow_path)
+            if str(comp) in _completeness_checked and comp.exists():
+                continue
+            if not comp.exists() or is_stale(comp):
+                out.append(entry.arrow_path)
+    return out
+
+
+async def _precache_events(targets: list[pathlib.Path], workers: int):
+    """Generate completeness files for *targets*, streaming SSE progress."""
+    from earthscope_positions.process.completeness import generate_completeness_file
+
+    total = len(targets)
+    yield _sse({"type": "start", "total": total})
+    if not total:
+        # Same shape as the completion event below — the client reads `total`
+        # off it to finish the progress bar, and "nothing to do" is the most
+        # common outcome once a selection has been precached.
+        yield _sse({"type": "done", "code": 0,
+                    "generated": 0, "failed": 0, "total": 0})
+        return
+
+    loop = asyncio.get_event_loop()
+    sem = asyncio.Semaphore(max(1, workers))
+    done = 0
+    generated = 0
+    failed = 0
+    # Results are reported as each task finishes rather than in submission
+    # order, so a slow file cannot hold up the progress bar behind it.
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def run_one(src: pathlib.Path) -> None:
+        async with sem:
+            try:
+                out = await loop.run_in_executor(
+                    _executor, generate_completeness_file, src, False
+                )
+                await queue.put((src, out, None))
+            except Exception as exc:                      # noqa: BLE001
+                await queue.put((src, None, f"{type(exc).__name__}: {exc}"))
+
+    tasks = [asyncio.create_task(run_one(p)) for p in targets]
+    try:
+        for _ in range(total):
+            src, out, err = await queue.get()
+            done += 1
+            if err is not None:
+                failed += 1
+                yield _sse({"type": "error", "msg": f"{src.name}: {err}"})
+            else:
+                if out is not None:
+                    generated += 1
+                    _completeness_checked.add(str(out))
+                yield _sse({
+                    "type": "progress", "done": done, "total": total,
+                    "generated": generated, "name": src.name,
+                })
+    finally:
+        for t in tasks:
+            t.cancel()
+
+    yield _sse({
+        "type": "done", "code": 1 if failed else 0,
+        "generated": generated, "failed": failed, "total": total,
+    })
+
+
+@app.post("/api/completeness/precache")
+async def api_completeness_precache(body: _PrecacheBody) -> StreamingResponse:
+    """Build every completeness file the current selection needs, up front.
+
+    Same selection semantics as the heatmap itself (lists + filters + search +
+    date range) so "precache what I am looking at" means exactly that — but
+    across every page, not just the one on screen.
+    """
+    async def generate():
+        try:
+            start_dt = dt.datetime.fromisoformat(body.start).replace(tzinfo=_UTC)
+            end_dt = dt.datetime.fromisoformat(body.end).replace(tzinfo=_UTC)
+        except ValueError:
+            yield _sse({"type": "error", "msg": "Invalid date format. Use YYYY-MM-DD."})
+            yield _sse({"type": "done", "code": 1})
+            return
+        if end_dt <= start_dt:
+            yield _sse({"type": "error", "msg": "end must be after start"})
+            yield _sse({"type": "done", "code": 1})
+            return
+
+        geosncls = _precache_geosncls(body)
+        targets = await asyncio.get_event_loop().run_in_executor(
+            None, _precache_targets, geosncls, start_dt, end_dt
+        )
+        yield _sse({"type": "streams", "count": len(geosncls)})
+        async for chunk in _precache_events(targets, workers=4):
+            yield chunk
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+def _precache_geosncls(body: _PrecacheBody) -> list[str]:
+    """Resolve a precache request to the same stream set the heatmap shows."""
+    if body.geosncls:
+        geosncls = sorted({g for g in body.geosncls if g})
+    else:
+        collected: set[str] = set()
+        for name in body.lists or ["all"]:
+            collected.update(_geosncls_for_list(name))
+        geosncls = sorted(collected)
+    if body.filter_centers or body.filter_sol_types:
+        geosncls = _apply_stream_filters(
+            geosncls, body.filter_centers, body.filter_sol_types
+        )
+    if body.search:
+        geosncls = _filter_by_pattern(geosncls, body.search)
+    return geosncls
+
+
 class _FetchMissingBody(BaseModel):
     lists: list[str] = []
     geosncls: list[str] = []
@@ -2605,10 +2904,19 @@ async def api_config_data_directory() -> JSONResponse:
 
     known = []
     for entry in paths.known_data_dirs():
+        try:
+            entry_env = environment.environment_of(entry)
+            entry_env_name, entry_env_label = entry_env.name, entry_env.label
+        except ValueError:
+            # Marker written by a newer version: show it as unknown rather than
+            # as production, which it demonstrably is not.
+            entry_env_name, entry_env_label = "unknown", "Unknown"
         known.append({
             "path": str(entry),
             "active": entry == resolved,
             "exists": entry.exists(),
+            "environment": entry_env_name,
+            "environment_label": entry_env_label,
         })
 
     subdirs = []
@@ -2636,10 +2944,23 @@ async def api_config_data_directory() -> JSONResponse:
     in_docker = paths.in_container() or bool(host_data_dir)
     persistent = paths.data_dir_is_persistent(resolved) if in_docker else None
 
+    env = environment.current()
     return JSONResponse({
         "data_directory": str(resolved),
         "exists": resolved.exists(),
         "source": source,
+        "environment": env.name,
+        "environment_label": env.label,
+        "environment_badge": env.badge,
+        "environment_source": environment.current_source(),
+        "environment_source_label": {
+            "env": f"{environment.ENV_VAR} environment variable",
+            "data-dir": "the data directory's .config/environment.json",
+            "default": "built-in default (directory not marked)",
+        }.get(environment.current_source(), environment.current_source()),
+        "environment_marker_file": str(environment.marker_path(resolved)),
+        "api_url": env.api_url,
+        "es_profile": environment.profile(),
         "in_docker": in_docker,
         "host_data_directory": host_data_dir,
         "data_persistent": persistent,
@@ -2730,27 +3051,113 @@ async def api_files_list(path: str = "") -> JSONResponse:
     root = _files_root().resolve()
     entries = []
     for child in sorted(target.iterdir(), key=lambda p: (p.is_file(), p.name.lower())):
+        # .config holds the environment marker, not data.  Hidden here on
+        # purpose: hand-editing it would route around the guard in
+        # `es-pos config use-data-dir --stage`, which is the one thing keeping
+        # prod and stage EDIDs out of the same tree.
+        if child.name == environment.CONFIG_DIR_NAME and child.parent.resolve() == root:
+            continue
         try:
             stat = child.stat()
         except OSError:
             continue
         is_file = child.is_file()
+        kind = _file_kind(child) if is_file else "dir"
         entries.append({
             "name": child.name,
             "type": "file" if is_file else "dir",
             "path": str(child.resolve().relative_to(root)),
-            "kind": _file_kind(child) if is_file else "dir",
+            "kind": kind,
+            # Three unrelated shapes share the .arrow extension; the UI needs to
+            # tell them apart (only PPSD files can be viewed several at once),
+            # and the naming rule lives here rather than being re-implemented in
+            # the client where it would drift.
+            "arrowKind": _arrow_plot_kind(child) if kind == "arrow" else None,
             "size": stat.st_size if is_file else None,
             "mtime": stat.st_mtime,
         })
     return JSONResponse({"path": path, "root": str(root), "entries": entries})
 
 
+#: Cap on how many continuous blocks are listed individually.  A badly broken
+#: station-day can have hundreds; the count and the summary rows above the table
+#: still describe all of them, and shipping every row to the browser for a
+#: preview pane is not worth it.
+_MAX_LISTED_BLOCKS = 200
+
+
+def _arrow_gap_seconds(target: pathlib.Path) -> float:
+    """Gap threshold to summarise *target* with.
+
+    Taken from the sibling completeness file when it recorded one, so the File
+    Explorer and the Completeness heatmap always count the same thing — a tree
+    generated with an explicit ``--gap-seconds`` would otherwise show one
+    threshold in the plot and the default in the per-file summary.
+    """
+    from earthscope_positions.process.completeness import (
+        _GAP_SECONDS, completeness_path, read_gap_seconds,
+    )
+    comp = completeness_path(target)
+    if comp.exists():
+        table = _read_completeness(comp)
+        if table is not None:
+            recorded = read_gap_seconds(table)
+            if recorded is not None:
+                return recorded
+    return _GAP_SECONDS
+
+
+def _summarize_completeness(table: pa.Table) -> list[tuple[str, str]]:
+    """Extra rows for a .completeness.arrow file.
+
+    A completeness file has no per-sample times, so it gets none of the block
+    listing a source file does — but it already carries the restart totals, and
+    reading them straight out of the file is the whole point of storing them.
+    """
+    rows: list[tuple[str, str]] = []
+    names = set(table.schema.names)
+
+    if "completeness" in names and table.num_rows:
+        vals = [v for v in table.column("completeness").to_pylist() if v is not None]
+        if vals:
+            rows.append(("Mean completeness", f"{100 * sum(vals) / len(vals):.1f} %"))
+            rows.append(("Empty buckets", f"{sum(1 for v in vals if v == 0):,} of {len(vals):,}"))
+
+    if not {"restart_count", "max_gap_s"}.issubset(names):
+        rows.append((
+            "Restarts",
+            "not recorded — rebuild with 'es-pos process completeness'",
+        ))
+        return rows
+
+    from earthscope_positions.process.completeness import read_gap_seconds
+
+    counts = [c for c in table.column("restart_count").to_pylist() if c is not None]
+    gaps = [g for g in table.column("max_gap_s").to_pylist() if g is not None]
+    threshold = read_gap_seconds(table)
+    label = "Restarts" + (f" (gap > {threshold:g} s)" if threshold is not None else "")
+    rows.append((label, f"{sum(counts):,}"))
+    rows.append(("Buckets with a restart", f"{sum(1 for c in counts if c):,}"))
+    if gaps:
+        rows.append(("Longest gap", _fmt_duration(max(gaps))))
+    return rows
+
+
 def _summarize_arrow(target: pathlib.Path) -> dict:
+    from earthscope_positions.process.completeness import (
+        continuous_blocks, find_gaps, window_start_ms,
+    )
+
+    gap_seconds = _arrow_gap_seconds(target)
+
     rows: list[tuple[str, str]] = []
     table = ipc.open_stream(target).read_all()
     rows.append(("Rows", f"{table.num_rows:,}"))
     rows.append(("Columns", str(table.num_columns)))
+    if "bucket_start_ms" in table.column_names:
+        rows.extend(_summarize_completeness(table))
+    blocks_out: list[dict] = []
+    blocks_total = 0
     if "time" in table.column_names and table.num_rows:
         times = table.column("time")
         t0 = pc.min(times).as_py()
@@ -2763,10 +3170,43 @@ def _summarize_arrow(target: pathlib.Path) -> dict:
             if table.num_rows > 1:
                 rows.append(("Nominal rate", f"{(table.num_rows - 1) / span:.3f} Hz"
                              if span > 0 else "—"))
+
+        # Continuity: how many uninterrupted runs the series breaks into, and
+        # how many times it came back after stopping.  Same threshold and same
+        # helpers the Completeness heatmap uses, so the two never disagree.
+        times_ms = times.to_pylist()
+        blocks = continuous_blocks(times_ms, gap_seconds)
+        # The leading gap (window start → first sample) is counted the same way
+        # the Completeness plot counts it, so a file that starts late shows the
+        # restart here too — but it does not split the samples present into an
+        # extra block, hence restarts and blocks-1 can differ by one.
+        gaps = find_gaps(times_ms, gap_seconds, window_start_ms=window_start_ms(target))
+        blocks_total = len(blocks)
+        rows.append(("Continuous blocks", f"{len(blocks):,}"))
+        rows.append((f"Restarts (gap > {gap_seconds:g} s)", f"{len(gaps):,}"))
+        if gaps:
+            longest = max(end - start for start, end in gaps)
+            total_gap = sum(end - start for start, end in gaps)
+            rows.append(("Longest gap", _fmt_duration(longest / 1000.0)))
+            rows.append(("Total time in gaps", _fmt_duration(total_gap / 1000.0)))
+        for start, end, count in blocks[:_MAX_LISTED_BLOCKS]:
+            blocks_out.append({
+                "start": _ms_to_iso(start),
+                "end": _ms_to_iso(end),
+                "duration": _fmt_duration((end - start) / 1000.0),
+                "samples": count,
+            })
+
     schema = [{"name": f.name, "type": str(f.type),
                "nulls": table.column(f.name).null_count}
               for f in table.schema]
-    return {"rows": rows, "schema": schema}
+    return {
+        "rows": rows,
+        "schema": schema,
+        "blocks": blocks_out,
+        # Total before the listing cap, so the UI can say how many it is not showing.
+        "blocks_total": blocks_total,
+    }
 
 
 def _summarize_miniseed(target: pathlib.Path) -> dict:
@@ -3244,11 +3684,28 @@ _ARROW_COLUMN_LABELS = {
     "expected_count": ("Expected in bucket", ""),
     "mean_ingest_latency_s": ("Mean ingest latency", "s"),
     "mean_processing_delay_s": ("Mean processing delay", "s"),
+    "restart_count": ("Restarts in bucket", ""),
+    "max_gap_s": ("Longest gap in bucket", "s"),
 }
 
 #: Columns whose natural range is 0..1 -- pinned so a healthy flat line at 1.0
 #: reads as "complete" instead of being autoscaled into a noisy hairline.
 _UNIT_RANGE_COLUMNS = {"completeness"}
+
+
+def _arrow_block_edges(target: pathlib.Path, times_ms: list[int]) -> list[float]:
+    """Epoch-ns start of each continuous block in a position file.
+
+    Returned so the renderer can colour each uninterrupted run differently: a
+    restart is the thing an operator is looking for in these plots, and a
+    single-colour line makes a gap almost invisible once the x-axis covers a
+    whole day.  Empty for a bucketed (completeness) file, which has no
+    per-sample times to break up.
+    """
+    from earthscope_positions.process.completeness import continuous_blocks
+
+    blocks = continuous_blocks(times_ms, _arrow_gap_seconds(target))
+    return [start * 1e6 for start, _end, _n in blocks]
 
 
 def _arrow_series(target: pathlib.Path) -> dict:
@@ -3262,6 +3719,10 @@ def _arrow_series(target: pathlib.Path) -> dict:
     if time_col is None or table.num_rows == 0:
         return {}
     times_ms = table.column(time_col).to_pylist()
+    block_edges = (
+        _arrow_block_edges(target, [t for t in times_ms if t is not None])
+        if time_col == "time" else []
+    )
     series: dict[str, dict] = {}
     for name in table.column_names:
         if name == time_col:
@@ -3280,7 +3741,7 @@ def _arrow_series(target: pathlib.Path) -> dict:
             # being closed over by the line.
             v_out.append(float("nan") if v is None else float(v))
         if t_out:
-            series[name] = {"t": t_out, "v": v_out}
+            series[name] = {"t": t_out, "v": v_out, "blocks": block_edges}
     return series
 
 
@@ -3422,6 +3883,35 @@ def _decimate_minmax(times: list, values: list, max_points: int):
     return out_t, out_v
 
 
+#: Cycled per continuous block so a restart shows as a colour change.  Chosen
+#: for contrast between *adjacent* entries rather than as a gradient — a
+#: sequential ramp would make consecutive blocks look nearly identical, which
+#: is the failure mode this is here to avoid.
+_BLOCK_COLORS = [
+    "#1565C0", "#EF6C00", "#2E7D32", "#6A1B9A",
+    "#00838F", "#C62828", "#4E342E", "#AD1457",
+]
+
+
+def _block_spans(times_ns: list[float], edges: list[float]) -> list[tuple[int, int]]:
+    """Index ranges of *times_ns* belonging to each block, given block starts.
+
+    Ranges overlap by one point on purpose: without it the line would show a
+    one-sample notch at every boundary where neither block draws the segment
+    between them.  The overlap is invisible (the two blocks share that point)
+    and keeps each block's line continuous up to the gap.
+    """
+    spans: list[tuple[int, int]] = []
+    start = 0
+    for edge in edges[1:]:
+        cut = bisect.bisect_left(times_ns, edge)
+        if cut > start:
+            spans.append((start, cut))
+            start = cut
+    spans.append((start, len(times_ns)))
+    return [(lo, min(len(times_ns), hi + 1)) for lo, hi in spans]
+
+
 def _plot_label(kind: str, key: str) -> tuple[str, str]:
     """(title, unit) for one panel."""
     if kind == "miniseed":
@@ -3445,7 +3935,7 @@ _PANEL_ORDER = [
     "East", "North", "Up",
     "East uncertainty", "North uncertainty", "Up uncertainty", "Quality",
     # completeness -- the ratio first, then its two inputs, then the timings
-    "completeness", "row_count", "expected_count",
+    "completeness", "restart_count", "max_gap_s", "row_count", "expected_count",
     "mean_ingest_latency_s", "mean_processing_delay_s",
 ]
 
@@ -3526,7 +4016,21 @@ async def api_files_plot(path: str, width: int = 1100, height: int = 200) -> Res
             stamps = [dt.datetime.fromtimestamp(t / 1e9, tz=dt.timezone.utc) for t in times]
             title, unit = _plot_label(kind, key)
 
-            ax.plot(stamps, values, linewidth=0.7, color="#1565C0")
+            edges = entry.get("blocks") or []
+            if len(edges) > 1:
+                for (lo, hi), color in zip(
+                    _block_spans(times, edges), itertools.cycle(_BLOCK_COLORS)
+                ):
+                    ax.plot(stamps[lo:hi], values[lo:hi], linewidth=0.7, color=color)
+                # A hairline at each restart, so a block boundary is visible even
+                # where two adjacent blocks happen to draw in similar colours.
+                for edge in edges[1:]:
+                    ax.axvline(
+                        dt.datetime.fromtimestamp(edge / 1e9, tz=dt.timezone.utc),
+                        color="#B71C1C", linewidth=0.5, alpha=0.55, zorder=0,
+                    )
+            else:
+                ax.plot(stamps, values, linewidth=0.7, color=_BLOCK_COLORS[0])
             if key in _UNIT_RANGE_COLUMNS:
                 ax.set_ylim(-0.02, 1.02)
             ax.set_title(title, fontsize=9, loc="left")
@@ -3538,6 +4042,8 @@ async def api_files_plot(path: str, width: int = 1100, height: int = 200) -> Res
             n_real = sum(1 for v in entry["v"] if v == v)
             n_gaps = sum(1 for v in entry["v"] if v != v)
             note = f"{n_real:,} samples"
+            if len(edges) > 1:
+                note += f" · {len(edges)} blocks / {len(edges) - 1} restarts"
             if len(entry["v"]) > _PLOT_MAX_POINTS:
                 note += " (min/max reduced)"
             if n_gaps:
@@ -3562,6 +4068,47 @@ async def api_files_plot(path: str, width: int = 1100, height: int = 200) -> Res
         return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=500)
     return Response(content=png, media_type="image/png",
                     headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/api/files/locate", response_model=None)
+async def api_files_locate(
+    geosncl: str,
+    start_ms: int,
+    end_ms: int = 0,
+) -> JSONResponse:
+    """Source .arrow file backing one heatmap cell, as a File Explorer path.
+
+    Deliberately resolved on click rather than shipped with every bucket: a
+    page of 50 streams x 72 bins would carry 3,600 long paths, nearly all of
+    which are never used.
+
+    Returns the *source* file, not the .completeness.arrow beside it — the
+    completeness file is a derived summary, and someone clicking a cell wants
+    the data that produced it.  A coarse bin can span several days; the first
+    file in the range wins, since that is where the bin's data starts.
+    """
+    start_dt = dt.datetime.fromtimestamp(start_ms / 1000, tz=_UTC)
+    end_dt = (dt.datetime.fromtimestamp(end_ms / 1000, tz=_UTC)
+              if end_ms else start_dt + dt.timedelta(days=1))
+    # _entries_in_range compares whole dates, so a bin shorter than a day (the
+    # 15-minute and 2-hour bins the heatmap uses most) would span [d, d) and
+    # match nothing.  Source files are per-day anyway, so widen to at least the
+    # day containing the bin.
+    end_dt = max(end_dt, start_dt + dt.timedelta(days=1))
+    entries = _entries_in_range(geosncl, start_dt, end_dt)
+    if not entries:
+        return JSONResponse(
+            {"error": "No downloaded file covers that time for this stream.",
+             "geosncl": geosncl},
+            status_code=404,
+        )
+    target = entries[0].arrow_path
+    try:
+        rel = str(target.resolve().relative_to(_files_root().resolve()))
+    except ValueError:
+        return JSONResponse({"error": "File is outside the data directory."},
+                            status_code=404)
+    return JSONResponse({"path": rel, "name": target.name})
 
 
 @app.get("/api/files/download", response_model=None)
@@ -4300,6 +4847,66 @@ async def api_ppsd_run(
 
 
 # ── SPA static file fallback ─────────────────────────────────────────────────
+
+#: The two catch-alls, which match any path and so must not count as evidence
+#: that a path is real.
+_CATCH_ALL_PATHS = ("/api/{rest:path}", "/{full_path:path}")
+
+
+def _methods_for_path(path: str) -> set[str]:
+    """Methods some *real* route serves at *path* (empty if none does)."""
+    methods: set[str] = set()
+    for route in app.routes:
+        regex = getattr(route, "path_regex", None)
+        if regex is None or getattr(route, "path", "") in _CATCH_ALL_PATHS:
+            continue
+        if regex.fullmatch(path):
+            methods |= (getattr(route, "methods", None) or set())
+    return methods
+
+
+# An /api request this build has no route for used to be answered by the SPA
+# fallback below, and both of its outcomes were actively misleading:
+#
+#   GET   → 200 with index.html, so a caller reading r.data.path silently got
+#           undefined and carried on with a broken value
+#   POST  → 405 "Method Not Allowed", because the path matched the GET-only
+#           fallback but the method did not
+#
+# Both come up the same way in practice — a server left running while the page
+# talking to it was rebuilt — so this answers them plainly instead.
+@app.api_route(
+    "/api/{rest:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+    response_model=None,
+    include_in_schema=False,
+)
+async def api_not_found(rest: str, request: Request) -> JSONResponse:
+    """404 for unknown /api routes, 405 for a real one called the wrong way.
+
+    Registered after every real API route, so it only sees what nothing else
+    claimed.  It has to tell the two cases apart itself: matching a path this
+    broadly means Starlette stops looking, so an endpoint that exists GET-only
+    would otherwise come back 404 instead of the correct 405.
+    """
+    path = f"/api/{rest}"
+    allowed = _methods_for_path(path)
+    if allowed:
+        return JSONResponse(
+            {"error": f"{request.method} not allowed on {path}",
+             "allowed": sorted(allowed)},
+            status_code=405,
+            headers={"Allow": ", ".join(sorted(allowed))},
+        )
+    return JSONResponse(
+        {
+            "error": f"No such API endpoint: {request.method} {path}",
+            "hint": "If this endpoint is new, the server is running older code — "
+                    "restart es-pos webserver.",
+        },
+        status_code=404,
+    )
+
 
 @app.get("/{full_path:path}", response_model=None)
 async def serve_spa(full_path: str) -> FileResponse | JSONResponse:

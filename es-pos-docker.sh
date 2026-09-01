@@ -15,7 +15,8 @@ es-pos-docker.sh — build and run the earthscope-positions Docker image.
 
 Usage:
   ./es-pos-docker.sh build [--tag IMAGE_TAG]
-  ./es-pos-docker.sh login [--earthscope-dir PATH] [--profile NAME] [--image TAG]
+  ./es-pos-docker.sh login [--earthscope-dir PATH] [--profile NAME | --stage]
+                           [--image TAG]
   ./es-pos-docker.sh run   [--data-dir PATH] [--earthscope-dir PATH] [--profile NAME]
                            [--port N] [--hostname NAME] [--image TAG] [--name NAME]
                            [--detach]
@@ -41,8 +42,11 @@ Commands:
                                     (default: ~/.earthscope — point this at an
                                     empty directory for a genuinely fresh login)
             --profile NAME         Named profile to log into (default: "default").
-                                    Passed to `run` too, so the web server reads
-                                    the same profile's tokens.
+            --stage                Shorthand for --profile stage — the profile a
+                                    stage data directory resolves to. Log in with
+                                    this once before running against a directory
+                                    marked with
+                                    `es-pos config use-data-dir --stage`.
             --image TAG            Image to run (default: earthscope-positions:latest)
 
   run     Run the web server in Docker. Mounts a data directory (so downloaded
@@ -57,9 +61,13 @@ Commands:
                                     The banner prints which of those it used.
             --earthscope-dir PATH  Host directory mounted at /root/.earthscope, holding
                                     EarthScope login credentials (default: ~/.earthscope)
-            --profile NAME         Named profile to read credentials from
-                                    (default: "default" — the profile `es user
-                                    login` uses when no --profile is given)
+            --profile NAME         Named profile to read credentials from. Omit it
+                                    (the default) and the profile follows the
+                                    mounted data directory's environment: a
+                                    production directory uses "default", one
+                                    marked with `es-pos config use-data-dir
+                                    --stage` uses "stage". Pass it only to
+                                    override that.
             --port N               Port to publish on the host and inside the container
                                     (default: 8000)
             --hostname NAME        Hostname used in UI callback URLs, e.g. the Replay
@@ -127,6 +135,11 @@ cmd_login() {
                 earthscope_dir="$2"; shift 2 ;;
             --profile)
                 profile="$2"; shift 2 ;;
+            --stage)
+                # Must match environment.STAGE.profile in the Python package —
+                # that is what a stage data directory resolves to, and logging
+                # into a differently-named profile leaves it unauthenticated.
+                profile="stage"; shift ;;
             --image)
                 image="$2"; shift 2 ;;
             -h|--help)
@@ -145,7 +158,10 @@ cmd_login() {
 
     # --profile is passed explicitly to `es user login` (confirmed as the
     # correct placement: `es user login --profile X`, NOT `es --profile X
-    # user login`) and also set as ES_PROFILE so it's consistent with `run`.
+    # user login`) and also set as ES_PROFILE.  Unlike `run`/`cli`, defaulting
+    # to "default" here is right: `login` has no mounted data directory to take
+    # an environment from, and no flag means the same profile plain
+    # `es user login` would use.  Use --stage (or --profile) for the other one.
     local -a login_args=(login)
     if [[ -n "$profile" ]]; then
         login_args+=(--profile "$profile")
@@ -213,10 +229,34 @@ except Exception:
     RESOLVED_DATA_ORIGIN="built-in default"
 }
 
+# Build the -e ES_PROFILE flags for `run`/`cli`.
+#
+# Deliberately EMPTY unless --profile was given.  The profile now follows the
+# mounted data directory: a directory marked for stage
+# (<data dir>/.config/environment.json) resolves to the "stage" es profile on
+# its own.  Passing -e ES_PROFILE=default unconditionally -- which this used to
+# do -- overrode that from outside and sent a stage container looking for
+# production tokens.  An explicit --profile still wins, which is the point of
+# passing it.
+#
+# Sets profile_env (array) and profile_label (for the banner), both declared
+# local by the caller.
+build_profile_env() {
+    if [[ -n "$profile" ]]; then
+        profile_env=(-e "ES_PROFILE=$profile")
+        profile_label="$profile  (--profile)"
+    else
+        profile_env=()
+        profile_label="from the data directory's environment"
+    fi
+}
+
 cmd_run() {
     local data_dir=""
     local earthscope_dir="$HOME/.earthscope"
     local profile=""
+    local -a profile_env=()
+    local profile_label=""
     local port=8000
     local hostname_arg=localhost
     local image="earthscope-positions:latest"
@@ -263,7 +303,8 @@ cmd_run() {
     echo "Starting $image  ->  http://${hostname_arg}:${port}"
     echo "  data:        $data_dir  ->  $CONTAINER_DATA_DIR   (from $data_dir_source)"
     echo "  credentials: $earthscope_dir  ->  /root/.earthscope"
-    echo "  profile:     ${profile:-default}"
+    build_profile_env
+    echo "  profile:     $profile_label"
 
     # --rm and --restart are mutually exclusive (a self-removing container
     # can't also be auto-restarted), so the two modes use disjoint flag sets.
@@ -280,7 +321,7 @@ cmd_run() {
         -p "${port}:${port}" \
         -e ES_POS_PORT="$port" \
         -e ES_POS_HOSTNAME="$hostname_arg" \
-        -e ES_PROFILE="${profile:-default}" \
+        ${profile_env[@]+"${profile_env[@]}"} \
         -e ES_POS_HOST_DATA_DIRECTORY="$data_dir" \
         -v "$data_dir:$CONTAINER_DATA_DIR" \
         -v "$earthscope_dir:/root/.earthscope" \
@@ -291,6 +332,8 @@ cmd_cli() {
     local data_dir=""
     local earthscope_dir="$HOME/.earthscope"
     local profile=""
+    local -a profile_env=()
+    local profile_label=""
     local image="earthscope-positions:latest"
     local container_name="earthscope-positions-cli"
 
@@ -328,13 +371,14 @@ cmd_cli() {
     echo "Starting interactive CLI shell in $image"
     echo "  data:        $data_dir  ->  $CONTAINER_DATA_DIR   (from $data_dir_source)"
     echo "  credentials: $earthscope_dir  ->  /root/.earthscope"
-    echo "  profile:     ${profile:-default}"
+    build_profile_env
+    echo "  profile:     $profile_label"
 
     # Always --rm -it: inherently interactive, and nothing useful to leave
     # running after you exit the shell.
     docker run --rm -it \
         --name "$container_name" \
-        -e ES_PROFILE="${profile:-default}" \
+        ${profile_env[@]+"${profile_env[@]}"} \
         -e ES_POS_HOST_DATA_DIRECTORY="$data_dir" \
         -v "$data_dir:$CONTAINER_DATA_DIR" \
         -v "$earthscope_dir:/root/.earthscope" \

@@ -139,7 +139,102 @@
         class="self-center"
         @click="openFetchDialog"
       />
+
+      <!-- Precompute: build the completeness files for the whole selection up
+           front, so paging through the plots afterwards is instant. -->
+      <q-btn
+        label="Precompute"
+        icon="bolt"
+        color="secondary"
+        dense
+        outline
+        no-caps
+        size="sm"
+        class="self-center"
+        :loading="precacheRunning"
+        @click="openPrecacheDialog"
+      >
+        <q-tooltip>
+          Build the completeness data for every stream in this list, filter and
+          date range — not just the page on screen. Paging through the heatmaps
+          afterwards needs no work at all.
+        </q-tooltip>
+      </q-btn>
     </div>
+
+    <!-- ── Precompute dialog ───────────────────────────────────────────────── -->
+    <q-dialog v-model="precacheOpen" persistent>
+      <q-card style="min-width: 520px; max-width: 640px">
+        <q-card-section class="row items-center q-pb-none">
+          <div class="text-h6">Precompute completeness</div>
+          <q-space />
+          <q-btn icon="close" flat round dense v-close-popup :disable="precacheRunning" />
+        </q-card-section>
+
+        <q-card-section class="text-body2">
+          <p class="q-mb-sm">
+            Builds the completeness and restart data for every stream matching the
+            current list, filters and date range — across all
+            {{ data?.totalPages ?? 1 }} page(s), not only the one shown.
+          </p>
+          <p class="text-caption text-grey-7 q-mb-none">
+            Without this, each page builds what it needs the first time you open
+            it, which is what makes moving around feel slow on a large tree.
+            Already-current files are skipped, so running it again is cheap.
+          </p>
+        </q-card-section>
+
+        <q-card-section v-if="precacheTotal !== null" class="q-pt-none">
+          <q-linear-progress
+            :value="precacheTotal ? precacheDone / precacheTotal : 0"
+            :indeterminate="precacheRunning && !precacheTotal"
+            size="18px"
+            color="secondary"
+            class="rounded-borders"
+          >
+            <div class="absolute-full flex flex-center">
+              <span class="text-caption text-white">
+                {{ precacheDone.toLocaleString() }} / {{ precacheTotal.toLocaleString() }}
+              </span>
+            </div>
+          </q-linear-progress>
+          <div class="text-caption text-grey-7 q-mt-xs">
+            <span v-if="precacheStreams != null">{{ precacheStreams.toLocaleString() }} stream(s) ·</span>
+            {{ precacheGenerated.toLocaleString() }} built
+            <span v-if="precacheErrors.length" class="text-negative">
+              · {{ precacheErrors.length }} could not be read
+            </span>
+          </div>
+        </q-card-section>
+
+        <q-card-section v-if="precacheErrors.length" class="q-pt-none">
+          <q-banner dense class="bg-orange-1 text-orange-9">
+            <div class="text-body2">
+              {{ precacheErrors.length }} file(s) could not be read — usually a
+              truncated download.
+            </div>
+            <div class="text-caption q-mt-xs">
+              Re-fetch them with
+              <code>es-pos fetch --list &lt;name&gt; --redownload</code>.
+            </div>
+            <pre class="precache-errors">{{ precacheErrors.slice(0, 12).join('\n') }}</pre>
+          </q-banner>
+        </q-card-section>
+
+        <q-card-actions align="right">
+          <q-btn v-if="precacheRunning" flat no-caps label="Cancel" @click="cancelPrecache" />
+          <q-btn v-else flat no-caps label="Close" v-close-popup />
+          <q-btn
+            v-if="!precacheRunning"
+            unelevated
+            no-caps
+            color="secondary"
+            :label="precacheDone ? 'Run again' : 'Precompute'"
+            @click="startPrecache"
+          />
+        </q-card-actions>
+      </q-card>
+    </q-dialog>
 
     <!-- ── Fetch Missing dialog ────────────────────────────────────────────── -->
     <q-dialog v-model="fetchOpen" persistent>
@@ -269,6 +364,26 @@
         </div>
       </div>
 
+      <!-- Files that could not be summarised at all. Their cells would
+           otherwise read as a plain absence of data. -->
+      <q-banner
+        v-if="data.damaged?.count"
+        dense
+        class="bg-orange-1 text-orange-9 q-mb-sm"
+      >
+        <template #avatar><q-icon name="report_problem" color="orange-9" /></template>
+        <div class="text-body2">
+          {{ data.damaged.count }} file(s) on this page could not be read — usually a
+          truncated download. Their cells show no completeness data.
+        </div>
+        <div class="text-caption q-mt-xs">
+          Re-fetch them with <code>es-pos fetch --list &lt;name&gt; --redownload</code>.
+          <span v-if="data.damaged.files.length">
+            First: {{ data.damaged.files.map(f => f.name).slice(0, 3).join(', ') }}
+          </span>
+        </div>
+      </q-banner>
+
       <!-- Completeness heatmap -->
       <div class="text-subtitle2 q-mb-xs q-mt-sm">Completeness</div>
       <HeatmapGrid
@@ -276,6 +391,7 @@
         :bucket-starts="data.bucketStarts"
         :color-fn="completenessColor"
         :tooltip-fn="completenessTooltip"
+        :cell-click="openInExplorer"
       />
       <div class="row items-center q-gutter-md q-mt-xs q-mb-sm">
         <div
@@ -298,6 +414,7 @@
         :bucket-starts="data.bucketStarts"
         :color-fn="latencyColor"
         :tooltip-fn="latencyTooltip"
+        :cell-click="openInExplorer"
       />
       <div class="row items-center q-gutter-md q-mt-xs">
         <div
@@ -312,6 +429,38 @@
           <span class="text-caption">{{ l.label }}</span>
         </div>
         <span class="text-caption text-grey-6">(linear: 0 – 1.5 – 5 s)</span>
+      </div>
+
+      <!-- Restarts heatmap -->
+      <div class="text-subtitle2 q-mb-xs q-mt-md">
+        Restarts
+        <span class="text-caption text-grey-6 text-weight-regular">
+          — times the stream resumed after a gap
+          <template v-if="data.gapSeconds != null">
+            longer than {{ data.gapSeconds }} s
+          </template>
+        </span>
+      </div>
+      <HeatmapGrid
+        :stations="data.stations"
+        :bucket-starts="data.bucketStarts"
+        :color-fn="restartColor"
+        :tooltip-fn="restartTooltip"
+        :cell-click="openInExplorer"
+      />
+      <div class="row items-center q-gutter-md q-mt-xs">
+        <div
+          v-for="l in RESTART_LEGEND"
+          :key="l.label"
+          class="row items-center q-gutter-xs"
+        >
+          <div
+            class="legend-swatch"
+            :style="{ background: l.color, borderColor: l.border ? '#bdbdbd' : undefined }"
+          />
+          <span class="text-caption">{{ l.label }}</span>
+        </div>
+        <span class="text-caption text-grey-6">(per {{ binLabel }} bin)</span>
       </div>
 
       <!-- Bottom pagination -->
@@ -339,8 +488,13 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, nextTick } from "vue";
+import { useRouter } from "vue-router";
+import { useQuasar } from "quasar";
 import HeatmapGrid from "../components/HeatmapGrid.vue";
-import { getStreamLists, getCompleteness, openFetchMissingStream } from "../api";
+import {
+  getStreamLists, getCompleteness, openFetchMissingStream,
+  openPrecacheStream, locateArrowFile,
+} from "../api";
 import type { CompletenessResponse, BucketData, FetchEvent } from "../types";
 import { useSharedControls } from "../composables/useSharedControls";
 import { useListDelete } from "../composables/useListDelete";
@@ -381,8 +535,23 @@ const LATENCY_LEGEND = [
   { label: "≥ 5 s",    color: "hsl(0,100%,50%)"   },
 ];
 
+// A restart is an outage, so 0 is the only "good" value and any count at all
+// has to be visible at a glance — hence a step scale that jumps straight to
+// amber at 1 rather than a smooth ramp on which 1 would still read as green.
+const RESTART_LEGEND = [
+  { label: "Not tried",     color: "#ffffff",           border: true },
+  { label: "No data",       color: "#616161" },
+  { label: "0",             color: "hsl(120,100%,30%)" },
+  { label: "1",             color: "hsl(66,100%,58%)"  },
+  { label: "2",             color: "hsl(48,100%,55%)"  },
+  { label: "3–4",           color: "hsl(24,100%,52%)"  },
+  { label: "5+",            color: "hsl(0,100%,50%)"   },
+  { label: "Not computed",  color: "#d7ccc8",           border: true },
+];
+
 // ─── State ────────────────────────────────────────────────────────────────────
 
+const $q = useQuasar();
 const loading = ref(false);
 
 // Stream list dropdown
@@ -451,6 +620,102 @@ function startFetch() {
       }
     },
   );
+}
+
+// ─── Precompute dialog ────────────────────────────────────────────────────────
+
+const precacheOpen = ref(false);
+const precacheRunning = ref(false);
+const precacheTotal = ref<number | null>(null);
+const precacheDone = ref(0);
+const precacheGenerated = ref(0);
+const precacheStreams = ref<number | null>(null);
+const precacheErrors = ref<string[]>([]);
+let _cancelPrecache: (() => void) | null = null;
+
+function openPrecacheDialog() {
+  precacheOpen.value = true;
+}
+
+function cancelPrecache() {
+  if (_cancelPrecache) {
+    _cancelPrecache();
+    _cancelPrecache = null;
+  }
+  precacheRunning.value = false;
+}
+
+function startPrecache() {
+  precacheRunning.value = true;
+  precacheTotal.value = null;
+  precacheDone.value = 0;
+  precacheGenerated.value = 0;
+  precacheStreams.value = null;
+  precacheErrors.value = [];
+
+  // Sent as the selection rather than as the current page's stream names: the
+  // whole point is to cover the pages that are NOT on screen.
+  _cancelPrecache = openPrecacheStream(
+    {
+      lists: selectedList.value ? [selectedList.value] : ["all"],
+      search: searchText.value,
+      start: startDate.value,
+      end: endDate.value,
+    },
+    (evt) => {
+      if (evt.type === "streams") precacheStreams.value = evt.count ?? null;
+      if (evt.type === "start") precacheTotal.value = evt.total ?? 0;
+      if (evt.type === "progress") {
+        precacheDone.value = evt.done ?? precacheDone.value;
+        precacheGenerated.value = evt.generated ?? precacheGenerated.value;
+      }
+      if (evt.type === "error" && evt.msg) precacheErrors.value.push(evt.msg);
+      if (evt.type === "done") {
+        precacheRunning.value = false;
+        precacheTotal.value = evt.total ?? precacheTotal.value ?? 0;
+        precacheDone.value = precacheTotal.value ?? precacheDone.value;
+        precacheGenerated.value = evt.generated ?? precacheGenerated.value;
+        _cancelPrecache = null;
+        loadCompleteness();
+      }
+    },
+  );
+}
+
+// ─── Cell → File Explorer ─────────────────────────────────────────────────────
+
+const router = useRouter();
+
+/**
+ * Open the source .arrow file behind a cell in the File Explorer.
+ *
+ * The path is resolved server-side on click rather than shipped with every
+ * bucket — a page carries thousands of cells and almost none are clicked.
+ */
+async function openInExplorer(geosncl: string, bucket: BucketData) {
+  if (bucket.state !== "has-data") return;      // nothing downloaded to open
+  const binMs = data.value?.bucketMs ?? 0;
+  try {
+    const { path } = await locateArrowFile(
+      geosncl, bucket.bucketStartMs, bucket.bucketStartMs + binMs);
+    // Guard the reply rather than trusting it: a server older than this page
+    // has no /api/files/locate, and used to answer with index.html and a 200 —
+    // navigating on that lands on an empty File Explorer with no explanation.
+    if (typeof path !== "string" || !path) {
+      $q.notify({
+        type: "warning",
+        message: "The server did not return a file path — it may be running older "
+               + "code than this page. Restart es-pos webserver.",
+      });
+      return;
+    }
+    router.push({ path: "/plots", query: { path } });
+  } catch {
+    $q.notify({
+      type: "warning",
+      message: `No downloaded file for ${geosncl} at ${isoLabel(bucket.bucketStartMs)}.`,
+    });
+  }
 }
 
 // ─── Lifecycle ────────────────────────────────────────────────────────────────
@@ -662,6 +927,28 @@ function latencyColor(bucket: BucketData): string {
   }
 }
 
+// Step scale: 0 restarts green, then escalating warm colours, saturating at 5.
+// Deliberately not linear — one outage in a bin matters and must not look like
+// a rounding error beside a bin that had none.
+function _restartScore(count: number): number {
+  if (count <= 0) return 1;
+  return Math.max(0, 0.7 - 0.15 * count);   // 1→0.55, 2→0.40, 3→0.25, 4→0.10, 5+→0
+}
+
+function restartColor(bucket: BucketData): string {
+  switch (bucket.state) {
+    case "not-tried": return "#ffffff";
+    case "no-data":   return "#616161";
+    case "error":     return "#9e9e9e";
+    case "has-data":
+      // null ≠ 0: the completeness files predate gap tracking and simply cannot
+      // say. Painting it green would claim an outage-free bin.
+      if (bucket.restartCount == null) return "#d7ccc8";
+      return _scoreColor(_restartScore(bucket.restartCount));
+    default:          return "#eeeeee";
+  }
+}
+
 // ─── Tooltip functions ────────────────────────────────────────────────────────
 
 function isoLabel(epochMs: number): string {
@@ -681,6 +968,40 @@ function completenessTooltip(geosncl: string, bucket: BucketData): string {
         lines.push(`Ingest latency: ${bucket.meanIngestLatencyS.toFixed(2)} s`);
       if (bucket.meanProcessingDelayS != null)
         lines.push(`Processing delay: ${bucket.meanProcessingDelayS.toFixed(3)} s`);
+      if (bucket.restartCount)
+        lines.push(`Restarts: ${bucket.restartCount}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+function fmtGap(seconds: number): string {
+  if (seconds < 60)   return `${seconds.toFixed(0)} s`;
+  if (seconds < 3600) return `${(seconds / 60).toFixed(1)} min`;
+  return `${(seconds / 3600).toFixed(1)} h`;
+}
+
+function restartTooltip(geosncl: string, bucket: BucketData): string {
+  const lines = [geosncl, isoLabel(bucket.bucketStartMs)];
+  switch (bucket.state) {
+    case "not-tried": lines.push("Not yet attempted"); break;
+    case "no-data":   lines.push("No data returned by API"); break;
+    case "error":     lines.push("Fetch attempted — API returned an error (400/422)"); break;
+    case "has-data": {
+      if (bucket.restartCount == null) {
+        lines.push("Restarts: not computed for this data");
+        lines.push("Run: es-pos process completeness --overwrite");
+        break;
+      }
+      lines.push(
+        bucket.restartCount === 0
+          ? "No restarts — continuous through this bin"
+          : `Restarts: ${bucket.restartCount}`,
+      );
+      if (bucket.maxGapS != null)
+        lines.push(`Longest gap: ${fmtGap(bucket.maxGapS)}`);
+      const pct = ((bucket.completeness ?? 0) * 100).toFixed(1);
+      lines.push(`Completeness: ${pct}%`);
     }
   }
   return lines.join("\n");
@@ -708,6 +1029,15 @@ function latencyTooltip(geosncl: string, bucket: BucketData): string {
 </script>
 
 <style scoped>
+.precache-errors {
+  margin: 8px 0 0;
+  font-size: 0.72rem;
+  line-height: 1.35;
+  max-height: 140px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
 .legend-swatch {
   width: 14px;
   height: 14px;

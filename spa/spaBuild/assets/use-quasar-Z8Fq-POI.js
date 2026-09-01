@@ -1,0 +1,1 @@
+import{i as u,bl as o}from"./index-W4R_x7h0.js";function i(t,r,n){return n<=r?r:Math.min(n,Math.max(r,t))}function f(t,r,n){if(n<=r)return r;const e=n-r+1;let a=r+(t-r)%e;return a<r&&(a=e+a),a===0?0:a}function l(t,r=2,n="0"){if(t==null)return t;const e=String(t);return e.length>=r?e:new Array(r-e.length+1).join(n)+e}function c(){return u(o)}export{i as b,f as n,l as p,c as u};

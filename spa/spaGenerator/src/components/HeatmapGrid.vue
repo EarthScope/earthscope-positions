@@ -19,8 +19,10 @@
           v-for="(bucket, ci) in st.buckets"
           :key="ci"
           class="hm-data"
+          :class="{ 'hm-clickable': cellClick && bucket.state === 'has-data' }"
           :style="{ background: colorFn(bucket) }"
-          :title="tooltipFn(st.geosncl, bucket)"
+          :title="cellTitle(st.geosncl, bucket)"
+          @click="cellClick && cellClick(st.geosncl, bucket)"
         />
       </template>
     </div>
@@ -36,7 +38,19 @@ const props = defineProps<{
   bucketStarts: number[];
   colorFn: (bucket: BucketData) => string;
   tooltipFn: (geosncl: string, bucket: BucketData) => string;
+  /** Optional: makes cells clickable, e.g. to open the file behind one. */
+  cellClick?: (geosncl: string, bucket: BucketData) => void;
 }>();
+
+/** The caller's tooltip, plus a hint that the cell does something when clicked. */
+function cellTitle(geosncl: string, bucket: BucketData): string {
+  const base = props.tooltipFn(geosncl, bucket);
+  // Only "has-data" is offered: those are the cells a downloaded file
+  // definitely sits behind, so the pointer cursor never promises a file that
+  // was never fetched.
+  if (!props.cellClick || bucket.state !== "has-data") return base;
+  return `${base}\n\nClick to open this file in the File Explorer`;
+}
 
 const LABEL_COL_W = 165;
 
@@ -118,6 +132,9 @@ function isoLabel(epochMs: number): string {
   cursor: crosshair;
   transition: opacity 0.08s;
   min-height: 18px;
+}
+.hm-clickable {
+  cursor: pointer;
 }
 .hm-data:hover {
   opacity: 0.7;

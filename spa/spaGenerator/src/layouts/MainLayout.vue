@@ -20,6 +20,19 @@
           <q-route-tab to="/export"          label="Export" />
           <q-route-tab to="/replay"          label="Replay" />
         </q-tabs>
+        <!--
+          Environment badge, immediately left of the help button.  Rendered
+          only when the server says so (production is unbadged), so the
+          absence of a badge always means production rather than "the request
+          has not come back yet".
+        -->
+        <div v-if="envBadge" class="env-badge q-mr-sm">
+          {{ envBadge.environment_label }}
+          <q-tooltip anchor="bottom right" self="top right">
+            Pulling from {{ envBadge.api_url }} (es profile "{{ envBadge.es_profile }}").
+            EDIDs here differ from production.
+          </q-tooltip>
+        </div>
         <q-btn
           v-if="currentHelp"
           flat dense round
@@ -47,12 +60,26 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed } from "vue";
+import { ref, computed, onMounted } from "vue";
 import { useRoute } from "vue-router";
 import { ESLayout } from "@earthscope/spa-lib";
+import { getServerConfig, type ServerConfig } from "../api";
 
 const helpOpen = ref(false);
 const route = useRoute();
+
+// Null until the config lands, and null forever on production — the badge is
+// an exception marker, so failing to fetch it must not paint a false one.
+const envBadge = ref<ServerConfig | null>(null);
+
+onMounted(async () => {
+  try {
+    const cfg = await getServerConfig();
+    if (cfg.environment_badge) envBadge.value = cfg;
+  } catch {
+    envBadge.value = null;
+  }
+});
 
 interface HelpEntry { title: string; html: string }
 
@@ -170,7 +197,41 @@ const HELP: Record<string, HelpEntry> = {
             day to set both at once</li>
         <li>Results are paginated; use the arrows to step through streams</li>
         <li>Click <strong>Fetch Missing</strong> to download data for streams that have never been tried</li>
-        <li>The <em>Latency</em> heatmap below shows ingest delay in seconds</li>
+      </ul>
+      <div class="help-section-label">The three heatmaps</div>
+      <ul>
+        <li><strong>Completeness</strong> — samples received vs expected at 1&nbsp;Hz</li>
+        <li><strong>Ingest Latency</strong> — mean ingest delay in seconds</li>
+        <li><strong>Restarts</strong> — how many times the stream stopped and came back
+            inside the bin. A gap longer than 2&nbsp;s counts as an outage; a single
+            dropped sample does not, since that is ordinary and is already what
+            Completeness measures. Green is zero, and any restart at all shows warm</li>
+      </ul>
+      <div class="help-section-label">Precompute</div>
+      <ul>
+        <li>The completeness data behind these plots is built the first time a page
+            needs it, which is what makes moving between pages feel slow on a large
+            tree. <strong>Precompute</strong> builds it for every stream in the
+            current list, filter and date range — all pages, not just the one on
+            screen — so browsing afterwards is instant</li>
+        <li>Already-current files are skipped, so running it again costs nothing</li>
+      </ul>
+      <div class="help-section-label">Opening the data behind a cell</div>
+      <ul>
+        <li><strong>Click any coloured cell</strong> to open that stream's Arrow file
+            for that day in the File Explorer — the position data itself, not the
+            completeness summary</li>
+        <li>Only cells that have data are clickable; a cell that was never fetched
+            has no file to open</li>
+      </ul>
+      <div class="help-section-label">Reading Restarts</div>
+      <ul>
+        <li>An outage is counted once, in the bin where the data <em>came back</em> —
+            the bins it spans show as empty in Completeness, which is what they are</li>
+        <li>Hover a cell for the count and the longest gap in that bin</li>
+        <li><strong>Beige</strong> means the metric was never computed for that data.
+            Run <code>es-pos process completeness --overwrite</code>, or just revisit
+            the page — the server rebuilds those files as it serves them</li>
       </ul>`,
   },
   "/positions": {
@@ -240,6 +301,17 @@ const HELP: Record<string, HelpEntry> = {
             nothing to decompose — use Karhunen-Loève instead for gappy,
             loosely-overlapping networks</li>
       </ul>
+      <div class="help-section-label">Zooming</div>
+      <ul>
+        <li><strong>Time series</strong> — drag up/down to zoom the value axis of that
+            plot; <strong>Shift&nbsp;+&nbsp;drag</strong> sideways to zoom the time
+            axis on every plot at once (they share it); <strong>click</strong> anywhere
+            to go back to the full view</li>
+        <li><strong>Scatter panels</strong> — <strong>Shift&nbsp;+&nbsp;drag</strong> a
+            box to zoom into it, <strong>click</strong> to zoom back out. Each panel
+            zooms on its own</li>
+        <li>Right-click also resets, on either kind</li>
+      </ul>
       <div class="help-section-label">Common mode (None / PCA / KLE)</div>
       <ul>
         <li>Click <strong>Common mode: …</strong> to pick which method — if any —
@@ -252,6 +324,11 @@ const HELP: Record<string, HelpEntry> = {
         <li>With PCA, any epoch where the network doesn't fully overlap is left as
             raw data (no common-mode estimate exists there) — KLE instead estimates
             through those gaps using whichever streams are available</li>
+        <li>The scatter panels and histograms are drawn twice while a method is
+            active — once as measured, once for the residual — so you can see whether
+            removing the common mode actually tightened the cloud and narrowed the
+            distribution. Each set is scaled to its own data, since the residual is
+            far tighter than the input</li>
       </ul>`,
   },
   "/ppsd": {
@@ -308,11 +385,23 @@ const HELP: Record<string, HelpEntry> = {
       <div class="help-section-label">What you get per file</div>
       <ul>
         <li><strong>.arrow</strong> — a time-series plot of every numeric column,
-            plus row and column counts, first/last sample, span, nominal rate, and the
-            column schema with null counts</li>
+            plus row and column counts, first/last sample, span, nominal rate, the
+            column schema with null counts, and <strong>continuity</strong>: how many
+            uninterrupted blocks the series breaks into, how many restarts that means,
+            the longest gap and the total time spent in gaps, followed by a table of
+            every block with its start, end, duration and sample count.
+            A gap longer than 2&nbsp;s is an outage; a single dropped sample is not.
+            A file that starts late counts a restart without splitting the samples it
+            does have, so restarts can be one more than blocks&nbsp;−&nbsp;1.
+            <strong>Each continuous block is plotted in its own colour</strong>, with a
+            red hairline at every restart, so a break is visible even when the x-axis
+            spans a whole day</li>
         <li><strong>.completeness.arrow</strong> — completeness ratio per time bucket
             (pinned to 0–1 so a healthy flat line reads as complete), sample vs expected
-            counts, and mean ingest latency / processing delay</li>
+            counts, mean ingest latency / processing delay, and per-bucket
+            <strong>restart counts</strong> and longest gap. The summary above the plot
+            totals the restarts and reports the gap threshold they were built with,
+            read straight out of the file rather than recomputed</li>
         <li><strong>_ppsd.arrow</strong> — the three-panel East/North/Up probabilistic
             power spectral density, rendered exactly as <code>es-pos export ppsd</code>
             draws it</li>
@@ -328,6 +417,19 @@ const HELP: Record<string, HelpEntry> = {
         <li><strong>.jsonl</strong> — whether it is a stream or station list, entry
             counts, the fields present, and the first few lines</li>
         <li><strong>Images</strong> — displayed as before</li>
+      </ul>
+      <div class="help-section-label">Comparing images side by side</div>
+      <ul>
+        <li>Files whose whole preview is one picture — stored images, and
+            <code>_ppsd.arrow</code> arrays — get a <strong>checkbox</strong> in the
+            tree. Tick as many as you like and they all appear stacked in the pane, in
+            tree order, so you can compare stations or days</li>
+        <li>Ticking does not change which file is "current"; use the × beside a picture,
+            or <strong>Clear</strong> in the bar, to drop one or all of them</li>
+        <li><strong>Clicking any other file</strong> (not a folder) unticks everything
+            and goes back to the single-file view</li>
+        <li>Rename and Delete act on one file, so they are hidden while a stack is
+            shown</li>
       </ul>
       <div class="help-section-label">Managing files</div>
       <ul>
@@ -465,6 +567,20 @@ const currentHelp = computed<HelpEntry | null>(
 }
 .nav-tabs :deep(.q-tab__indicator) {
   background: #fff;
+}
+.env-badge {
+  /* Amber on the navy nav bar: reads as a warning without looking like an
+     error, and stays legible against the #1a237e background. */
+  background: #ffb300;
+  color: #1a237e;
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 2px 8px;
+  border-radius: 3px;
+  white-space: nowrap;
+  cursor: default;
 }
 .help-btn {
   color: rgba(255, 255, 255, 0.7);

@@ -5,9 +5,13 @@ Iterates from --min-workers to --max-workers, testing each endpoint in series
 (auth first, then open) at each concurrency level. Every request result is
 saved as a JSON line to a JSONL file for post-run analysis.
 
-Endpoints tested:
+Endpoints tested (both follow the active environment — see
+``earthscope_positions.environment``; the hosts below are production's):
   auth: api.earthscope.org/beta/data-products/gnss/positions/instantaneous
   open: gnss-observations-api.prod.earthscope.org/positions/instantaneous/v2
+
+Stage has no known unauthenticated equivalent, so a stage run sweeps the
+authenticated endpoint alone rather than probing a guessed hostname.
 
 Per-request output fields:
   endpoint, worker_count, geosncl, edid, date, status, latency_ms,
@@ -38,7 +42,7 @@ import orjson
 import pyarrow.ipc
 import requests
 
-from earthscope_positions import paths
+from earthscope_positions import environment, paths
 from earthscope_positions.fetch.positions_fetch import (
     _ensure_token,
     _load_station_list,
@@ -51,12 +55,18 @@ from earthscope_positions.fetch.positions_fetch import (
 # Endpoints
 # ---------------------------------------------------------------------------
 
-_ENDPOINT_AUTH = (
-    "https://api.earthscope.org/beta/data-products/gnss/positions/instantaneous/v2"
-)
-_ENDPOINT_OPEN = (
-    "https://gnss-observations-api.prod.earthscope.org/positions/instantaneous/v2"
-)
+_AUTH_PATH = "/beta/data-products/gnss/positions/instantaneous/v2"
+
+
+def _endpoint_auth() -> str:
+    """Authenticated positions endpoint for the active environment."""
+    return environment.api_url().rstrip("/") + _AUTH_PATH
+
+
+def _endpoint_open() -> "str | None":
+    """Unauthenticated positions endpoint, or None where the environment has
+    none.  Only production publishes one; see environment.Environment."""
+    return environment.current().open_positions_url
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -336,14 +346,25 @@ def _run(
     token: str,
 ) -> None:
     worker_counts = _logspace_workers(max_workers)
-    # Each worker count tests auth then open — in series
+    endpoint_auth = _endpoint_auth()
+    endpoint_open = _endpoint_open()
+    # Each worker count tests auth then open — in series.  An environment with
+    # no open endpoint (stage) contributes only the auth phase, so the phase
+    # budget divides by however many endpoints actually exist rather than
+    # always by two.
+    endpoints: list[tuple[str, str, "str | None"]] = [("auth", endpoint_auth, token)]
+    if endpoint_open:
+        endpoints.append(("open", endpoint_open, None))
+    else:
+        print(
+            f"[note] {environment.label()} has no unauthenticated positions "
+            f"endpoint; sweeping the authenticated one only.",
+            file=sys.stderr,
+        )
     phase_configs = [
         (w, ep_label, ep_url, tok)
         for w in worker_counts
-        for ep_label, ep_url, tok in [
-            ("auth", _ENDPOINT_AUTH, token),
-            ("open", _ENDPOINT_OPEN, None),
-        ]
+        for ep_label, ep_url, tok in endpoints
     ]
 
     n_phases = len(phase_configs)
@@ -378,13 +399,15 @@ def _run(
         "n_phases": n_phases,
         "phase_duration_s": round(phase_duration_s, 1),
         "total_duration_s": total_duration_s,
-        "endpoint_auth": _ENDPOINT_AUTH,
-        "endpoint_open": _ENDPOINT_OPEN,
+        "environment": environment.name(),
+        "endpoint_auth": endpoint_auth,
+        "endpoint_open": endpoint_open,
     }
 
     print(f"\nOutput → {output_path}", file=sys.stderr)
     print(
-        f"Sweep: {worker_counts} × 2 endpoints = {n_phases} phases",
+        f"Sweep: {worker_counts} × {len(endpoints)} endpoint(s) = {n_phases} phases "
+        f"({environment.label()})",
         file=sys.stderr,
     )
     print(
@@ -442,6 +465,10 @@ def _build_parser(prog=None) -> argparse.ArgumentParser:
 Worker counts are spaced logarithmically from 1 to --max-workers (~12 levels),
 testing each endpoint in series (auth then open) at each level.
 Every request is saved to a JSONL file for post-run analysis.
+
+Both endpoints follow the active data directory's environment.  On stage
+(api.dev.earthscope.org) there is no unauthenticated endpoint, so only the
+auth phase runs.
 
 NOTE: The auth endpoint (api.earthscope.org) requires the EarthScope VPN.
       The open endpoint (gnss-observations-api.prod.earthscope.org) is always

@@ -140,7 +140,13 @@
       </q-btn>
       <q-spinner v-if="cmrLoading" size="16px" color="primary" />
       <span class="text-caption text-grey-6 self-center">
-        · Shift+click to add · Shift+drag to zoom · right-click to reset zoom · Shift+click line to deselect
+        · Shift+click to add · Shift+click line to deselect
+      </span>
+      <span class="text-caption text-grey-6 self-center">
+        · Time series: drag = zoom Y, Shift+drag = zoom time, click = reset
+      </span>
+      <span class="text-caption text-grey-6 self-center">
+        · Scatter: Shift+drag = zoom box, click = reset
       </span>
       <q-space />
       <span class="text-caption text-grey-6 self-center">
@@ -245,6 +251,7 @@
           </template>
 
           <!-- Scatter plots: E-N, N-U, U-E -->
+          <div class="text-caption text-grey-7 q-mb-xs">Scatter — as measured</div>
           <div class="row no-wrap q-col-gutter-xs q-mb-sm" style="flex-shrink: 0">
             <div v-for="sc in SCATTER_DEFS" :key="'sc_' + sc.key" class="col chart-block-sq">
               <canvas :ref="el => setScatterCanvas(sc.key, el)" class="chart-canvas-full" />
@@ -252,11 +259,37 @@
           </div>
 
           <!-- Histograms: E, N, U -->
+          <div class="text-caption text-grey-7 q-mb-xs">Distribution — as measured</div>
           <div class="row no-wrap q-col-gutter-xs q-mb-sm" style="flex-shrink: 0">
             <div v-for="h in HIST_DEFS" :key="'h_' + h.key" class="col chart-block-sm">
               <canvas :ref="el => setHistCanvas(h.key, el)" class="chart-canvas-full" />
             </div>
           </div>
+
+          <!-- The same scatters and histograms over the common-mode-removed
+               series.  Removing a common mode is meant to tighten the cloud and
+               narrow the distribution, and that is only visible side by side
+               with the "as measured" pair above. -->
+          <template v-if="cmrMethod !== 'none' && cmrResult">
+            <q-separator class="q-my-sm" />
+            <div class="text-caption text-grey-7 q-mb-xs">
+              Scatter — common-mode removed ({{ cmrResult.method.toUpperCase() }})
+            </div>
+            <div class="row no-wrap q-col-gutter-xs q-mb-sm" style="flex-shrink: 0">
+              <div v-for="sc in SCATTER_DEFS" :key="'sccmr_' + sc.key" class="col chart-block-sq">
+                <canvas :ref="el => setScatterCanvas(sc.key + '_cmr', el)" class="chart-canvas-full" />
+              </div>
+            </div>
+
+            <div class="text-caption text-grey-7 q-mb-xs">
+              Distribution — common-mode removed ({{ cmrResult.method.toUpperCase() }})
+            </div>
+            <div class="row no-wrap q-col-gutter-xs q-mb-sm" style="flex-shrink: 0">
+              <div v-for="h in HIST_DEFS" :key="'hcmr_' + h.key" class="col chart-block-sm">
+                <canvas :ref="el => setHistCanvas(h.key + '_cmr', el)" class="chart-canvas-full" />
+              </div>
+            </div>
+          </template>
         </template>
       </div>
     </div>
@@ -668,11 +701,15 @@ const _canvas:        Record<string, HTMLCanvasElement | null> = {
 const _chart:         Record<string, Chart | null>             = {
   east: null, north: null, up: null, east_cmr: null, north_cmr: null, up_cmr: null,
 };
-const _scatterCanvas: Record<string, HTMLCanvasElement | null> = { en: null, nu: null, ue: null };
-const _scatterChart:  Record<string, Chart | null>             = { en: null, nu: null, ue: null };
-const _histCanvas:    Record<string, HTMLCanvasElement | null> = { east: null, north: null, up: null };
-const _histChart:     Record<string, Chart | null>             = { east: null, north: null, up: null };
-const _histStats:     Record<string, { mean: number; std: number } | null> = { east: null, north: null, up: null };
+// Keyed by SCATTER_DEFS/HIST_DEFS key, plus a "_cmr" suffixed twin for the
+// common-mode-removed series.  Open-ended records rather than fixed keys so the
+// CMR panels mount and unmount with the CMR method without a second set of
+// declarations to keep in step.
+const _scatterCanvas: Record<string, HTMLCanvasElement | null> = {};
+const _scatterChart:  Record<string, Chart | null>             = {};
+const _histCanvas:    Record<string, HTMLCanvasElement | null> = {};
+const _histChart:     Record<string, Chart | null>             = {};
+const _histStats:     Record<string, { mean: number; std: number } | null> = {};
 
 // Cleanup functions for canvas event listeners
 const _canvasCleanup: Record<string, (() => void) | null> = {
@@ -683,7 +720,17 @@ const _canvasCleanup: Record<string, (() => void) | null> = {
 const _posZoom = ref<{ min: number; max: number } | null>(null);
 
 // ── Interaction state (plain, not reactive – updated on every mouse event) ───
-const _posDragState = { active: false, chartKey: "", startPx: 0, currentPx: 0, justZoomed: false };
+const _posDragState = {
+  active: false, chartKey: "", justZoomed: false,
+  startPx: 0, currentPx: 0, startPy: 0, currentPy: 0,
+  // "x" = shift-drag (time window, shared by every chart), "y" = plain drag
+  // (value range, this chart only -- east/north/up are on unrelated scales, so
+  // a shared y-zoom would be meaningless).
+  mode: "x" as "x" | "y",
+};
+
+//: Per-chart y-axis zoom, keyed the same way _chart is.
+const _posYZoom = ref<Record<string, { min: number; max: number } | null>>({});
 const _crosshair    = { posX: null as number | null };
 
 // ── Save Selection dialog ────────────────────────────────────────────────────
@@ -1639,7 +1686,21 @@ async function loadListOptions() {
   } catch { listOptions.value = [{ label: "All", value: "all" }]; }
 }
 
-async function reloadStations() {
+//: In-flight reloadStations(), so a bulk action can wait for the filter it
+//: just triggered instead of acting on the pre-filter list.
+let _stationsReload: Promise<void> | null = null;
+
+/** Resolve once any in-flight station reload has landed. */
+function pendingStations(): Promise<void> {
+  return _stationsReload ?? Promise.resolve();
+}
+
+function reloadStations(): Promise<void> {
+  _stationsReload = _reloadStations().finally(() => { _stationsReload = null; });
+  return _stationsReload;
+}
+
+async function _reloadStations() {
   stationsLoading.value = true;
   try {
     const r = await getStations({ list: selectedList.value, search: searchText.value || undefined });
@@ -1732,10 +1793,33 @@ function onItemClick(item: TreeItem, event: MouseEvent) {
   _setSelected(next);
 }
 function clearSelection() { _setSelected(new Set()); }
-function selectAll() {
-  const all = new Set<string>();
-  for (const ch of stationGroups.value.values()) ch.forEach(g => all.add(g));
-  _setSelected(all);
+
+//: Bulk selection cap.  Past a few hundred series the three charts are
+//: unreadable anyway, and the request behind them (one Arrow read per stream,
+//: thousands of points each) locks the tab up for minutes.  Explicitly ticking
+//: streams is left uncapped — that is a deliberate choice by the user.
+const SELECT_ALL_MAX = 250;
+
+async function selectAll() {
+  // Clicking this button blurs the filter box, which is what *starts* the
+  // filtered reload.  Without waiting for it, Select All reads the pre-filter
+  // station list and selects every stream in the list rather than the handful
+  // the filter shows — which then stalls the page loading them and looks like
+  // "nothing plotted".
+  await pendingStations();
+
+  const all: string[] = [];
+  for (const ch of stationGroups.value.values()) all.push(...ch);
+
+  if (all.length > SELECT_ALL_MAX) {
+    $q.notify({
+      type: "warning",
+      timeout: 6000,
+      message: `${all.length.toLocaleString()} streams match — selecting the first `
+             + `${SELECT_ALL_MAX}. Narrow the filter to choose which.`,
+    });
+  }
+  _setSelected(new Set(all.slice(0, SELECT_ALL_MAX)));
 }
 function onTreeKeydown(e: KeyboardEvent) {
   const items = flatItems.value; if (!items.length) return;
@@ -1772,13 +1856,136 @@ function setCanvas(key: string, el: unknown) {
 }
 function setScatterCanvas(key: string, el: unknown) {
   const canvas = el as HTMLCanvasElement | null;
-  if (!canvas) { _scatterChart[key]?.destroy(); _scatterChart[key] = null; _scatterCanvas[key] = null; }
-  else { _scatterCanvas[key] = canvas; }
+  if (!canvas) {
+    _scatterChart[key]?.destroy(); _scatterChart[key] = null; _scatterCanvas[key] = null;
+    _scatterCleanup[key]?.(); _scatterCleanup[key] = null;
+  } else {
+    _scatterCanvas[key] = canvas;
+    _scatterCleanup[key]?.();
+    _scatterCleanup[key] = _attachScatterListeners(canvas, key);
+  }
+}
+
+//: Per-scatter box zoom.  Unlike the time-series charts these are not on a
+//: shared axis -- each panel plots a different pair of components -- so zooming
+//: one leaves the others alone.
+const _scatterZoom = ref<Record<string, { xMin: number; xMax: number; yMin: number; yMax: number } | null>>({});
+const _scatterDrag = {
+  active: false, key: "", startPx: 0, startPy: 0, currentPx: 0, currentPy: 0,
+};
+const _scatterCleanup: Record<string, (() => void) | null> = {};
+
+/**
+ * Shift-drag a box to zoom into it; a plain click zooms back out.
+ *
+ * Shift (rather than a plain drag, as on the time series) because these panels
+ * are square scatters where a drag has no single obvious axis — the box is the
+ * gesture, and reserving plain click for "reset" keeps one unmodified action
+ * per plot type.
+ */
+function _attachScatterListeners(canvas: HTMLCanvasElement, key: string): () => void {
+  const drag = _scatterDrag;
+  const chart = () => _scatterChart[key];
+
+  const onMousedown = (e: MouseEvent) => {
+    if (!e.shiftKey) return;
+    e.preventDefault();
+    drag.active = true; drag.key = key;
+    drag.startPx = e.offsetX; drag.startPy = e.offsetY;
+    drag.currentPx = e.offsetX; drag.currentPy = e.offsetY;
+  };
+
+  const onMousemove = (e: MouseEvent) => {
+    if (!drag.active || drag.key !== key) return;
+    drag.currentPx = e.offsetX; drag.currentPy = e.offsetY;
+    chart()?.render();
+  };
+
+  const onMouseup = (e: MouseEvent) => {
+    const c = chart();
+    if (drag.active && drag.key === key) {
+      drag.currentPx = e.offsetX; drag.currentPy = e.offsetY;
+      const dx = Math.abs(drag.currentPx - drag.startPx);
+      const dy = Math.abs(drag.currentPy - drag.startPy);
+      drag.active = false;
+      if (c && dx > DRAG_SLOP && dy > DRAG_SLOP) {
+        const xs = c.scales["x"], ys = c.scales["y"];
+        const xMin = xs?.getValueForPixel(Math.min(drag.startPx, drag.currentPx));
+        const xMax = xs?.getValueForPixel(Math.max(drag.startPx, drag.currentPx));
+        // Pixels grow downward, so the top of the box is the larger value.
+        const yMax = ys?.getValueForPixel(Math.min(drag.startPy, drag.currentPy));
+        const yMin = ys?.getValueForPixel(Math.max(drag.startPy, drag.currentPy));
+        if (xMin !== undefined && xMax !== undefined && yMin !== undefined && yMax !== undefined
+            && xMax > xMin && yMax > yMin) {
+          _scatterZoom.value = { ..._scatterZoom.value, [key]: { xMin, xMax, yMin, yMax } };
+        }
+        return;
+      }
+      return;
+    }
+    // Plain click, no box: back to the full range.
+    if (!e.shiftKey && _scatterZoom.value[key]) {
+      _scatterZoom.value = { ..._scatterZoom.value, [key]: null };
+    }
+  };
+
+  const onMouseleave = () => { if (drag.active && drag.key === key) { drag.active = false; chart()?.render(); } };
+  const onContextmenu = (e: MouseEvent) => {
+    e.preventDefault();
+    _scatterZoom.value = { ..._scatterZoom.value, [key]: null };
+  };
+
+  canvas.addEventListener("mousedown", onMousedown);
+  canvas.addEventListener("mousemove", onMousemove);
+  canvas.addEventListener("mouseup", onMouseup);
+  canvas.addEventListener("mouseleave", onMouseleave);
+  canvas.addEventListener("contextmenu", onContextmenu);
+  return () => {
+    canvas.removeEventListener("mousedown", onMousedown);
+    canvas.removeEventListener("mousemove", onMousemove);
+    canvas.removeEventListener("mouseup", onMouseup);
+    canvas.removeEventListener("mouseleave", onMouseleave);
+    canvas.removeEventListener("contextmenu", onContextmenu);
+  };
+}
+
+/** Draws the shift-drag box while it is being dragged. */
+function _scatterDragPlugin(key: string): object {
+  return {
+    id: `scatter-drag-${key}`,
+    afterDraw(chart: Chart) {
+      const drag = _scatterDrag;
+      if (!drag.active || drag.key !== key) return;
+      const { left, right, top, bottom } = chart.chartArea;
+      const x1 = Math.max(left, Math.min(drag.startPx, drag.currentPx));
+      const x2 = Math.min(right, Math.max(drag.startPx, drag.currentPx));
+      const y1 = Math.max(top, Math.min(drag.startPy, drag.currentPy));
+      const y2 = Math.min(bottom, Math.max(drag.startPy, drag.currentPy));
+      if (x2 <= x1 || y2 <= y1) return;
+      const ctx = chart.ctx;
+      ctx.save();
+      ctx.fillStyle = "rgba(33,150,243,0.12)";
+      ctx.strokeStyle = "rgba(33,150,243,0.7)";
+      ctx.lineWidth = 1;
+      ctx.fillRect(x1, y1, x2 - x1, y2 - y1);
+      ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+      ctx.restore();
+    },
+  };
 }
 function setHistCanvas(key: string, el: unknown) {
   const canvas = el as HTMLCanvasElement | null;
   if (!canvas) { _histChart[key]?.destroy(); _histChart[key] = null; _histCanvas[key] = null; }
   else { _histCanvas[key] = canvas; }
+}
+
+//: Pixels of movement below which a press counts as a click, not a drag.
+const DRAG_SLOP = 5;
+
+/** Back to the full view on every chart — both axes. */
+function resetPosZoom() {
+  _posZoom.value = null;
+  _posYZoom.value = {};
 }
 
 function _attachListeners(canvas: HTMLCanvasElement, chartKey: string): () => void {
@@ -1788,10 +1995,11 @@ function _attachListeners(canvas: HTMLCanvasElement, chartKey: string): () => vo
   const renderPeers = () => { Object.values(_chart).forEach(c => c?.render()); };
 
   const onMousedown = (e: MouseEvent) => {
-    if (!e.shiftKey) return;
     e.preventDefault();
     drag.active = true; drag.chartKey = chartKey;
+    drag.mode = e.shiftKey ? "x" : "y";
     drag.startPx = e.offsetX; drag.currentPx = e.offsetX;
+    drag.startPy = e.offsetY; drag.currentPy = e.offsetY;
   };
 
   const onMousemove = (e: MouseEvent) => {
@@ -1802,6 +2010,7 @@ function _attachListeners(canvas: HTMLCanvasElement, chartKey: string): () => vo
     }
     if (drag.active && drag.chartKey === chartKey) {
       drag.currentPx = e.offsetX;
+      drag.currentPy = e.offsetY;
       getChart()?.render();
     }
   };
@@ -1809,16 +2018,32 @@ function _attachListeners(canvas: HTMLCanvasElement, chartKey: string): () => vo
   const onMouseup = (e: MouseEvent) => {
     if (!drag.active || drag.chartKey !== chartKey) return;
     drag.currentPx = e.offsetX;
+    drag.currentPy = e.offsetY;
     const chart = getChart();
-    if (chart && Math.abs(drag.currentPx - drag.startPx) > 5) {
-      const xMin = Math.min(drag.startPx, drag.currentPx);
-      const xMax = Math.max(drag.startPx, drag.currentPx);
-      const dMin = chart.scales["x"]?.getValueForPixel(xMin);
-      const dMax = chart.scales["x"]?.getValueForPixel(xMax);
+    const dx = Math.abs(drag.currentPx - drag.startPx);
+    const dy = Math.abs(drag.currentPy - drag.startPy);
+
+    if (chart && drag.mode === "x" && dx > DRAG_SLOP) {
+      const dMin = chart.scales["x"]?.getValueForPixel(Math.min(drag.startPx, drag.currentPx));
+      const dMax = chart.scales["x"]?.getValueForPixel(Math.max(drag.startPx, drag.currentPx));
       if (dMin !== undefined && dMax !== undefined && dMax > dMin) {
         zoomRef.value = { min: dMin, max: dMax };
         drag.justZoomed = true;
       }
+    } else if (chart && drag.mode === "y" && dy > DRAG_SLOP) {
+      // Pixels grow downward, so the *top* of the band is the larger value.
+      const vTop = chart.scales["y"]?.getValueForPixel(Math.min(drag.startPy, drag.currentPy));
+      const vBottom = chart.scales["y"]?.getValueForPixel(Math.max(drag.startPy, drag.currentPy));
+      if (vTop !== undefined && vBottom !== undefined && vTop > vBottom) {
+        _posYZoom.value = { ..._posYZoom.value, [chartKey]: { min: vBottom, max: vTop } };
+        drag.justZoomed = true;
+      }
+    } else if (dx <= DRAG_SLOP && dy <= DRAG_SLOP && !e.shiftKey) {
+      // A plain click with no drag: back to the full view.  Both axes, since
+      // the time axis is shared across the charts anyway — resetting only the
+      // one you clicked would leave the others zoomed to a window that is no
+      // longer visible anywhere.
+      resetPosZoom();
     }
     drag.active = false;
   };
@@ -1829,7 +2054,7 @@ function _attachListeners(canvas: HTMLCanvasElement, chartKey: string): () => vo
     renderPeers();
   };
 
-  const onContextmenu = (e: MouseEvent) => { e.preventDefault(); zoomRef.value = null; };
+  const onContextmenu = (e: MouseEvent) => { e.preventDefault(); resetPosZoom(); };
 
   canvas.addEventListener("mousedown",    onMousedown);
   canvas.addEventListener("mousemove",    onMousemove);
@@ -1882,19 +2107,30 @@ function _interactionPlugin(chartKey: string): object {
         }
       }
 
-      // Drag selection box (only on the chart being dragged)
+      // Drag selection band (only on the chart being dragged).  Vertical band
+      // for a shift-drag (time window), horizontal for a plain drag (values),
+      // so the gesture's axis is obvious before you let go.
       if (drag.active && drag.chartKey === chartKey) {
-        const x1 = Math.max(left,  Math.min(drag.startPx, drag.currentPx));
-        const x2 = Math.min(right, Math.max(drag.startPx, drag.currentPx));
-        if (x2 > x1) {
-          ctx.save();
-          ctx.fillStyle   = "rgba(33,150,243,0.12)";
-          ctx.strokeStyle = "rgba(33,150,243,0.7)";
-          ctx.lineWidth = 1;
-          ctx.fillRect(x1, top, x2 - x1, bottom - top);
-          ctx.strokeRect(x1, top, x2 - x1, bottom - top);
-          ctx.restore();
+        ctx.save();
+        ctx.fillStyle   = "rgba(33,150,243,0.12)";
+        ctx.strokeStyle = "rgba(33,150,243,0.7)";
+        ctx.lineWidth = 1;
+        if (drag.mode === "x") {
+          const x1 = Math.max(left,  Math.min(drag.startPx, drag.currentPx));
+          const x2 = Math.min(right, Math.max(drag.startPx, drag.currentPx));
+          if (x2 > x1) {
+            ctx.fillRect(x1, top, x2 - x1, bottom - top);
+            ctx.strokeRect(x1, top, x2 - x1, bottom - top);
+          }
+        } else {
+          const y1 = Math.max(top,    Math.min(drag.startPy, drag.currentPy));
+          const y2 = Math.min(bottom, Math.max(drag.startPy, drag.currentPy));
+          if (y2 > y1) {
+            ctx.fillRect(left, y1, right - left, y2 - y1);
+            ctx.strokeRect(left, y1, right - left, y2 - y1);
+          }
         }
+        ctx.restore();
       }
     },
   };
@@ -1954,6 +2190,21 @@ watch(_posZoom, zoom => {
     c.update("none");
   }
 });
+
+watch(_scatterZoom, () => updateCharts(), { deep: true });
+
+// Per-chart, unlike the shared x zoom: east/north/up (and their
+// common-mode-removed twins) are on unrelated value scales.
+watch(_posYZoom, zooms => {
+  for (const [key, c] of Object.entries(_chart)) {
+    if (!c) continue;
+    const ys = (c.options.scales as any)?.y;
+    if (!ys) continue;
+    const z = zooms[key];
+    if (z) { ys.min = z.min; ys.max = z.max; } else { delete ys.min; delete ys.max; }
+    c.update("none");
+  }
+}, { deep: true });
 
 // ─── Data processing ─────────────────────────────────────────────────────────
 
@@ -2026,6 +2277,7 @@ function _makeScatterChart(key: string, xLabel: string, yLabel: string): Chart |
         }},
       },
     },
+    plugins: [_scatterDragPlugin(key)] as any,
   });
 }
 
@@ -2147,9 +2399,12 @@ function updateCharts() {
     if (pc) { pc.data.datasets = datasets as any; pc.update("none"); }
   }
 
-  // ── Common-mode-removed time-series (optional second set) ───────────────────
+  // ── Common-mode-removed series (optional second set) ─────────────────────────
+  // Processed once and reused by both the time-series charts and the scatter /
+  // histogram pair below.
+  let cmrProcessed: Map<string, Record<"east" | "north" | "up", Processed>> | null = null;
   if (cmrMethod.value !== "none" && cmrResult.value) {
-    const cmrProcessed = new Map<string, Record<"east" | "north" | "up", Processed>>();
+    cmrProcessed = new Map<string, Record<"east" | "north" | "up", Processed>>();
     for (const station of cmrResult.value.stations) {
       cmrProcessed.set(station.geosncl, {
         east:  processComponent(station, "east"),
@@ -2172,8 +2427,29 @@ function updateCharts() {
     }
   }
 
-  // ── Scatter plots ────────────────────────────────────────────────────────────
-  // Global min/max across all components so all scatter axes share the same scale
+  // ── Scatter plots and histograms ─────────────────────────────────────────────
+  // Rendered twice when a common mode is being removed: once for the measured
+  // series and once for the residual.  Removing a common mode is supposed to
+  // tighten the cloud and narrow the distribution, which is only readable with
+  // the two side by side — hence one function, called with each set.
+  _drawScatterAndHistograms(processed, "");
+  if (cmrProcessed) _drawScatterAndHistograms(cmrProcessed, "_cmr");
+}
+
+/**
+ * Draw the three scatter panels and three histograms for one set of processed
+ * traces.  *suffix* keys the chart registries, so "" is the measured series and
+ * "_cmr" its common-mode-removed twin; the two never share a chart instance.
+ *
+ * Axis ranges are computed per set rather than shared: the residual is by
+ * construction much tighter than the input, and forcing both onto the measured
+ * data's range would collapse the residual to a dot.
+ */
+function _drawScatterAndHistograms(
+  processed: Map<string, Record<"east" | "north" | "up", Processed>>,
+  suffix: string,
+) {
+  // Global min/max across all components so all scatter axes share one scale
   let gMin = Infinity, gMax = -Infinity;
   for (const comps of processed.values())
     for (const c of ["east", "north", "up"] as const)
@@ -2183,8 +2459,9 @@ function updateCharts() {
   const scatterMax = isFinite(gMax) ? gMax + scatterPad : undefined;
 
   for (const def of SCATTER_DEFS) {
-    if (!_scatterChart[def.key])
-      _scatterChart[def.key] = _makeScatterChart(def.key, def.xLabel, def.yLabel);
+    const key = def.key + suffix;
+    if (!_scatterChart[key])
+      _scatterChart[key] = _makeScatterChart(key, def.xLabel, def.yLabel);
     const datasets: object[] = [];
     for (const [geosncl, comps] of processed) {
       const color = _colorFor(geosncl);
@@ -2199,33 +2476,37 @@ function updateCharts() {
       datasets.push({ label: geosncl, data: pts, borderColor: color, backgroundColor: color + "66",
                       pointRadius: 2, pointHoverRadius: 4 });
     }
-    const sc = _scatterChart[def.key];
+    const sc = _scatterChart[key];
     if (sc) {
       sc.data.datasets = datasets as any;
+      // A zoom, once set, has to survive every later updateCharts() — otherwise
+      // the next redraw (a stream toggled, the mean removed) silently snaps the
+      // panel back to the full range.
+      const z = _scatterZoom.value[key];
       const sx = (sc.options.scales as any)?.x, sy = (sc.options.scales as any)?.y;
-      if (sx) { sx.min = scatterMin; sx.max = scatterMax; }
-      if (sy) { sy.min = scatterMin; sy.max = scatterMax; }
+      if (sx) { sx.min = z ? z.xMin : scatterMin; sx.max = z ? z.xMax : scatterMax; }
+      if (sy) { sy.min = z ? z.yMin : scatterMin; sy.max = z ? z.yMax : scatterMax; }
       sc.update("none");
     }
   }
 
-  // ── Histograms ───────────────────────────────────────────────────────────────
   for (const def of HIST_DEFS) {
-    if (!_histChart[def.key]) _histChart[def.key] = _makeHistChart(def.key, def.label);
+    const key = def.key + suffix;
+    if (!_histChart[key]) _histChart[key] = _makeHistChart(key, def.label);
 
-    // Compute combined mean & std (used by the afterDraw plugin)
+    // Combined mean & std, drawn by the afterDraw plugin
     const allFlat = [...processed.values()].flatMap(comps => comps[def.comp].specVals);
     if (allFlat.length) {
       const mean = allFlat.reduce((s, v) => s + v, 0) / allFlat.length;
       const std  = Math.sqrt(allFlat.reduce((s, v) => s + (v - mean) ** 2, 0) / Math.max(1, allFlat.length - 1));
-      _histStats[def.key] = { mean, std };
+      _histStats[key] = { mean, std };
     } else {
-      _histStats[def.key] = null;
+      _histStats[key] = null;
     }
 
     const allVals = [...processed.values()].map(comps => comps[def.comp].specVals);
     const { labels, counts } = _histBins(allVals, 30);
-    const hc = _histChart[def.key];
+    const hc = _histChart[key];
     if (!hc) continue;
     hc.data.labels = labels;
     const geosncls = [...processed.keys()];

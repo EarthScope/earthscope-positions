@@ -337,8 +337,108 @@ export function openExportStream(
 
 // ─── Server config ─────────────────────────────────────────────────────────────
 
-export async function getServerConfig(): Promise<{ base_url: string; hostname: string; port: number }> {
-  const r = await http.get<{ base_url: string; hostname: string; port: number }>("/config");
+export interface ServerConfig {
+  base_url: string;
+  hostname: string;
+  port: number;
+  /** Deployment this server pulls from: "prod" | "stage". */
+  environment: string;
+  environment_label: string;
+  /**
+   * Whether the UI should announce the environment.  The server decides, not
+   * the client — production is the unremarkable case and stays unlabelled.
+   */
+  environment_badge: boolean;
+  api_url: string;
+  es_profile: string;
+}
+
+export async function getServerConfig(): Promise<ServerConfig> {
+  const r = await http.get<ServerConfig>("/config");
+  return r.data;
+}
+
+// ─── Completeness precache ────────────────────────────────────────────────────
+
+export interface PrecacheEvent {
+  type: "start" | "streams" | "progress" | "error" | "done";
+  total?: number;
+  done?: number;
+  generated?: number;
+  failed?: number;
+  count?: number;
+  name?: string;
+  msg?: string;
+  code?: number;
+}
+
+/**
+ * Build every completeness file the given selection needs, up front.
+ *
+ * Same selection the heatmap uses, but across every page — the point is to pay
+ * the build cost once instead of on each page you happen to open.
+ * Returns an abort function.
+ */
+export function openPrecacheStream(
+  body: {
+    lists?: string[];
+    geosncls?: string[];
+    filter_centers?: string[];
+    filter_sol_types?: string[];
+    search?: string;
+    start: string;
+    end: string;
+  },
+  onEvent: (e: PrecacheEvent) => void,
+): () => void {
+  const controller = new AbortController();
+
+  (async () => {
+    try {
+      const resp = await fetch("/api/completeness/precache", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+      if (!resp.body) throw new Error("No response body");
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const parts = buf.split("\n\n");
+        buf = parts.pop() ?? "";
+        for (const part of parts) {
+          const line = part.split("\n").find((l) => l.startsWith("data: "));
+          if (line) onEvent(JSON.parse(line.slice(6)) as PrecacheEvent);
+        }
+      }
+    } catch (err) {
+      if ((err as Error).name === "AbortError") return;
+      onEvent({ type: "error", msg: String(err) });
+      onEvent({ type: "done", code: 1 });
+    }
+  })();
+
+  return () => controller.abort();
+}
+
+/**
+ * Source .arrow file backing one heatmap cell, as a File Explorer path.
+ * Resolved on click rather than shipped with every bucket — a page carries
+ * thousands of cells and almost none are clicked.
+ */
+export async function locateArrowFile(
+  geosncl: string,
+  startMs: number,
+  endMs: number,
+): Promise<{ path: string; name: string }> {
+  const r = await http.get<{ path: string; name: string }>("/files/locate", {
+    params: { geosncl, start_ms: startMs, end_ms: endMs },
+  });
   return r.data;
 }
 

@@ -13,6 +13,14 @@ export interface BucketData {
   completeness: number | null;
   meanIngestLatencyS: number | null;
   meanProcessingDelayS: number | null;
+  /**
+   * Times the stream resumed after a gap inside this bin. `null` means the
+   * completeness files backing it predate gap tracking, which is NOT the same
+   * as zero outages — render it as "not computed", never as a clean bin.
+   */
+  restartCount: number | null;
+  /** Longest gap ending in this bin, in seconds. */
+  maxGapS: number | null;
   state: BucketState;
 }
 
@@ -26,6 +34,18 @@ export interface CompletenessResponse {
   binMinutes: number;
   bucketStarts: number[];
   stations: StationCompleteness[];
+  /**
+   * Gap threshold the restart counts were computed with, in seconds — read from
+   * the completeness files rather than assumed, since a tree generated with an
+   * explicit --gap-seconds keeps its own. `null` if none recorded one.
+   */
+  gapSeconds: number | null;
+  /**
+   * Source files on this page that could not be summarised at all (normally a
+   * truncated download). Their cells would otherwise read as a plain absence
+   * of data, so the page says so explicitly.
+   */
+  damaged: { count: number; files: { name: string; error: string }[] };
   total: number;
   page: number;
   pageSize: number;

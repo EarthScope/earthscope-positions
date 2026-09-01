@@ -25,7 +25,7 @@ from typing import Optional, get_args
 
 import orjson
 
-from earthscope_positions import paths
+from earthscope_positions import environment, paths
 from earthscope_sdk import EarthScopeClient
 from earthscope_sdk.client.discovery.models import (
     ProcessingFacility,
@@ -33,8 +33,17 @@ from earthscope_sdk.client.discovery.models import (
     StreamType,
 )
 
-# Base host for the one endpoint the SDK doesn't cover (radial search).
-_API_HOST = "https://api.earthscope.org"
+
+def _api_host() -> str:
+    """Base host for the one endpoint the SDK doesn't cover (radial search).
+
+    Read per call from the active environment rather than fixed at import, so
+    the direct REST call lands on the same deployment as every SDK call beside
+    it — a constant here was the one place stage traffic could leak back to
+    production.
+    """
+    return environment.api_url().rstrip("/")
+
 
 # The SDK discovery calls auto-paginate up to `limit`; use a high cap for "all".
 _MAX_RESULTS = 1_000_000
@@ -55,7 +64,8 @@ def _discover():
     """Return the SDK discovery service, creating the shared client on first use."""
     global _client
     if _client is None:
-        _client = EarthScopeClient()
+        from earthscope_positions.fetch.positions_fetch import sdk_settings
+        _client = EarthScopeClient(settings=sdk_settings())
     return _client.discover
 
 
@@ -598,7 +608,7 @@ def _get_radial(args) -> list[dict]:
     if args.facility:
         params["facility"] = args.facility
 
-    url = f"{_API_HOST}/beta/discover/gnss/radial"
+    url = f"{_api_host()}/beta/discover/gnss/radial"
     try:
         resp = requests.get(
             url,

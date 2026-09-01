@@ -39,6 +39,12 @@ Every data sub-directory (``arrow/``, ``stream-lists/``, ``station-lists/``,
 ``plots/``, ``positions_diagnose/``, ``resources/``) derives from the base —
 including the Arrow data root, which is always ``<base>/arrow``.
 
+One more sub-directory is *not* data: ``.config/`` records which EarthScope
+deployment the tree was filled from (production or stage).  That lives with
+the data rather than in the home-directory config file because the two
+deployments issue different EDIDs, so it is a property of the tree, not of the
+install — see :mod:`earthscope_positions.environment`.
+
 ``resources/`` holds user-editable copies of bundled files — coordinates.csv
 and the GeoJSON/MiniSEED export path-spec TOMLs — seeded from the package's
 own ``resources/`` dir on first use (see :func:`ensure_resource`).

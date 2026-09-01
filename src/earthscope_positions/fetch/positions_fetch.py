@@ -37,21 +37,16 @@ import pyarrow.compute as pc
 import pyarrow.ipc as ipc
 from earthscope_sdk import AsyncEarthScopeClient
 from earthscope_sdk.auth.error import UnauthenticatedError, UnauthorizedError
+from earthscope_sdk.config.error import ProfileDoesNotExistError
 from earthscope_sdk.config.models import Tokens
+from earthscope_sdk.config.settings import SdkSettings
 
-from earthscope_positions import paths
+from earthscope_positions import environment, paths
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-# ES_PROFILE selects the named profile — same env var the earthscope-sdk
-# itself reads (via SdkSettings.profile_name) to pick which profile's tokens
-# AsyncEarthScopeClient uses, so this stays consistent with it rather than
-# always reading the "default" profile regardless of what's actually active.
-_TOKENS_PATH = (
-    pathlib.Path.home() / ".earthscope" / os.environ.get("ES_PROFILE", "default") / "tokens.json"
-)
 _REFRESH_MARGIN = 60  # seconds before expiry to trigger refresh
 
 _LOCK_TTL = 120  # lock expiry in seconds (2 minutes)
@@ -81,8 +76,36 @@ def _data_root() -> pathlib.Path:
 # ---------------------------------------------------------------------------
 
 
+def sdk_settings() -> SdkSettings:
+    """SDK settings pinned to the active environment (see
+    :mod:`earthscope_positions.environment`).
+
+    Both halves matter and have to move together: ``profile_name`` picks which
+    token cache is read, ``resources.api_url`` picks which deployment is
+    called.  Setting only one of them authenticates against prod and queries
+    stage (or the reverse), which fails as a 401 that looks like a login
+    problem rather than a configuration one.
+
+    Anything else about the profile — the OAuth domain and audience a stage
+    login needs — comes from the profile's own entry in
+    ``~/.earthscope/config.toml``, which is where the ``es`` CLI already keeps
+    it; duplicating it here would give it two sources of truth.
+    """
+    env = environment.current()
+    try:
+        return SdkSettings(
+            profile_name=environment.profile(),
+            resources={"api_url": env.api_url},
+        )
+    except ProfileDoesNotExistError:
+        # The SDK's own message is just "Profile 'x' does not exist" — it does
+        # not say where profiles live or that this install may already have a
+        # working one under another name, which is the actual next step.
+        sys.exit(environment.profile_setup_hint())
+
+
 def _make_client() -> AsyncEarthScopeClient:
-    """Create a new EarthScope SDK async client.
+    """Create a new EarthScope SDK async client for the active environment.
 
     The SDK handles credentials end to end — reading the local token cache,
     refreshing before expiry, and retrying transient (429/5xx) failures — so
@@ -91,15 +114,40 @@ def _make_client() -> AsyncEarthScopeClient:
     the constructor directly at each call site) so tests can substitute a
     fake client via monkeypatch.
     """
-    return AsyncEarthScopeClient()
+    return AsyncEarthScopeClient(settings=sdk_settings())
+
+
+def _tokens_path() -> pathlib.Path:
+    """Token cache for the active environment's profile.
+
+    Resolved per call rather than at import: the profile follows the data
+    directory now, and a module-level constant would freeze whichever one
+    happened to be active when this module was first imported.
+    """
+    return pathlib.Path.home() / ".earthscope" / environment.profile() / "tokens.json"
 
 
 def _read_tokens() -> Tokens:
     try:
-        raw = _TOKENS_PATH.read_bytes()
+        raw = _tokens_path().read_bytes()
     except FileNotFoundError:
-        sys.exit("No credentials found. Please authenticate: es user login")
+        sys.exit(
+            f"No credentials found for the {environment.label()} environment "
+            f"(profile '{environment.profile()}').\n"
+            f"Please authenticate: {login_command()}"
+        )
     return Tokens.model_validate_json(raw)
+
+
+def login_command() -> str:
+    """The exact ``es user login`` invocation for the active environment.
+
+    Every "you are not logged in" message routes through this rather than
+    hard-coding ``es user login``: told the bare command while a stage
+    directory is active, you log into prod and get the same error again.
+    """
+    prof = environment.profile()
+    return "es user login" if prof == "default" else f"es user login --profile {prof}"
 
 
 def _ensure_token() -> str:
@@ -117,13 +165,23 @@ def _ensure_token() -> str:
         body = None
     if body is not None and body.ttl.total_seconds() > _REFRESH_MARGIN:
         return tokens.access_token.get_secret_value()
+    # ES_PROFILE rather than a --profile flag: it is the alias SdkSettings
+    # validates `profile_name` from, so it steers the CLI's own settings chain
+    # the same way it steers ours, and does not depend on which subcommands
+    # happen to expose the flag.
     result = subprocess.run(
         ["es", "user", "refresh-access-token"],
         capture_output=True,
         text=True,
+        env={**os.environ, environment.PROFILE_ENV_VAR: environment.profile()},
     )
     if result.returncode != 0:
-        sys.exit(f"Token refresh failed:\n  {result.stderr.strip()}")
+        sys.exit(
+            f"Token refresh failed for the {environment.label()} environment "
+            f"(profile '{environment.profile()}'):\n"
+            f"  {result.stderr.strip()}\n"
+            f"  Log in with: {login_command()}"
+        )
     return _read_tokens().access_token.get_secret_value()
 
 
@@ -429,7 +487,10 @@ async def _fetch_one_day(
         # Refresh itself failed (e.g. refresh token expired) — every other
         # request this run would fail identically, so stop the whole process
         # with a clear, actionable message rather than burning through it.
-        sys.exit(f"Authentication failed ({exc}). Please run: es user login")
+        sys.exit(
+            f"Authentication failed against {environment.label()} ({exc}). "
+            f"Please run: {login_command()}"
+        )
     except httpx.HTTPStatusError as exc:
         status = exc.response.status_code
         if status == 404:

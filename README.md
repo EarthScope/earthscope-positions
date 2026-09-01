@@ -106,6 +106,9 @@ es-pos config set-data-dir /mnt/gnss          # record a new location
 es-pos config move-data-dir /Volumes/BigDisk  # move the tree there, then record it
 ```
 
+Each data directory is also tied to one EarthScope deployment — production or stage. See
+[Production and stage](#production-and-stage).
+
 The Overview tab of the web UI shows the same information read-only. Switching is a
 command-line operation: the server resolves its data directory once at startup, so change
 it with `es-pos config` and restart `es-pos webserver`.
@@ -121,10 +124,95 @@ Inside the base directory:
 <data-dir>/geojson/               # `es-pos export geojson` output (per the path spec)
 <data-dir>/resources/             # editable coordinates.csv + export path-spec TOMLs
 <data-dir>/positions_errors.jsonl # fetch API error log
+<data-dir>/.config/               # which deployment this tree pulls from (not data)
 ```
 
 For CI, cron, and Docker, `ES_POS_DATA_DIRECTORY` overrides the configured location for a
 single invocation. Full precedence rules are under [Data directory](#data-directory).
+
+---
+
+## Production and stage
+
+EarthScope runs two deployments, and **a data directory belongs to exactly one of them**:
+
+| | Production (default) | Stage |
+|---|---|---|
+| API | `https://api.earthscope.org` | `https://api.dev.earthscope.org` |
+| `es` profile | `default` | `stage` |
+| Marked by | nothing — this is the default | `<data-dir>/.config/environment.json` |
+| Web UI | no badge | amber **STAGE** badge beside the help button |
+
+They are not interchangeable. **The same physical station has a different EDID in each**,
+so a stream list built against one is meaningless against the other, and a tree holding
+both would contain the same station twice under unrelated identifiers with no way to tell
+them apart. That is why the environment is a property of the *directory* rather than a
+flag on each command.
+
+### Putting a directory on stage
+
+One command can do it, and it is the only one:
+
+```bash
+es-pos config use-data-dir --stage ~/earthscope-positions-stage
+```
+
+That writes `<data-dir>/.config/environment.json` and makes the directory active. It is
+**refused** for a directory that already holds data (anything under `arrow/`,
+`stream-lists/` or `station-lists/`) — use a separate directory instead. `--force`
+overrides the refusal if you genuinely need it.
+
+`--prod` switches a directory back the same way. Plain `es-pos config use-data-dir` never
+changes a directory's environment, so switching between a prod tree and a stage tree is
+just switching directories:
+
+```bash
+es-pos config list-data-dirs     # stage entries are tagged [Stage]
+es-pos config use-data-dir 2     # keeps whatever environment #2 already has
+```
+
+Every `es-pos config` subcommand reports which environment it is talking about.
+
+### Credentials
+
+Stage needs its own tokens, from an `es` profile pointed at the dev deployment. Add one to
+`~/.earthscope/config.toml`:
+
+```toml
+[profile.stage]
+resources.api_url = "https://api.dev.earthscope.org"
+oauth2.audience   = "https://api.dev.earthscope.org"
+oauth2.domain     = "https://login-dev.earthscope.org"
+oauth2.client_id  = "<the dev client id>"
+```
+
+then log in once:
+
+```bash
+es user login --profile stage
+```
+
+If your dev credentials already live under a differently-named profile, point the
+directory at that one instead of duplicating the entry:
+
+```bash
+es-pos config use-data-dir --stage --profile dev ~/earthscope-positions-stage
+```
+
+`es-pos config show` tells you if the profile a directory needs is not defined yet, and
+names the profiles that are.
+
+### What follows the directory
+
+Everything: the API host for both the SDK calls and the direct REST radial search, the
+token cache the fetch path reads, the profile `es-pos test fetch` probes with, the
+subprocesses the web server spawns, and the badge in the web UI. There is no per-command
+override — `ES_PROFILE` overrides just the profile if you need it, and
+`ES_POS_ENVIRONMENT` exists for the web server to pin its children, not as a user-facing
+switch.
+
+Stage has no unauthenticated positions endpoint, so `es-pos test fetch` sweeps only the
+authenticated one there (production probes both).
 
 ---
 
@@ -349,6 +437,7 @@ but pre-computing them speeds up the **Completeness & Latency** tab significantl
 ```bash
 es-pos process completeness
 es-pos process completeness --overwrite                    # regenerate even if files exist
+es-pos process completeness --gap-seconds 10 --overwrite   # only longer outages count
 ```
 
 Each Arrow file gets a sibling `.completeness.arrow` with 96 rows (one per 15-min bin):
@@ -361,8 +450,70 @@ Each Arrow file gets a sibling `.completeness.arrow` with 96 rows (one per 15-mi
 | `completeness`             | `row_count / expected_count` (capped at 1.0) |
 | `mean_ingest_latency_s`    | Mean ingest latency in seconds               |
 | `mean_processing_delay_s`  | Mean processing delay in seconds             |
+| `restart_count`            | Gaps the stream resumed from inside this bin |
+| `max_gap_s`                | Longest of those gaps, in seconds            |
 
-Results power the **Completeness & Latency** tab heat map in the web UI.
+Results power the **Completeness & Latency** tab's three heat maps in the web UI.
+
+Completeness files written before restart tracking existed lack the last two columns.
+They are regenerated automatically — by `es-pos process completeness` and by the web
+server as it serves them — because reading them as-is would make the restart metric look
+like a uniform zero, which is indistinguishable from a stream with no outages.
+
+#### Gaps, restarts and continuous blocks
+
+A **gap** is an interval between consecutive samples longer than `--gap-seconds`
+(default **2 s**). A **restart** is the stream resuming after one, so restarts = gaps and
+**continuous blocks = restarts + 1**.
+
+The threshold is 2 s rather than "any missing sample" because at 1 Hz a single dropped
+epoch produces a 2.000 s interval and is ordinary — about **0.4% of all intervals** in
+real data, working out to a mean of ~274 per station-day. Counting those as outages would
+swamp the signal and duplicate what `completeness` already reports. Intervals of two or
+more consecutive missing epochs run ~19 per station-day, which is what the default
+counts. Lower `--gap-seconds` to include single drops, raise it for sustained outages
+only:
+
+| gap longer than | median/station-day | mean/station-day |
+|---|---|---|
+| 1 s (any dropped epoch) | 9 | 274 |
+| **2 s (default)** | **4.5** | **18.6** |
+| 10 s | 1 | 5.5 |
+| 60 s | 0 | 2.0 |
+
+Each gap is attributed to the bin holding the sample that **resumed** the stream, not the
+one where it stopped. A multi-bin outage is therefore counted once, in the bin where data
+came back, and the bins it spans show as empty in `completeness` — which is what they
+are. It also means restart counts stay correct when the heat map aggregates 15-minute
+bins into coarser ones.
+
+A completeness file only sees its own source file (one UTC day), so an outage spanning
+midnight leaves no interior gap in either day: the first just ends early and the second
+just starts late. A file that **starts late** relative to the window in its filename
+therefore counts one restart at its first sample. That late start does not split the
+samples it does have into an extra block, so restarts can be one more than blocks − 1.
+
+The threshold each file was built with is stored inside it, so generating with a
+non-default `--gap-seconds` is not silently undone by a later run (or by the web server)
+using the default. The Restarts plot is labelled with the threshold the data carries, and
+the File Explorer's per-file summary uses the same threshold the sibling completeness file
+recorded, so the two views never disagree.
+
+#### Precomputing
+
+Completeness files are built on demand as pages are viewed. That is fine for a handful of
+streams, but on a large tree each new page or date range pays to build whatever it
+touches, which is what makes browsing feel slow. The Completeness tab's **Precompute**
+button builds everything the current list, filters and date range need — across every
+page, not just the one on screen — with a progress bar. Measured on a real tree, a page of
+50 streams over 24 days went from **1.27 s to 0.05 s** once precomputed.
+
+`es-pos process completeness` does the same thing for the whole data directory from the
+command line.
+
+Files that cannot be read at all (normally a truncated download) are reported rather than
+failing the request: the Completeness tab shows a banner naming them, and the precache
+dialog lists them. Re-fetch with `es-pos fetch --list <name> --redownload`.
 
 ### `es-pos webserver`
 
@@ -390,10 +541,10 @@ The web UI has these tabs:
 |-----|-------------|
 | **Station Builder** | Interactive map of all stations in `<data-directory>/resources/coordinates.csv` (see [Data directory](#data-directory)). Click or rectangle-drag to select stations; filter by processing center and solution type; **Prune** deselects stations with no matching stream; **All Streams → List** saves every `gnss_ppp` stream; **Add Network Stations** adds every station in a chosen `RTDB:*`/`SHAKE:*` network to the selection **and saves them as a station list named after the network** — if that list already exists it is loaded from disk rather than re-queried, so hand-edits survive (**Re-query network** refetches and overwrites); save selections as station lists. |
 | **Fetch Data** | Guided three-step walkthrough (choose lists → date range & filters → fetch) that downloads only the missing `(geosncl, day)` pairs with a live progress bar and log. Only one fetch runs at a time; the job keeps running when you switch tabs. |
-| **Completeness & Latency** | Heat-map of data completeness and ingest latency per station per day. Completeness is generated on-demand if not pre-computed. Includes a Fetch button that runs `es-pos fetch` for the selected list/range. |
-| **Positions** | Interactive ENU time-series plots with power spectra (linear-frequency axis, down to 5-minute noise). Select stations from a saved list, set a date range, overlay multiple stations. |
+| **Completeness & Latency** | Three heat-maps per station per time bin — completeness, ingest latency, and **restarts** (times the stream came back after a gap; see [Gaps, restarts and continuous blocks](#gaps-restarts-and-continuous-blocks)). Completeness is generated on-demand if not pre-computed; **Precompute** builds it for the whole list/filter/date selection up front so paging through is instant. Clicking a cell opens that stream-day's Arrow file in the File Explorer. Includes a Fetch button that runs `es-pos fetch` for the selected list/range. |
+| **Positions** | Interactive ENU time-series plots with power spectra (linear-frequency axis, down to 5-minute noise). Select stations from a saved list, set a date range, overlay multiple stations. **Zoom:** drag on a time-series plot to zoom its value axis, Shift+drag to zoom the shared time axis, click to reset both; Shift+drag a box on a scatter panel to zoom it, click to reset. With PCA/KLE common-mode removal on, the scatter panels and histograms are drawn a second time for the residual, so you can see whether the cloud actually tightened. |
 | **Export** | Convert downloaded Arrow position data into MiniSEED or GeoJSON. Pick the format, the **MiniSEED version** (3 by default, or 2), stream list(s) and a date range. The path-spec TOML controlling output directory structure and filenames is editable in-page (**Save spec**, then **Convert** with overwrite to regenerate under the new layout). |
-| **File Explorer** | File browser rooted at the **data directory** — the Arrow tree, stream/station lists, exports and plots in one place. Selecting a file shows a type-aware summary: `.arrow` (a time-series plot of every numeric column, plus rows, columns, time span, schema; `.completeness` arrays plot per-bucket completeness and latency, and `_ppsd` arrays render the three-panel PPSD), MiniSEED (a waveform plot, plus records, channels, format, encoding), GeoJSON (a time-series plot, features, stations, lat/lon bounds, first 25 lines), `.jsonl` (stream vs station list, entry counts, first lines); images render inline. Text files can be edited in place (JSONL validated line-by-line), and any file renamed or deleted. |
+| **File Explorer** | File browser rooted at the **data directory** — the Arrow tree, stream/station lists, exports and plots in one place. Selecting a file shows a type-aware summary: `.arrow` (a time-series plot of every numeric column, plus rows, columns, time span, schema, and **continuity** — continuous blocks, restarts, longest gap, total time in gaps, and a table of every block with its start, end, duration and sample count; see [Gaps, restarts and continuous blocks](#gaps-restarts-and-continuous-blocks). **Each continuous block is plotted in its own colour with a red marker at every restart**, so a break is visible even across a full-day axis. `.completeness` arrays plot per-bucket completeness, latency and restarts, and summarise the stored restart totals; `_ppsd` arrays render the three-panel PPSD. Files whose whole preview is one picture — stored images and `_ppsd` arrays — get a **checkbox** in the tree; tick several to see them stacked in one pane for comparison, and click any other file to untick them all), MiniSEED (a waveform plot, plus records, channels, format, encoding), GeoJSON (a time-series plot, features, stations, lat/lon bounds, first 25 lines), `.jsonl` (stream vs station list, entry counts, first lines); images render inline. Text files can be edited in place (JSONL validated line-by-line), and any file renamed or deleted. |
 | **Replay** | Configure and run a Kafka replay from the browser. Shows preload summary, a live status log, and a **delivery check** (a consumer reads the topic back from the latest offset, reporting messages written vs. read, one-for-one matches, mean added round-trip latency, and a warning/error if echoes lag ≥ 2 s / 5 s). State persists server-side — closing and reopening the browser reconnects to the same replay. |
 
 ### `es-pos export miniseed`
@@ -613,6 +764,9 @@ Only one replay can be in progress at a time (a new Preload while one is running
 
 Diagnostic tools for the EarthScope positions API. Requires EarthScope VPN for the authenticated endpoint.
 
+Both endpoints follow the active data directory's environment. Stage publishes no
+unauthenticated endpoint, so a stage run sweeps the authenticated one alone.
+
 ```bash
 # Concurrency sweep against both API endpoints
 es-pos test fetch -i ShakeAlert.clean --start 2026-01-01 --total-duration 25200
@@ -623,7 +777,8 @@ es-pos test plot data/positions_diagnose/diagnose_20260701T000000Z.jsonl
 
 ### `es-pos config`
 
-Show or change the persisted data-directory setting.
+Show or change the persisted data-directory setting, and which EarthScope deployment each
+directory pulls from.
 
 ```bash
 es-pos config show                                # where is my data, and what set it?
@@ -633,19 +788,32 @@ es-pos config use-data-dir /mnt/gnss/positions    # …or by path
 es-pos config set-data-dir /mnt/gnss/positions    # record a location (does not move data)
 es-pos config move-data-dir /Volumes/BigDisk/pos  # move the tree there, then record it
 es-pos config forget-data-dir 3                   # drop from the list; data untouched
+
+# Point a directory at the stage deployment (api.dev.earthscope.org).
+es-pos config use-data-dir --stage ~/earthscope-positions-stage
+es-pos config use-data-dir --stage --profile dev ~/es-pos-stage   # use an existing profile
+es-pos config use-data-dir --prod  ~/earthscope-positions         # …and back again
 ```
 
 `show` reports the resolved directory, **which layer decided it**, how much is in it, the
-config file path, the remembered list, and a note if `ES_POS_DATA_DIRECTORY` disagrees
-with the configured value.
+environment (production or stage) with its API host and `es` profile, the config file
+path, the remembered list, and a note if `ES_POS_DATA_DIRECTORY` disagrees with the
+configured value.
 
 `list-data-dirs` numbers every directory this install has used, marks the active one with
-`*`, and shows each one's size (or `(missing)` if it has been deleted or moved outside the
-tool). The numbers come from the config file's stored order and do **not** shuffle when
+`*`, tags any non-production one with its environment (`[Stage]`), and shows each one's
+size (or `(missing)` if it has been deleted or moved outside the tool). The numbers come from the config file's stored order and do **not** shuffle when
 you switch, so a number you read stays valid.
 
 `use-data-dir` switches the active directory, taking either a number from the listing or a
 path. A path that has not been seen before is remembered too. No data is moved.
+
+It is also the **only** command that can change a directory's environment, via `--stage`
+or `--prod`; without one of those the directory keeps whatever it already has. Changing
+the environment of a directory that already holds data is refused (prod and stage EDIDs
+differ, so the two cannot share a tree) unless you pass `--force`. `--profile NAME`
+records which `es` profile that directory's tokens come from, for when yours are not under
+the default name. See [Production and stage](#production-and-stage).
 
 `set-data-dir` records a location and creates the directory (pass `--no-create` to skip),
 but never moves existing data. Use `move-data-dir` for that — it relocates the tree and
@@ -889,6 +1057,37 @@ The Arrow root is always `<data-directory>/arrow`; every sub-directory
 (`arrow/`, `stream-lists/`, `station-lists/`, `plots/`, `resources/`, …) derives from
 the single resolved base.
 
+### Environment marker (`<data-directory>/.config/environment.json`)
+
+Which EarthScope deployment the tree pulls from. Absent means production. Written only by
+`es-pos config use-data-dir --stage` / `--prod` — see
+[Production and stage](#production-and-stage) — and hidden from the File Explorer, since
+hand-editing it would route around the guard that keeps prod and stage data apart.
+
+```json
+{
+  "environment": "stage",
+  "profile": "stage",
+  "api_url": "https://api.dev.earthscope.org",
+  "written_at": "2026-08-31T18:22:04Z",
+  "written_by": "es-pos config use-data-dir"
+}
+```
+
+It lives with the data rather than in `~/.earthscope-positions.json` because the two
+deployments issue different EDIDs: it is a property of the tree, not of the install, and
+it has to survive `move-data-dir` (it does — it rides along inside the moved directory).
+
+Resolution order, first that applies:
+
+1. the `ES_POS_ENVIRONMENT` environment variable — for the web server to pin its child
+   processes, not a user-facing switch
+2. `environment` in this file
+3. `prod`
+
+The `es` profile follows from the environment, unless `profile` here or the `ES_PROFILE`
+environment variable names a different one.
+
 ### Config file (`~/.earthscope-positions.json`)
 
 Holds settings that persist between runs — the active data directory and the ones used
@@ -945,6 +1144,7 @@ earthscope-positions/
 │   ├── es_pos.py              # Unified CLI entry point (es-pos)
 │   ├── arrow_inspect.py       # es-pos inspect subcommand
 │   ├── paths.py               # Data-directory resolution + config file
+│   ├── environment.py         # production vs stage, per data directory
 │   ├── coordinates.py         # Station coordinate lookup class
 │   ├── stations/
 │   │   └── station_list.py    # es-pos lists subcommands
@@ -1018,6 +1218,11 @@ es user login
 Tokens are cached at `~/.earthscope/default/tokens.json` and refreshed automatically.
 The `es-pos test fetch` command also requires EarthScope VPN connectivity.
 
+A data directory on **stage** uses a different `es` profile — `stage` by default — so its
+tokens live at `~/.earthscope/stage/tokens.json` and are obtained with
+`es user login --profile stage`. Every "not logged in" message names the right command for
+whichever environment is active. See [Production and stage](#production-and-stage).
+
 
 ---
 
@@ -1078,8 +1283,24 @@ the URL/code); it doesn't start the web server. Container name:
 `login` takes `--earthscope-dir PATH` (default `~/.earthscope` — point this at
 an empty directory for a genuinely fresh login) and `--profile NAME` (default
 `"default"`, the profile `es user login` uses with no `--profile` given).
-Pass the same `--profile` to `run` afterward so the web server reads that
-profile's tokens instead of `"default"`.
+`--stage` is shorthand for `--profile stage`.
+
+You do **not** need to pass `--profile` to `run` or `cli` afterward: the profile
+follows the mounted data directory's environment, so a directory marked with
+`es-pos config use-data-dir --stage` resolves to the `stage` profile on its own.
+Pass `--profile` only to override that — see
+[Production and stage](#production-and-stage).
+
+To run the container against stage, mark the host directory first and log into
+the matching profile:
+
+```bash
+es-pos config use-data-dir --stage ~/earthscope-positions-stage
+./es-pos-docker.sh login --stage
+./es-pos-docker.sh run --data-dir ~/earthscope-positions-stage
+```
+
+The web UI then shows the amber **STAGE** badge in the nav bar.
 
 ### `run` options
 
@@ -1087,7 +1308,7 @@ profile's tokens instead of `"default"`.
 | --- | --- | --- |
 | `--data-dir PATH` | *(resolved — env var, then `~/.earthscope-positions.json`, then `~/earthscope-positions`)* | Host directory mounted at `/data` |
 | `--earthscope-dir PATH` | `~/.earthscope` | Host directory mounted at `/root/.earthscope` |
-| `--profile NAME` | `default` | Named profile to read credentials from (must match what `login` used) |
+| `--profile NAME` | *(from the data directory's environment: `default` for production, `stage` for a stage directory)* | Named profile to read credentials from. Pass it only to override the directory's own choice |
 | `--port N` | `8000` | Port published on the host and inside the container |
 | `--hostname NAME` | `localhost` | Hostname shown in UI callback URLs (e.g. the Replay curl commands) |
 | `--image TAG` | `earthscope-positions:latest` | Image to run |
@@ -1121,6 +1342,12 @@ Examples:
 # Fresh login under a named profile, then run against that same profile
 ./es-pos-docker.sh login --earthscope-dir ./es-creds --profile dev
 ./es-pos-docker.sh run --earthscope-dir ./es-creds --profile dev
+
+# Run against the stage deployment (the data directory carries the environment,
+# so `run` needs no --profile)
+es-pos config use-data-dir --stage ~/earthscope-positions-stage
+./es-pos-docker.sh login --stage
+./es-pos-docker.sh run --data-dir ~/earthscope-positions-stage
 
 # Custom data location and port
 ./es-pos-docker.sh run --data-dir /mnt/es-data --port 9000

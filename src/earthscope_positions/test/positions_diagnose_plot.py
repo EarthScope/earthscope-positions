@@ -62,9 +62,12 @@ _STATUS_LABEL = {
     0:   "exception",
 }
 _EP_COLOR = {"auth": "#2980b9", "open": "#e67e22"}
+# Environment-neutral: a run's actual hostnames vary with the environment it
+# swept (production vs stage), and the JSONL's _meta line records them.  Baking
+# production's hosts into the legend mislabelled every stage plot.
 _EP_NAME = {
-    "auth": "api.earthscope.org (auth)",
-    "open": "gnss-observations-api.prod (open)",
+    "auth": "authenticated API",
+    "open": "open API",
 }
 
 
@@ -559,11 +562,18 @@ def _dispatch(args: argparse.Namespace) -> None:
     phase_s = meta.get("phase_duration_s")
 
     print(f"  {n_req:,} requests  |  {n_ep} endpoints  |  workers {worker_range}  |  run: {run_ts}")
+    env_name = meta.get("environment")
+    if env_name:
+        print(f"  environment: {env_name}")
+    for key, label in (("endpoint_auth", "auth"), ("endpoint_open", "open")):
+        if meta.get(key):
+            print(f"  {label}: {meta[key]}")
 
     agg = _aggregate(df, phase_s)
 
+    env_suffix = f"  [{env_name}]" if env_name and env_name != "prod" else ""
     title = (
-        f"EarthScope Positions API Diagnostic  —  "
+        f"EarthScope Positions API Diagnostic{env_suffix}  —  "
         f"{n_req:,} requests  workers {worker_range}  {run_ts}"
     )
 

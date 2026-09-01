@@ -28,7 +28,7 @@ import os
 import pathlib
 import sys
 
-from earthscope_positions import paths
+from earthscope_positions import environment, paths
 
 
 def _project_root() -> pathlib.Path:
@@ -195,8 +195,26 @@ Each completeness file contains 96 rows (one per 15-min bin in a day) with:
   completeness             row_count / expected_count, capped at 1.0
   mean_ingest_latency_s    mean ingestLatency in seconds
   mean_processing_delay_s  mean processingDelay in seconds
+  restart_count            gaps the stream resumed from inside the bin
+  max_gap_s                longest of those gaps, in seconds
 
-Already-existing completeness files are skipped unless --overwrite is given.
+A gap is an interval between consecutive samples longer than --gap-seconds,
+and a restart is the stream coming back from one; continuous blocks are
+restarts + 1.  The default of 2 s is chosen so a single dropped epoch (a
+2.000 s interval at 1 Hz, and ordinary -- roughly 0.4% of all intervals in real
+data) is not counted as an outage; that is what 'completeness' already
+measures.  Each gap is attributed to the bin where the data came back, so a
+long outage counts once however coarsely the bins are later aggregated.
+
+Already-existing completeness files are skipped unless --overwrite is given --
+except files written before restart tracking existed, which are regenerated
+regardless, since serving them would make the restart metric read as a uniform
+zero.
+
+The threshold each file was built with is stored inside it, so generating with
+a non-default --gap-seconds is not silently undone by a later run (or by the
+web server) using the default.  The Completeness tab labels its Restarts plot
+with the threshold the data actually carries.
 
 The web UI ('es-pos webserver') generates completeness files on demand, but
 pre-computing them here makes the Completeness & Latency tab load faster.
@@ -204,6 +222,7 @@ pre-computing them here makes the Completeness & Latency tab load faster.
 Examples:
   es-pos process completeness
   es-pos process completeness --overwrite
+  es-pos process completeness --gap-seconds 10 --overwrite
 """,
     )
     comp_p.add_argument(
@@ -217,6 +236,16 @@ Examples:
         default=1.0,
         metavar="HZ",
         help="Expected sample rate in Hz used to compute completeness (default: 1.0).",
+    )
+    comp_p.add_argument(
+        "--gap-seconds",
+        type=float,
+        default=None,
+        metavar="S",
+        help="An interval between consecutive samples longer than this counts as "
+             "a gap, and the sample ending it as a restart (default: 2). Lower it "
+             "to count single dropped samples, raise it to count only sustained "
+             "outages. Recorded in each file it writes.",
     )
 
     # ── webserver ─────────────────────────────────────────────────────────────
@@ -307,10 +336,27 @@ value, every command prints a one-time note showing both.
 Directories used before are remembered, so you can switch between them by
 number instead of retyping a path.
 
+ENVIRONMENT (production or stage)
+
+Each data directory is tied to one EarthScope deployment, recorded in
+<data directory>/.config/environment.json:
+
+  prod    api.earthscope.org       (the default; no marker file needed)
+  stage   api.dev.earthscope.org   (es profile "stage")
+
+The two issue different EDIDs for the same station, so a directory is only
+ever one of them.  The single way to put a directory on stage is:
+
+  es-pos config use-data-dir --stage PATH
+
+and it is refused for a directory that already holds production data — use a
+separate directory for stage rather than mixing the two in one Arrow tree.
+Every subcommand here reports which environment it is talking about.
+
 Subcommands:
-  show             Print the resolved data directory and which layer set it.
-  list-data-dirs   List remembered data directories, marking the active one.
-  use-data-dir     Switch the active data directory (by number or path).
+  show             Print the resolved data directory, its environment, and which layer set it.
+  list-data-dirs   List remembered data directories with their environments, marking the active one.
+  use-data-dir     Switch the active data directory (by number or path); --stage/--prod set its environment.
   set-data-dir     Record a data directory in the config file (does not move data).
   move-data-dir    Move the existing data tree somewhere else, then record it.
   forget-data-dir  Remove a directory from the remembered list (leaves data alone).
@@ -319,6 +365,8 @@ Examples:
   es-pos config show
   es-pos config list-data-dirs
   es-pos config use-data-dir 2
+  es-pos config use-data-dir --stage ~/earthscope-positions-stage
+  es-pos config use-data-dir --prod ~/earthscope-positions
   es-pos config set-data-dir /mnt/gnss/positions
   es-pos config move-data-dir /Volumes/BigDisk/positions
 """,
@@ -326,29 +374,67 @@ Examples:
     config_sub = config_p.add_subparsers(dest="config_cmd", metavar="SUBCOMMAND")
     config_sub.add_parser(
         "show",
-        help="Print the resolved data directory and which layer set it.",
+        help="Print the resolved data directory, its environment, and which layer set it.",
     )
     config_sub.add_parser(
         "list-data-dirs",
-        help="List remembered data directories, marking the active one.",
+        help="List remembered data directories with their environments.",
         description=(
             "List every data directory this install has used, in the order they "
-            "were first seen, with the active one marked.  The numbers are stable "
+            "were first seen, with the active one marked and each one's "
+            "environment (production or stage) shown.  The numbers are stable "
             "and are what 'use-data-dir' and 'forget-data-dir' accept."
         ),
     )
     cfg_use_p = config_sub.add_parser(
         "use-data-dir",
-        help="Switch the active data directory (by number or path).",
+        help="Switch the active data directory; --stage/--prod set its environment.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         description=(
-            "Make a remembered directory active.  TARGET is either a number from "
-            "'es-pos config list-data-dirs' or a path.  A path that has not been "
-            "seen before is remembered too.  No data is moved."
+            "Make a remembered directory active.  TARGET is either a number from\n"
+            "'es-pos config list-data-dirs' or a path.  A path that has not been\n"
+            "seen before is remembered too.  No data is moved.\n"
+            "\n"
+            "This is also the only command that can put a directory on the stage\n"
+            "deployment (api.dev.earthscope.org):\n"
+            "\n"
+            "  es-pos config use-data-dir --stage ~/earthscope-positions-stage\n"
+            "\n"
+            "Without --stage/--prod the directory keeps whatever environment it\n"
+            "already has (production for a directory that has never been marked).\n"
+            "Changing the environment of a directory that already holds data is\n"
+            "refused: prod and stage EDIDs differ, so the two cannot share a tree."
         ),
     )
     cfg_use_p.add_argument(
         "target", metavar="TARGET",
         help="Number from 'list-data-dirs', or a directory path.",
+    )
+    cfg_use_env = cfg_use_p.add_mutually_exclusive_group()
+    cfg_use_env.add_argument(
+        "--stage", dest="environment", action="store_const", const="stage",
+        help="Point TARGET at the stage deployment (api.dev.earthscope.org, "
+             "es profile 'stage').",
+    )
+    cfg_use_env.add_argument(
+        "--prod", "--production", dest="environment",
+        action="store_const", const="prod",
+        help="Point TARGET back at production (api.earthscope.org). This is the "
+             "default for an unmarked directory.",
+    )
+    cfg_use_p.add_argument(
+        "--profile", metavar="NAME",
+        help="es profile holding this environment's tokens, recorded with the "
+             "directory.  Defaults to 'stage' for --stage and 'default' for "
+             "--prod; pass it when your credentials for that deployment already "
+             "live under a differently-named profile in ~/.earthscope/config.toml. "
+             "Requires --stage or --prod.",
+    )
+    cfg_use_p.add_argument(
+        "--force", action="store_true",
+        help="Change the environment even though TARGET already holds data. "
+             "Mixes prod and stage EDIDs in one tree — only for a directory you "
+             "know is safe to re-point.",
     )
     cfg_forget_p = config_sub.add_parser(
         "forget-data-dir",
@@ -400,12 +486,17 @@ Examples:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description="""Diagnostic tools for the EarthScope positions API.
 
-WARNING: 'es-pos test fetch' contacts api.earthscope.org directly.
-         It will only return valid auth-endpoint results when connected
-         to the EarthScope VPN.  The open endpoint is always reachable.
+Both endpoints follow the active data directory's environment (production or
+stage) -- see 'es-pos config show'.
+
+WARNING: 'es-pos test fetch' contacts the positions API directly
+         (api.earthscope.org on production).  It will only return valid
+         auth-endpoint results when connected to the EarthScope VPN.
+         Production's open endpoint is always reachable; stage has none, so a
+         stage run sweeps the authenticated endpoint alone.
 
 Subcommands:
-  fetch   Concurrency sweep against both positions API endpoints.
+  fetch   Concurrency sweep against the positions API endpoints.
   plot    Plot results from a previous 'test fetch' run.
 
 Use 'es-pos test <subcommand> --help' for per-command options.
@@ -1147,6 +1238,46 @@ _SOURCE_LABELS = {
     "default": "built-in default (nothing configured)",
 }
 
+_ENV_SOURCE_LABELS = {
+    "env":      f"{environment.ENV_VAR} environment variable",
+    "data-dir": "the data directory's .config/environment.json",
+    "default":  "built-in default (directory not marked)",
+}
+
+
+def _env_tag(env: "environment.Environment") -> str:
+    """One-word environment marker for a listing line.
+
+    Production is the ordinary case and gets no decoration; anything else is
+    flagged, so a stage directory cannot be skimmed past in a numbered list.
+    """
+    return "" if env.name == environment.DEFAULT_ENVIRONMENT else f"  [{env.label}]"
+
+
+def _print_environment_block() -> None:
+    """The environment stanza shared by every `es-pos config` subcommand."""
+    env = environment.current()
+    source = environment.current_source()
+    print(f"Environment:     {env.label} ({env.name})")
+    print(f"  set by:        {_ENV_SOURCE_LABELS.get(source, source)}")
+    print(f"  API:           {env.api_url}")
+    print(f"  es profile:    {environment.profile()}")
+
+
+def _warn_if_profile_undefined() -> None:
+    """Say so now if the active environment's es profile is not configured.
+
+    Checked here rather than left to the first API call: a switch is when
+    someone can act on it, whereas the failure otherwise surfaces mid-fetch as
+    the SDK's bare "Profile 'stage' does not exist".
+    """
+    defined = environment.configured_profiles()
+    if defined is None or environment.profile() in defined:
+        return
+    print()
+    for line in environment.profile_setup_hint().splitlines():
+        print(f"[note] {line}" if not line.startswith(" ") else f"       {line}")
+
 
 def _cmd_config_show(args: argparse.Namespace) -> None:
     resolved = paths.base_dir()
@@ -1160,6 +1291,15 @@ def _cmd_config_show(args: argparse.Namespace) -> None:
     if resolved.exists():
         size, count = _dir_size(resolved)
         print(f"  contents:      {_fmt_size(size)} in {count:,} file(s)")
+    print()
+    _print_environment_block()
+    marker = environment.marker_path(resolved)
+    print(f"  marker file:   {marker}"
+          f"{'' if marker.exists() else '  (not written — production)'}")
+    if environment.is_default():
+        print(f"  to use stage:  es-pos config use-data-dir --stage PATH")
+    else:
+        _warn_if_profile_undefined()
     print()
     print(f"Config file:     {cfg_path}")
     print(f"  exists:        {'yes' if cfg_path.exists() else 'no'}")
@@ -1183,7 +1323,7 @@ def _cmd_config_show(args: argparse.Namespace) -> None:
 
 
 def _print_known(known: list[pathlib.Path], active: pathlib.Path) -> None:
-    """Numbered listing of remembered directories.
+    """Numbered listing of remembered directories, with their environments.
 
     Numbers come from the config file's stored order, which is stable, so a
     number a user reads here is still valid after switching.
@@ -1195,7 +1335,13 @@ def _print_known(known: list[pathlib.Path], active: pathlib.Path) -> None:
         else:
             size, count = _dir_size(path)
             state = f"  ({_fmt_size(size)}, {count:,} file(s))"
-        print(f"  {mark} {i}. {path}{state}")
+        try:
+            tag = _env_tag(environment.environment_of(path))
+        except ValueError as exc:
+            # An unrecognised marker (written by a newer version): say so rather
+            # than showing the directory as production, which it is not.
+            tag = f"  [unknown environment: {exc}]"
+        print(f"  {mark} {i}. {path}{state}{tag}")
 
 
 def _resolve_known_target(target: str) -> pathlib.Path:
@@ -1226,6 +1372,8 @@ def _cmd_config_list_data_dirs(args: argparse.Namespace) -> None:
     active = paths.base_dir()
     print(f"Remembered data directories ({len(known)}), '*' = active:")
     _print_known(known, active)
+    print()
+    _print_environment_block()
     if paths.base_dir_source() == "env":
         print(f"\n[note] {paths.ENV_VAR} is overriding the active entry "
               f"for this run ({active}).")
@@ -1233,16 +1381,63 @@ def _cmd_config_list_data_dirs(args: argparse.Namespace) -> None:
 
 def _cmd_config_use_data_dir(args: argparse.Namespace) -> None:
     target = _resolve_known_target(args.target)
+    requested = getattr(args, "environment", None)
+    if args.profile and requested is None:
+        sys.exit(
+            "--profile only has meaning alongside --stage or --prod: it is "
+            "recorded in the directory's environment marker, and without one of "
+            "those there is no marker to write.\n"
+            "  For a one-off override use the ES_PROFILE environment variable."
+        )
+
+    # The environment is written before the directory becomes active, and the
+    # conflict check runs before either: a refusal must leave the previous
+    # active directory untouched rather than switching to a directory it then
+    # declines to mark.
+    if requested is not None:
+        resolved_target = pathlib.Path(target).expanduser().resolve()
+        conflict = environment.describe_switch_conflict(resolved_target, requested)
+        if conflict and not args.force:
+            sys.exit(
+                f"Refusing to change the environment of a directory that already "
+                f"holds data:\n\n{conflict}\n\n"
+                f"  Or, if you are sure this tree can be re-pointed, pass --force."
+            )
+        resolved_target.mkdir(parents=True, exist_ok=True)
+        marker = environment.write_marker(
+            resolved_target, requested, profile=args.profile
+        )
+        env_obj = environment.ENVIRONMENTS[requested]
+        print(f"Environment for {resolved_target} is now {env_obj.label} ({env_obj.name})")
+        print(f"  recorded in {marker}")
+        if conflict:
+            print("  [warn] --force used: this tree now mixes environments.")
+
     saved = paths.set_configured_data_dir(target)
+    environment.reset_cache()
     print(f"Active data directory is now {saved}")
     print(f"  recorded in {paths.config_path()}")
     if not saved.exists():
         print("  (directory does not exist yet — it is created on first write)")
+    print()
+    _print_environment_block()
+    _warn_if_profile_undefined()
+    if not environment.is_default():
+        print(f"\n  Log in for this environment with: "
+              f"es user login --profile {environment.profile()}")
+
     env = os.environ.get(paths.ENV_VAR)
     if env and pathlib.Path(env).expanduser() != saved:
         print(
             f"\n[note] {paths.ENV_VAR} is set to {env} and takes precedence over\n"
             f"       the config file.  Unset it for this switch to take effect."
+        )
+    env_override = os.environ.get(environment.ENV_VAR)
+    if env_override and requested is not None and env_override.strip() != requested:
+        print(
+            f"\n[note] {environment.ENV_VAR} is set to {env_override} and takes\n"
+            f"       precedence over the directory's marker.  Unset it for this\n"
+            f"       change to take effect."
         )
 
 
@@ -1254,7 +1449,7 @@ def _cmd_config_forget_data_dir(args: argparse.Namespace) -> None:
         sys.exit(str(exc))
     if not removed:
         sys.exit(f"{target} is not in the remembered list.")
-    print(f"Forgot {target}")
+    print(f"Forgot {target}{_env_tag(environment.environment_of(target))}")
     print("  the directory and its contents were not touched.")
 
 
@@ -1263,10 +1458,18 @@ def _cmd_config_set_data_dir(args: argparse.Namespace) -> None:
     if not args.no_create:
         target.mkdir(parents=True, exist_ok=True)
     saved = paths.set_configured_data_dir(target)
+    environment.reset_cache()
     print(f"Data directory set to {saved}")
     print(f"  recorded in {paths.config_path()}")
     if not saved.exists():
         print("  (directory does not exist yet — it is created on first write)")
+    print()
+    _print_environment_block()
+    if environment.is_default():
+        # set-data-dir deliberately has no --stage: putting a directory on
+        # stage is a single, deliberate act, and it lives on use-data-dir.
+        print("\n  This directory is on production.  To put one on stage:")
+        print(f"    es-pos config use-data-dir --stage {saved}")
     # An override still in effect would quietly win over what we just saved.
     env = os.environ.get(paths.ENV_VAR)
     if env and pathlib.Path(env).expanduser() != saved:
@@ -1300,6 +1503,7 @@ def _cmd_config_move_data_dir(args: argparse.Namespace) -> None:
     print(f"  from: {src}")
     print(f"  to:   {dst}")
     print(f"  size: {_fmt_size(size)} in {count:,} file(s)")
+    print(f"  env:  {environment.environment_of(src).label}  (moves with the data)")
 
     if not args.yes and sys.stdin.isatty():
         try:
@@ -1322,8 +1526,14 @@ def _cmd_config_move_data_dir(args: argparse.Namespace) -> None:
     # `drop=src` keeps the vacated path out of the remembered list -- it no
     # longer exists, so offering it for switching would only ever fail.
     saved = paths.set_configured_data_dir(dst, drop=src)
+    environment.reset_cache()
     print(f"\nMoved.  Data directory is now {saved}")
     print(f"  recorded in {paths.config_path()}")
+    # The .config marker rides along inside the moved tree, so the environment
+    # follows the data rather than the path -- worth showing, since a move is
+    # exactly when someone might expect it not to.
+    print()
+    _print_environment_block()
 
     env = os.environ.get(paths.ENV_VAR)
     if env and pathlib.Path(env).expanduser() == src:
@@ -1344,25 +1554,30 @@ def _cmd_webserver(args: argparse.Namespace) -> None:
     run_startup_preflight()
 
     set_public_base(args.hostname, args.port)
+    env = environment.current()
     print(
         f"Starting GNSS Positions server → http://{args.hostname}:{args.port}"
         f"  (binding {args.host}:{args.port})"
     )
+    print(f"  data directory: {paths.base_dir()}")
+    print(f"  environment:    {env.label} ({env.name}) — {env.api_url}")
     uvicorn.run(app, host=args.host, port=args.port)
 
 
 def _cmd_process_completeness(args: argparse.Namespace) -> None:
-    from earthscope_positions.process.completeness import generate_all
+    from earthscope_positions.process.completeness import _GAP_SECONDS, generate_all
+
+    gap_seconds = args.gap_seconds if args.gap_seconds is not None else _GAP_SECONDS
+    if gap_seconds <= 0:
+        sys.exit("--gap-seconds must be positive.")
 
     data_dir = paths.arrow_dir()
 
     if not data_dir.exists():
         sys.exit(f"Data directory not found: {data_dir}")
 
-    arrow_files = [
-        p for p in sorted(data_dir.rglob("*.arrow"))
-        if ".completeness" not in p.name
-    ]
+    from earthscope_positions.process.completeness import is_source_arrow
+    arrow_files = [p for p in sorted(data_dir.rglob("*.arrow")) if is_source_arrow(p)]
     if not arrow_files:
         print(f"No .arrow files found under {data_dir}", file=sys.stderr)
         sys.exit(0)
@@ -1373,16 +1588,19 @@ def _cmd_process_completeness(args: argparse.Namespace) -> None:
         + (" (overwrite mode)" if args.overwrite else ""),
         file=sys.stderr,
     )
+    print(f"  gap threshold: > {gap_seconds:g} s between samples", file=sys.stderr)
 
     generated = generate_all(
         data_dir,
         overwrite=args.overwrite,
         sampling_hz=args.sampling_hz,
+        gap_seconds=gap_seconds,
     )
 
     skipped = n_total - len(generated)
     print(
-        f"Done.  Generated: {len(generated)}  |  Skipped (already exist): {skipped}",
+        f"Done.  Generated: {len(generated)}  |  "
+        f"Skipped (already up to date): {skipped}",
         file=sys.stderr,
     )
 

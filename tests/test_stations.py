@@ -105,7 +105,11 @@ def test_network_geosncls(fake_discover_api):
 # get radial (direct REST — no SDK method)
 # ---------------------------------------------------------------------------
 
-_RADIAL_URL = f"{station_list._API_HOST}/beta/discover/gnss/radial"
+# Resolved inside each test, not at import: _api_host() reads the active
+# environment, which the autouse data-directory fixture has not set up yet
+# at collection time.
+def _radial_url() -> str:
+    return f"{station_list._api_host()}/beta/discover/gnss/radial"
 
 
 def test_get_radial_returns_records(fake_token):
@@ -118,7 +122,7 @@ def test_get_radial_returns_records(fake_token):
         network_name=None, facility=None, software=None,
     )
     with responses.RequestsMock() as rsps:
-        rsps.get(_RADIAL_URL, json=body, status=200)
+        rsps.get(_radial_url(), json=body, status=200)
         records = station_list._get_radial(args)
         req = rsps.calls[0].request
 
@@ -138,7 +142,7 @@ def test_get_radial_filters_by_software_locally(fake_token):
         network_name=None, facility=None, software="jpl_ppp",
     )
     with responses.RequestsMock() as rsps:
-        rsps.get(_RADIAL_URL, json=body, status=200)
+        rsps.get(_radial_url(), json=body, status=200)
         records = station_list._get_radial(args)
 
     assert [r["edid"] for r in records] == ["E1"]

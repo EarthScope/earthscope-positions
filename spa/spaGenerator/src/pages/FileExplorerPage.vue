@@ -17,12 +17,28 @@
           <template v-for="{ node, depth } in flatTree" :key="node.path">
             <q-item
               dense clickable
-              :active="selectedPath === node.path && node.type === 'file'"
+              :active="node.type === 'file' && isSelected(node.path)"
               active-class="bg-blue-1"
               :style="{ paddingLeft: (depth * 16 + 4) + 'px' }"
               :data-file-path="node.path"
               @click="handleClick(node)"
             >
+              <!-- Tick to add a picture to the side-by-side stack.  Only on the
+                   kinds whose whole preview is one image; @click.stop so ticking
+                   does not also change the single selection. -->
+              <q-item-section
+                v-if="isCheckable(node)"
+                side
+                style="min-width: 24px; padding-right: 0"
+              >
+                <q-checkbox
+                  dense
+                  size="xs"
+                  :model-value="isChecked(node.path)"
+                  @click.stop
+                  @update:model-value="toggleChecked(node)"
+                />
+              </q-item-section>
               <q-item-section avatar style="min-width: 22px; padding-right: 4px">
                 <q-icon
                   v-if="node.type === 'dir'"
@@ -57,7 +73,7 @@
     <!-- ── Right: preview / summary + file actions ───────────────────────── -->
     <div class="col column no-wrap bg-white" style="overflow: hidden">
 
-      <div v-if="!selectedPath" class="col flex flex-center text-grey-4">
+      <div v-if="!selectedPath && !multiSelected" class="col flex flex-center text-grey-4">
         <div class="text-center">
           <q-icon name="folder_open" size="64px" />
           <div class="text-caption q-mt-sm">Select a file from the tree</div>
@@ -67,19 +83,52 @@
       <template v-else>
         <!-- Action bar -->
         <div class="row items-center q-pa-sm q-gutter-xs flex-shrink-0 border-bottom">
-          <div class="col text-caption text-grey-7" style="word-break: break-all">
+          <div v-if="multiSelected" class="col text-caption text-grey-7">
+            {{ checked.length }} image{{ checked.length === 1 ? "" : "s" }} checked
+            <q-btn flat dense no-caps size="sm" label="Clear" color="grey-8"
+                   class="q-ml-xs" @click="clearChecked" />
+          </div>
+          <div v-else class="col text-caption text-grey-7" style="word-break: break-all">
             {{ selectedPath }}
             <span v-if="summary?.size != null" class="text-grey-5"> — {{ fmtSize(summary.size) }}</span>
           </div>
-          <q-btn v-if="summary?.editable" flat dense no-caps size="sm" icon="edit_note"
-                 label="Edit" color="primary" @click="openEdit" />
-          <q-btn flat dense no-caps size="sm" icon="drive_file_rename_outline"
-                 label="Rename" color="grey-8" @click="openRename" />
-          <q-btn flat dense no-caps size="sm" icon="delete" label="Delete"
-                 color="negative" @click="openDelete" />
+          <!-- Rename/Delete act on one file, so they are hidden while several
+               are shown rather than silently applying to just the last one. -->
+          <template v-if="!multiSelected">
+            <q-btn v-if="summary?.editable" flat dense no-caps size="sm" icon="edit_note"
+                   label="Edit" color="primary" @click="openEdit" />
+            <q-btn flat dense no-caps size="sm" icon="drive_file_rename_outline"
+                   label="Rename" color="grey-8" @click="openRename" />
+            <q-btn flat dense no-caps size="sm" icon="delete" label="Delete"
+                   color="negative" @click="openDelete" />
+          </template>
         </div>
 
-        <q-scroll-area class="col">
+        <!-- Every checked picture, one panel each, in tree order -->
+        <q-scroll-area v-if="multiSelected" class="col">
+          <div class="q-pa-md">
+            <div class="text-subtitle2 q-mb-sm">
+              {{ checked.length }} image{{ checked.length === 1 ? "" : "s" }}
+            </div>
+            <div v-for="c in checkedInTreeOrder" :key="c.path" class="q-mb-lg">
+              <div class="row items-center no-wrap q-mb-xs">
+                <div class="col text-caption text-grey-7" style="word-break: break-all">
+                  {{ c.path }}
+                </div>
+                <q-btn flat dense round size="sm" icon="close" color="grey-6"
+                       @click="checked = checked.filter(x => x.path !== c.path)">
+                  <q-tooltip>Uncheck this one</q-tooltip>
+                </q-btn>
+              </div>
+              <img
+                :src="previewUrlFor(c)" :alt="c.path"
+                style="max-width: 100%; height: auto; border: 1px solid #e0e0e0; border-radius: 4px"
+              />
+            </div>
+          </div>
+        </q-scroll-area>
+
+        <q-scroll-area v-else class="col">
           <div class="q-pa-md">
             <div v-if="summaryLoading" class="flex flex-center q-pa-xl">
               <q-spinner-dots color="primary" size="40px" />
@@ -140,6 +189,40 @@
                       <tr v-for="c in summary.schema" :key="c.name">
                         <td>{{ c.name }}</td><td class="text-grey-7">{{ c.type }}</td>
                         <td class="text-right">{{ c.nulls.toLocaleString() }}</td>
+                      </tr>
+                    </tbody>
+                  </q-markup-table>
+                </template>
+
+                <!-- Arrow: continuous blocks -->
+                <template v-if="summary.blocks?.length">
+                  <div class="text-subtitle2 q-mb-xs q-mt-md">
+                    Continuous blocks
+                    <span
+                      v-if="summary.blocks_total && summary.blocks_total > summary.blocks.length"
+                      class="text-caption text-grey-6 text-weight-regular"
+                    >
+                      — first {{ summary.blocks.length }} of
+                      {{ summary.blocks_total.toLocaleString() }}
+                    </span>
+                  </div>
+                  <q-markup-table flat bordered dense style="max-width: 560px">
+                    <thead>
+                      <tr>
+                        <th class="text-left">#</th>
+                        <th class="text-left">Start</th>
+                        <th class="text-left">End</th>
+                        <th class="text-right">Duration</th>
+                        <th class="text-right">Samples</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr v-for="(b, i) in summary.blocks" :key="i">
+                        <td class="text-grey-7">{{ i + 1 }}</td>
+                        <td>{{ b.start }}</td>
+                        <td>{{ b.end }}</td>
+                        <td class="text-right">{{ b.duration }}</td>
+                        <td class="text-right">{{ b.samples.toLocaleString() }}</td>
                       </tr>
                     </tbody>
                   </q-markup-table>
@@ -299,6 +382,8 @@ interface Entry {
   type: "file" | "dir";
   path: string;
   kind: string;
+  /** For .arrow only: "positions" | "completeness" | "ppsd". */
+  arrowKind?: string | null;
   size: number | null;
   mtime: number;
 }
@@ -309,6 +394,10 @@ interface Summary {
   editable: boolean;
   rows?: [string, string][];
   schema?: { name: string; type: string; nulls: number }[];
+  /** Arrow only: uninterrupted runs of samples. One block = no restarts. */
+  blocks?: { start: string; end: string; duration: string; samples: number }[];
+  /** Total blocks before the listing cap, so the header can say what is elided. */
+  blocks_total?: number;
   channels?: { name: string; samples: number }[];
   columns?: { name: string; filled: number; blank: number; detail: string }[];
   settings?: { key: string; value: string }[];
@@ -326,6 +415,9 @@ const rootLoading  = ref(false);
 const rootPath     = ref("");
 
 const selectedPath   = ref("");
+//: Files ticked for side-by-side viewing.  Empty whenever a single file is
+//: being previewed, so every existing single-file code path is untouched.
+const checked        = ref<{ path: string; kind: string; arrowKind?: string | null }[]>([]);
 const summary        = ref<Summary | null>(null);
 const summaryLoading = ref(false);
 
@@ -334,8 +426,28 @@ const downloadUrl = computed(() =>
 
 // Server-rendered: a station-day at 1 Hz is 86,400 samples per channel, far
 // more than is worth shipping to the browser for a preview.
-const plotUrl = computed(() =>
-  selectedPath.value ? `/api/files/plot?path=${encodeURIComponent(selectedPath.value)}` : "");
+function plotUrlFor(path: string): string {
+  return path ? `/api/files/plot?path=${encodeURIComponent(path)}` : "";
+}
+const plotUrl = computed(() => plotUrlFor(selectedPath.value));
+
+/** How to render one checked file: a stored image is served directly, a PPSD
+ *  array has to be rendered to a PNG first. */
+function previewUrlFor(c: { path: string; kind: string }): string {
+  return c.kind === "image"
+    ? `/api/files/download?path=${encodeURIComponent(c.path)}`
+    : plotUrlFor(c.path);
+}
+
+const multiSelected = computed(() => checked.value.length > 0);
+
+//: Checked files in tree order, so the stack reads the same way the tree does
+//: however they were ticked.
+const checkedInTreeOrder = computed(() => {
+  const order = new Map(flatFiles.value.map(({ node }, i) => [node.path, i]));
+  return [...checked.value].sort(
+    (a, b) => (order.get(a.path) ?? 1e9) - (order.get(b.path) ?? 1e9));
+});
 const plotFailed = ref(false);
 watch(selectedPath, () => { plotFailed.value = false; });
 
@@ -452,9 +564,42 @@ async function selectFile(path: string) {
   }
 }
 
+/**
+ * Files whose whole preview is one picture: real images, and the PPSD arrays
+ * that render as a three-panel PNG.  Those are the ones worth stacking several
+ * of at once — a time series or a table gains nothing from it.
+ */
+function isCheckable(node: TreeNode): boolean {
+  return node.type === "file" && (node.kind === "image" || node.arrowKind === "ppsd");
+}
+
+function isChecked(path: string): boolean {
+  return checked.value.some((c) => c.path === path);
+}
+
+function toggleChecked(node: TreeNode) {
+  if (isChecked(node.path)) {
+    checked.value = checked.value.filter((c) => c.path !== node.path);
+  } else {
+    checked.value = [...checked.value,
+      { path: node.path, kind: node.kind, arrowKind: node.arrowKind }];
+  }
+}
+
+function clearChecked() { checked.value = []; }
+
+function isSelected(path: string): boolean {
+  return selectedPath.value === path || isChecked(path);
+}
+
 function handleClick(node: TreeNode) {
-  if (node.type === "dir") toggleDir(node);
-  else selectFile(node.path);
+  if (node.type === "dir") { toggleDir(node); return; }
+  // Clicking a file that is not one of the stackable kinds drops the whole
+  // checked set — it is about to be replaced by a single-file preview anyway,
+  // and leaving ticks behind that no longer drive the pane is worse than
+  // losing them.
+  if (!isCheckable(node)) clearChecked();
+  selectFile(node.path);
 }
 
 // ── Edit ─────────────────────────────────────────────────────────────────────
@@ -551,6 +696,16 @@ async function doDelete() {
 // The PPSD tab links here with a path relative to the *plots* directory, from
 // when this page was rooted there. Accept both by prefixing "plots/" when the
 // bare path is not present at the root.
+/**
+ * Reveal and select ``raw`` — used by the ?path= deep link the Completeness
+ * heatmap produces when you click a cell.
+ *
+ * Expanding the tree down to the file is a convenience; *showing* it is the
+ * point.  So a failure to walk the tree (an unfetched parent, a listing that
+ * has moved on, a path the tree does not contain) falls through to selecting
+ * the file anyway — the summary endpoint takes any valid path.  Landing on an
+ * empty File Explorer with no explanation is the one outcome worth ruling out.
+ */
 async function openPath(raw: string) {
   if (!raw) return;
   const candidates = raw.startsWith("plots/") ? [raw] : [raw, `plots/${raw}`];
@@ -574,6 +729,9 @@ async function openPath(raw: string) {
     document.querySelector(`[data-file-path="${path}"]`)?.scrollIntoView({ block: "nearest" });
     return;
   }
+  // Tree walk failed — show the file regardless.  selectFile() reports its own
+  // error if the server cannot read it either.
+  await selectFile(raw);
 }
 
 // ── Keyboard navigation ──────────────────────────────────────────────────────

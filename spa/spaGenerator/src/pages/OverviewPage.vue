@@ -56,6 +56,27 @@
             <q-badge v-if="cfg.in_docker" color="blue-grey-6" class="q-ml-sm" label="in Docker" />
           </div>
 
+          <!-- Environment is a property of this directory, not of the server,
+               so it belongs beside the path rather than in the table below. -->
+          <q-banner
+            v-if="cfg.environment_badge"
+            dense
+            class="bg-amber-2 text-amber-10 q-mt-sm"
+            style="max-width: 720px"
+          >
+            <template #avatar><q-icon name="science" color="amber-9" /></template>
+            <div class="text-body2">
+              This data directory pulls from <strong>{{ cfg.environment_label }}</strong>
+              (<code>{{ cfg.api_url }}</code>).
+            </div>
+            <div class="text-caption q-mt-xs">
+              EDIDs differ from production, so streams and positions here are not
+              interchangeable with a production directory. Tokens come from the
+              <code>{{ cfg.es_profile }}</code> es profile
+              (<code>es user login --profile {{ cfg.es_profile }}</code>).
+            </div>
+          </q-banner>
+
           <!-- Inside a container the path above is the container path, which does
                not exist on the host; show what it is actually mounted from. -->
           <div v-if="cfg.in_docker" class="q-mt-sm">
@@ -102,6 +123,21 @@
                 <td class="text-grey-7">{{ cfg.env_var }}</td>
                 <td>{{ cfg.env_value ?? "(not set)" }}</td>
               </tr>
+              <tr>
+                <td class="text-grey-7">Environment</td>
+                <td>
+                  {{ cfg.environment_label }} ({{ cfg.environment }})
+                  <span class="text-grey-5"> — set by {{ cfg.environment_source_label }}</span>
+                </td>
+              </tr>
+              <tr>
+                <td class="text-grey-7">API</td>
+                <td><code>{{ cfg.api_url }}</code></td>
+              </tr>
+              <tr>
+                <td class="text-grey-7">es profile</td>
+                <td><code>{{ cfg.es_profile }}</code></td>
+              </tr>
             </tbody>
           </q-markup-table>
 
@@ -147,6 +183,9 @@
               <q-item-section>
                 <q-item-label class="text-caption" style="word-break: break-all">{{ d.path }}</q-item-label>
               </q-item-section>
+              <q-item-section v-if="d.environment !== 'prod'" side>
+                <q-badge color="amber-8" text-color="black" :label="d.environment_label" />
+              </q-item-section>
               <q-item-section v-if="!d.exists" side>
                 <q-badge color="grey-5" label="missing" />
               </q-item-section>
@@ -167,7 +206,12 @@
 es-pos config list-data-dirs
 es-pos config use-data-dir 2
 es-pos config set-data-dir /path/to/data
-es-pos config move-data-dir /new/path</pre>
+es-pos config move-data-dir /new/path
+
+# Point a directory at the stage deployment (api.dev.earthscope.org).
+# This is the only command that can; it is refused for a directory that
+# already holds production data.
+es-pos config use-data-dir --stage ~/earthscope-positions-stage</pre>
           </q-banner>
         </q-card-section>
       </template>
@@ -199,7 +243,18 @@ interface DataDirConfig {
   mismatch: boolean;
   in_docker: boolean;
   host_data_directory: string | null;
-  known_data_directories: { path: string; active: boolean; exists: boolean }[];
+  environment: string;
+  environment_label: string;
+  environment_badge: boolean;
+  environment_source: string;
+  environment_source_label: string;
+  environment_marker_file: string;
+  api_url: string;
+  es_profile: string;
+  known_data_directories: {
+    path: string; active: boolean; exists: boolean;
+    environment: string; environment_label: string;
+  }[];
   subdirectories: { name: string; path: string; exists: boolean; entries: number | null }[];
 }
 
